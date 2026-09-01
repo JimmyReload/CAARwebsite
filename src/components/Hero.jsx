@@ -29,6 +29,12 @@ export default function Hero() {
 
         <Reveal>
 
+          <p className="hero-file">FILE No.CAAR-2023 // STATUS: ACTIVE</p>
+
+        </Reveal>
+
+        <Reveal>
+
           <p className="hero-kicker">{hero.kicker}</p>
 
         </Reveal>
