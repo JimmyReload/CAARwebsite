@@ -153,7 +153,7 @@ export const faqs = [
 
 export const contact = {
 
-  email: "表单超链接",
+  email: "743899771@qq.com",
 
   phone: "+86 18519670015",
 

@@ -80,6 +80,13 @@ export default function Intro() {
         showCharacter: false,
         strokeColor: '#f4eddf',
         highlightColor: '#c96a4c',
+        // 字形数据本地化（不依赖国外 CDN，国内秒载）
+        charDataLoader: (char, onComplete) => {
+          fetch('/hanzi-data/' + char + '.json')
+            .then((r) => { if (!r.ok) throw new Error('no local data') ; return r.json() })
+            .then(onComplete)
+            .catch(() => { /* 本地缺失时回退默认 loader（CDN） */ })
+        },
       })
     })
 
