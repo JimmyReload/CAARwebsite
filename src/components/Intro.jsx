@@ -85,7 +85,10 @@ export default function Intro() {
           fetch('/hanzi-data/' + char + '.json')
             .then((r) => { if (!r.ok) throw new Error('no local data') ; return r.json() })
             .then(onComplete)
-            .catch(() => { /* 本地缺失时回退默认 loader（CDN） */ })
+            .catch(() => {
+              // 本地缺失时回退官方 CDN
+              HanziWriter.loadCharacterData(char).then(onComplete)
+            })
         },
       })
     })
@@ -105,6 +108,9 @@ export default function Intro() {
     }
     animateNext(0)
 
+    // 保险丝：无论动画是否完成，12 秒后强制进入淡出（防止卡在开场）
+    const safety = setTimeout(() => setPhase('out'), 12000)
+    return () => { clearTimeout(safety) }
     // 这里故意不销毁 writer，让写好的字保留到整幕淡出完
   }, [phase])
 
