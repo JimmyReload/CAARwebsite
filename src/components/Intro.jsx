@@ -90,15 +90,9 @@ export default function Intro() {
       })
     })
 
-    let fadeTimer = null
     const finish = () => {
       playInk()
       setPhase('out')
-      fadeTimer = setTimeout(() => {
-        try { localStorage.setItem('abnormal-intro-date', getToday()) } catch {}
-        document.documentElement.classList.remove('intro-lock')
-        setPhase('gone')
-      }, GONE_AFTER)
     }
 
     const animateNext = (i) => {
@@ -112,7 +106,17 @@ export default function Intro() {
     animateNext(0)
 
     // 这里故意不销毁 writer，让写好的字保留到整幕淡出完
-    return () => { clearTimeout(fadeTimer) }
+  }, [phase])
+
+  /* 阶段 out：淡出结束后移除滚动锁并收尾 */
+  useEffect(() => {
+    if (phase !== 'out') return
+    const t = setTimeout(() => {
+      try { localStorage.setItem('abnormal-intro-date', getToday()) } catch {}
+      document.documentElement.classList.remove('intro-lock')
+      setPhase('gone')
+    }, GONE_AFTER)
+    return () => clearTimeout(t)
   }, [phase])
 
   /* 阶段3：整幕消失后再销毁 writer */
@@ -127,6 +131,7 @@ export default function Intro() {
   useEffect(() => () => {
     writersRef.current.forEach((w) => { try { w.destroy() } catch {} })
     writersRef.current = []
+    document.documentElement.classList.remove('intro-lock')
   }, [])
 
   const skip = () => {
