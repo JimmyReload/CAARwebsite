@@ -429,3 +429,36 @@ html.intro-lock, html.intro-lock body { overflow: hidden; }
   .panel-page { padding-top: 100px; }
 }
 .auth-msg--ok { color: var(--ink); border-color: rgba(44, 90, 60, .5); background: rgba(44, 90, 60, .06); }
+
+/* ============ 对话 / 工单 ============ */
+.chat { border: 1px solid var(--line); background: var(--paper); display: flex; flex-direction: column; }
+.chat-box { height: 340px; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; scroll-behavior: smooth; }
+.chat-form { display: grid; gap: 10px; border-top: 1px solid var(--line); padding: 14px 16px; }
+.chat-form textarea {
+  font: inherit; font-size: 15px; color: var(--ink);
+  padding: 12px 14px; border: 1px solid var(--line); background: var(--paper); outline: none; resize: vertical;
+}
+.chat-form textarea:focus { border-color: var(--red); }
+.chat-form .auth-btn { margin: 0; width: 100%; }
+.chat-msg { display: flex; flex-direction: column; max-width: 78%; gap: 3px; }
+.chat-msg--me { align-self: flex-end; align-items: flex-end; }
+.chat-msg--staff { align-self: flex-start; align-items: flex-start; }
+.chat-bubble {
+  padding: 10px 16px; font-size: 15px; line-height: 1.7;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--paper-2); border: 1px solid var(--line);
+}
+.chat-msg--me .chat-bubble { background: var(--ink); color: var(--cream); border-color: var(--ink); }
+.chat-meta { font-family: var(--mono); font-size: 11px; color: var(--ink-2); letter-spacing: .04em; }
+.conv-row {
+  display: flex; align-items: center; gap: 14px; width: 100%; text-align: left;
+  padding: 15px 18px; border: 1px solid var(--line); background: var(--paper);
+  cursor: pointer; font: inherit; transition: border-color .25s, background .25s;
+}
+.conv-row:hover { border-color: var(--red); }
+.conv-row--unread { border-left: 4px solid var(--red); }
+.conv-name { font-weight: 700; font-size: 15px; }
+.conv-unread { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--red); }
+.conv-detail { display: grid; gap: 14px; }
+.conv-title { font-family: var(--serif); font-size: 22px; font-weight: 800; }
+.chat--inadmin .chat-box { height: 380px; }

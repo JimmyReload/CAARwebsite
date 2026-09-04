@@ -152,46 +152,79 @@ export default {
       return json({ ok: true, id: r.meta.last_row_id });
     }
 
-    // 私信
-    if (path === 'staff' && method === 'GET') {
-      return json({ list: await allAdmins(env) });
-    }
-
-    if (path === 'messages' && method === 'GET') {
-      // 用户视角：自己发出的信（可看 staff 是否已读/回复）
-      const sent = (await env.DB.prepare(
-        'SELECT m.*, u.username AS to_name FROM messages m JOIN users u ON u.id = m.to_user WHERE m.from_user = ? ORDER BY m.id DESC LIMIT 50'
-      ).bind(user.id).all()).results;
-      // admin 视角：收件箱
-      let inbox = [];
+    // ---------- 工单会话（会员↔STAFF 双向） ----------
+    if (path === 'conversation' && method === 'GET') {
       if (user.role === 'admin') {
-        inbox = (await env.DB.prepare(
-          'SELECT m.*, u.username AS from_name FROM messages m JOIN users u ON u.id = m.from_user WHERE m.to_user = ? ORDER BY m.id DESC LIMIT 50'
-        ).bind(user.id).all()).results;
+        const list = (await env.DB.prepare("SELECT c.*, u.username, u.nickname, (SELECT COUNT(*) FROM messages m WHERE m.conv_id = c.id AND m.direction = 'to_staff' AND m.id > c.staff_last_read_id) AS unread FROM conversations c JOIN users u ON u.id = c.user_id ORDER BY c.updated_at DESC").all()).results;
+        return json({ list });
       }
-      return json({ sent, inbox });
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
+      if (!conv) return json({ conv: null, unread: 0 });
+      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND direction = 'to_user' AND id > ?").bind(conv.id, conv.user_last_read_id).first();
+      return json({ conv, unread: row ? row.n : 0 });
     }
 
-    if (path === 'messages' && method === 'POST') {
+    // 会员发消息（自动建会话）
+    if (path === 'conversation/message' && method === 'POST') {
       const b = await readBody(request);
-      const toId = Number(b.to_user);
       const content = String(b.content || '').trim();
-      if (!toId || !content) return json({ error: '收件人和内容不能为空' }, 400);
-      if (content.length > 2000) return json({ error: '内容过长（≤2000 字）' }, 400);
-      const target = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(toId).first();
-      if (!target) return json({ error: '收件人不存在' }, 404);
-      await env.DB.prepare('INSERT INTO messages (from_user, to_user, content) VALUES (?, ?, ?)')
-        .bind(user.id, toId, content).run();
-      return json({ ok: true });
+      if (!content) return json({ error: '内容不能为空' }, 400);
+      if (content.length > 1000) return json({ error: '内容过长（≤1000 字）' }, 400);
+      let conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
+      if (!conv) {
+        const cr = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (?)').bind(user.id).run();
+        conv = { id: cr.meta.last_row_id };
+      }
+      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_staff', ?)").bind(conv.id, user.id, content).run();
+      await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(conv.id).run();
+      return json({ ok: true, msg_id: ins.meta.last_row_id });
     }
 
-    if (path === 'messages/read' && method === 'POST') {
-      const b = await readBody(request);
+    // STAFF 回复
+    if (path === 'conversation/reply' && method === 'POST') {
       if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
-      await env.DB.prepare('UPDATE messages SET read = 1 WHERE id = ? AND to_user = ?').bind(Number(b.id), user.id).run();
-      return json({ ok: true });
+      const b = await readBody(request);
+      const convId = Number(b.conv_id);
+      const content = String(b.content || '').trim();
+      if (!convId || !content) return json({ error: '参数不完整' }, 400);
+      if (content.length > 1000) return json({ error: '内容过长（≤1000 字）' }, 400);
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+      if (!conv) return json({ error: '会话不存在' }, 404);
+      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_user', ?)").bind(convId, user.id, content).run();
+      await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(convId).run();
+      return json({ ok: true, msg_id: ins.meta.last_row_id });
     }
 
+    // 拉取消息（after=增量，默认最近 50 条）
+    if (path.indexOf('conversation/') === 0 && path.endsWith('/messages') && method === 'GET') {
+      const convId = Number(path.split('/')[1]);
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+      if (!conv) return json({ error: '会话不存在' }, 404);
+      const isOwner = conv.user_id === user.id;
+      if (!isOwner && user.role !== 'admin') return json({ error: '无权访问' }, 403);
+      const after = Number(url.searchParams.get('after') || 0);
+      let msgs;
+      if (after > 0) {
+        msgs = (await env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(convId, after).all()).results;
+      } else {
+        msgs = (await env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(convId).all()).results;
+        msgs.reverse();
+      }
+      return json({ conv: { id: conv.id, user_id: conv.user_id }, list: msgs });
+    }
+
+    // 标记已读
+    if (path.indexOf('conversation/') === 0 && path.endsWith('/read') && method === 'POST') {
+      const convId = Number(path.split('/')[1]);
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+      if (!conv) return json({ error: '会话不存在' }, 404);
+      const isOwner = conv.user_id === user.id;
+      if (!isOwner && user.role !== 'admin') return json({ error: '无权访问' }, 403);
+      const last = await env.DB.prepare('SELECT MAX(id) AS n FROM messages WHERE conv_id = ?').bind(convId).first();
+      if (isOwner) await env.DB.prepare('UPDATE conversations SET user_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
+      else await env.DB.prepare('UPDATE conversations SET staff_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
+      return json({ ok: true });
+    }
     // 管理员：用户管理
     if (path === 'admin/users' && method === 'GET') {
       if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);

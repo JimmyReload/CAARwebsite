@@ -17,14 +17,25 @@ CREATE TABLE IF NOT EXISTS announcements (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS messages (
+-- 工单会话（每个会员一个对话线程）
+DROP TABLE IF EXISTS conversations;
+CREATE TABLE conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_user INTEGER NOT NULL,
-  to_user INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  read INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
+  user_id INTEGER UNIQUE NOT NULL,
+  user_last_read_id INTEGER NOT NULL DEFAULT 0,
+  staff_last_read_id INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_user, read);
-CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_user);
+-- 消息（会员 to_staff / staff to_user 双向）
+DROP TABLE IF EXISTS messages;
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conv_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  direction TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, id);
