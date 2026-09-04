@@ -297,3 +297,134 @@ html.intro-lock, html.intro-lock body { overflow: hidden; }
 .intro-skip { position: fixed; right: 28px; bottom: 24px; background: none; border: 1px solid rgba(246,242,233,.25); color: rgba(246,242,233,.6); font-family: var(--mono); font-size: 11px; letter-spacing: .18em; padding: 8px 16px; cursor: pointer; transition: all .25s; }
 .intro-skip:hover { color: var(--cream); border-color: rgba(246,242,233,.6); }
 @media (prefers-reduced-motion: reduce) { .intro { display: none; } }
+
+
+/* ============ 登录/注册 ============ */
+.auth-page {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 120px 20px 60px;
+  background:
+    radial-gradient(700px 400px at 85% 10%, rgba(210, 60, 46, .06), transparent 60%),
+    var(--paper);
+}
+.auth-card {
+  width: 100%; max-width: 460px;
+  border: 1.5px solid var(--line); background: var(--paper);
+  padding: clamp(30px, 4vw, 48px);
+  position: relative;
+  box-shadow: 0 30px 70px rgba(22, 22, 22, .08);
+}
+.auth-card::before { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 4px; background: var(--red); }
+.auth-kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .3em; color: var(--red); }
+.auth-title { font-family: var(--serif); font-size: clamp(28px, 4vw, 40px); font-weight: 900; margin-top: 10px; }
+.auth-sub { margin-top: 10px; color: var(--ink-2); font-size: 14px; }
+.auth-form { margin-top: 28px; display: grid; gap: 18px; }
+.auth-form label { display: grid; gap: 8px; font-size: 13px; letter-spacing: .06em; color: var(--ink-2); }
+.auth-form input, .auth-form select, .auth-form textarea {
+  font: inherit; font-size: 15px; color: var(--ink);
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 0;
+  background: var(--paper); outline: none;
+  transition: border-color .25s;
+}
+.auth-form input:focus, .auth-form select:focus, .auth-form textarea:focus { border-color: var(--red); }
+.auth-form textarea { resize: vertical; }
+.auth-btn {
+  margin-top: 6px; padding: 14px; border: none; cursor: pointer;
+  background: var(--ink); color: var(--cream);
+  font-family: var(--mono); font-size: 14px; letter-spacing: .24em;
+  transition: background .3s;
+}
+.auth-btn:hover { background: var(--red); }
+.auth-btn:disabled { opacity: .5; cursor: wait; }
+.auth-msg { font-size: 14px; color: var(--red); padding: 10px 12px; border: 1px dashed rgba(210, 60, 46, .5); }
+.auth-alt { margin-top: 22px; font-size: 13.5px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.auth-alt a { color: var(--red); border-bottom: 1px solid rgba(210, 60, 46, .4); }
+
+/* ============ 面板通用 ============ */
+.panel-page {
+  min-height: 100vh; padding: 120px clamp(22px, 6vw, 88px) 80px;
+  max-width: 1100px; margin: 0 auto;
+}
+.panel-head { border-bottom: 3px double var(--ink); padding-bottom: 22px; margin-bottom: 34px; display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap; }
+.panel-title { font-family: var(--serif); font-size: clamp(28px, 4vw, 44px); font-weight: 900; }
+.panel-back { margin-left: auto; font-size: 14px; color: var(--ink-2); transition: color .25s; }
+.panel-back:hover { color: var(--red); }
+.panel-sec { margin-bottom: 48px; }
+.panel-sec-title {
+  font-family: var(--serif); font-size: clamp(20px, 2.4vw, 28px); font-weight: 800;
+  padding-bottom: 12px; margin-bottom: 22px; border-bottom: 1px solid var(--line);
+}
+.panel-sec-title::before { content: "▍"; color: var(--red); margin-right: 10px; }
+.panel-empty { color: var(--ink-2); font-size: 15px; padding: 18px 0; }
+
+.ann {
+  border: 1px solid var(--line); border-left: 4px solid var(--ink-2);
+  padding: 20px 24px; margin-bottom: 16px; background: var(--paper);
+  transition: box-shadow .3s;
+}
+.ann:hover { box-shadow: 0 12px 30px rgba(22, 22, 22, .07); }
+.ann--pinned { border-left-color: var(--red); }
+.ann-meta { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; color: var(--ink-2); letter-spacing: .1em; }
+.ann-title { font-family: var(--serif); font-size: 20px; font-weight: 800; margin: 10px 0 8px; }
+.ann-content { color: var(--ink-2); font-size: 15px; white-space: pre-wrap; }
+
+.msg-form { display: grid; gap: 16px; max-width: 640px; }
+.msg-form label { display: grid; gap: 8px; font-size: 13px; color: var(--ink-2); letter-spacing: .06em; }
+.msg-form input, .msg-form select, .msg-form textarea {
+  font: inherit; font-size: 15px; color: var(--ink);
+  padding: 12px 14px; border: 1px solid var(--line); background: var(--paper); outline: none;
+}
+.msg-form input:focus, .msg-form select:focus, .msg-form textarea:focus { border-color: var(--red); }
+.msg-form textarea { resize: vertical; }
+.check { flex-direction: row !important; align-items: center; gap: 8px !important; }
+.check input { width: auto; }
+
+.msg-row {
+  display: grid; grid-template-columns: 130px 1fr auto auto;
+  gap: 16px; align-items: baseline;
+  padding: 14px 6px; border-bottom: 1px dashed var(--line); font-size: 14.5px;
+}
+.msg-to { font-family: var(--mono); color: var(--red); font-size: 13px; }
+.msg-row .msg-content { color: var(--ink); overflow-wrap: anywhere; }
+.msg-date { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.msg-state { font-size: 12px; color: var(--ink-2); font-family: var(--mono); }
+.msg-state--ok { color: var(--red); }
+
+/* ============ 管理后台 ============ */
+.panel-page--admin { max-width: 960px; }
+.admin-tabs { display: flex; gap: 4px; margin-bottom: 30px; border-bottom: 1px solid var(--line); }
+.admin-tabs button {
+  padding: 12px 22px; border: none; cursor: pointer;
+  background: none; font-family: var(--serif); font-size: 16px; font-weight: 700; color: var(--ink-2);
+  border-bottom: 3px solid transparent; transition: all .25s;
+}
+.admin-tabs button.on { color: var(--ink); border-bottom-color: var(--red); }
+.admin-tabs button:hover { color: var(--ink); }
+.ann-form { margin-bottom: 34px; padding: 22px; border: 1px dashed var(--line); }
+.admin-list { display: grid; gap: 10px; }
+.admin-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 14px 16px; border: 1px solid var(--line); background: var(--paper);
+  font-size: 15px;
+}
+.admin-row--msg { align-items: flex-start; flex-direction: column; cursor: pointer; }
+.admin-row--msg.unread { border-left: 4px solid var(--red); }
+.admin-row--msg .msg-content { margin-top: 4px; color: var(--ink-2); }
+.role-tag {
+  margin-left: 10px; padding: 2px 10px; font-size: 11px; letter-spacing: .12em;
+  border: 1px solid var(--line); color: var(--ink-2); font-family: var(--mono);
+}
+.role-tag--admin { border-color: var(--red); color: var(--red); }
+.role-tag--new { border-color: var(--red); background: var(--red); color: var(--cream); }
+.mini-btn {
+  padding: 7px 16px; border: 1px solid var(--ink); background: none; cursor: pointer;
+  font-size: 13px; transition: all .25s; white-space: nowrap;
+}
+.mini-btn:hover { background: var(--ink); color: var(--cream); }
+.mini-btn--danger { border-color: var(--red); color: var(--red); }
+.mini-btn--danger:hover { background: var(--red); color: var(--cream); }
+
+@media (max-width: 700px) {
+  .msg-row { grid-template-columns: 1fr; gap: 4px; }
+  .panel-page { padding-top: 100px; }
+}

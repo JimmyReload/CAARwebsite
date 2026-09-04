@@ -1,8 +1,23 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "caarwebsite",
+  "main": "src/worker.js",
   "compatibility_date": "2026-08-01",
   "assets": {
-    "directory": "./dist"
-  }
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "caar-db",
+      "database_id": "c935cca0-f944-40bc-afd0-ce627c01b83d"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS",
+      "id": "8f20215dd21b4491b8670741c872e1ff"
+    }
+  ]
 }
