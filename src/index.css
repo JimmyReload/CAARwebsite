@@ -428,3 +428,4 @@ html.intro-lock, html.intro-lock body { overflow: hidden; }
   .msg-row { grid-template-columns: 1fr; gap: 4px; }
   .panel-page { padding-top: 100px; }
 }
+.auth-msg--ok { color: var(--ink); border-color: rgba(44, 90, 60, .5); background: rgba(44, 90, 60, .06); }

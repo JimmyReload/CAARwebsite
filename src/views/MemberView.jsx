@@ -9,6 +9,9 @@ export default function MemberView() {
   const [to, setTo] = useState('')
   const [content, setContent] = useState('')
   const [msg, setMsg] = useState('')
+  const [op, setOp] = useState('')
+  const [np, setNp] = useState('')
+  const [pwMsg, setPwMsg] = useState('')
 
   const load = async () => {
     try {
@@ -18,6 +21,12 @@ export default function MemberView() {
     } catch { /* 401 由 Layout 处理跳转 */ }
   }
   useEffect(() => { load() }, [])
+
+  const changePw = async (e) => {
+    e.preventDefault(); setPwMsg('')
+    try { await api('/change-password', { method: 'POST', body: { old_password: op, new_password: np } }); setOp(''); setNp(''); setPwMsg('✓ 密码已更新') }
+    catch (err) { setPwMsg(err.message) }
+  }
 
   const send = async (e) => {
     e.preventDefault()
@@ -80,6 +89,16 @@ export default function MemberView() {
             {m.read ? <span className="msg-state msg-state--ok">已读</span> : <span className="msg-state">未读</span>}
           </div>
         ))}
+      </section>
+
+      <section className="panel-sec">
+        <h2 className="panel-sec-title">修改密码</h2>
+        <form onSubmit={changePw} className="msg-form">
+          <label>原密码 <input type="password" value={op} onChange={(e) => setOp(e.target.value)} required /></label>
+          <label>新密码 <input type="password" value={np} onChange={(e) => setNp(e.target.value)} minLength="6" placeholder="至少 6 位" required /></label>
+          {pwMsg && <p className={"auth-msg " + (pwMsg.startsWith('✓') ? 'auth-msg--ok' : '')}>{pwMsg}</p>}
+          <button className="auth-btn">保存新密码</button>
+        </form>
       </section>
     </div>
   )
