@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { HashRouter, Routes, Route, Link, useNavigate, useLocation, Navigate } from 'react-router-dom'
-import Intro from './components/Intro'
 import Reveal from './components/Reveal'
 import AuthView from './views/AuthView'
 import MemberView from './views/MemberView'
@@ -171,7 +170,6 @@ export default function App() {
   const { user, setUser, ready } = useUser()
   return (
     <>
-      <Intro />
       <HashRouter>
         <Shell user={user} setUser={setUser} ready={ready} />
         <Routes>

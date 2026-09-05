@@ -95,10 +95,10 @@ export default function MemberView() {
       </section>
 
       <section className="panel-sec">
-        <h2 className="panel-sec-title">联系 STAFF</h2>
+        <h2 className="panel-sec-title">站内信</h2>
         <div className="chat">
           <div className="chat-box" ref={boxRef}>
-            {!conv && msgs.length === 0 && <p className="panel-empty">还没有联系过 STAFF——有问题、有想法，直接发消息（STAFF 会在此回复你）</p>}
+            {!conv && msgs.length === 0 && <p className="panel-empty">还没有发过站内信——有问题、有想法，直接写给 STAFF（会在此回复你）</p>}
             {msgs.map((m) => (
               <div key={m.id} className={"chat-msg " + (m.direction === 'to_staff' ? 'chat-msg--me' : 'chat-msg--staff')}>
                 <div className="chat-bubble">{m.content}</div>

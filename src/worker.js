@@ -108,6 +108,7 @@ export default {
       if (!row) return json({ error: '用户名或密码错误' }, 401);
       const [salt, hash] = String(row.password).split(':');
       if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: '用户名或密码错误' }, 401);
+      if (row.banned) return json({ error: '该账号已被封禁，请联系 STAFF' }, 403);
       const token = await createSession(env, row.id);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role } }, token);
     }
@@ -225,10 +226,28 @@ export default {
       else await env.DB.prepare('UPDATE conversations SET staff_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
       return json({ ok: true });
     }
+    // 管理概览
+    if (path === 'admin/stats' && method === 'GET') {
+      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      const total = (await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first()).n;
+      const admins = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").first()).n;
+      const convs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations').first()).n;
+      const unreadConvs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations c WHERE EXISTS (SELECT 1 FROM messages m WHERE m.conv_id = c.id AND m.direction = ' + "'to_staff'" + ' AND m.id > c.staff_last_read_id)').first()).n;
+      const anns = (await env.DB.prepare('SELECT COUNT(*) AS n FROM announcements').first()).n;
+      const new7 = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE created_at >= datetime('now', '-7 days')").first()).n;
+      return json({ total, admins, convs, unreadConvs, anns, new7 });
+    }
+
     // 管理员：用户管理
     if (path === 'admin/users' && method === 'GET') {
       if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
-      const list = (await env.DB.prepare('SELECT id, username, nickname, role, created_at FROM users ORDER BY id').all()).results;
+      const q = String(url.searchParams.get('q') || '').trim();
+      let list;
+      if (q) {
+        list = (await env.DB.prepare("SELECT id, username, nickname, role, banned, created_at FROM users WHERE username LIKE ? OR nickname LIKE ? ORDER BY id").bind('%' + q + '%', '%' + q + '%').all()).results;
+      } else {
+        list = (await env.DB.prepare('SELECT id, username, nickname, role, banned, created_at FROM users ORDER BY id').all()).results;
+      }
       return json({ list });
     }
 
@@ -239,11 +258,32 @@ export default {
       if (b.role && !['user', 'admin'].includes(b.role)) return json({ error: '非法角色' }, 400);
       if (id === user.id && b.role && b.role !== 'admin') return json({ error: '不能撤销自己的管理员' }, 400);
       if (b.role) {
+        if (id === user.id && b.role !== 'admin') return json({ error: '不能撤销自己的管理员' }, 400);
         await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(b.role, id).run();
       }
       if (b.nickname !== undefined) {
         await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(String(b.nickname).trim(), id).run();
       }
+      if (b.banned !== undefined) {
+        if (id === user.id && b.banned) return json({ error: '不能封禁自己' }, 400);
+        await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
+      }
+      if (b.new_password !== undefined) {
+        const np = String(b.new_password);
+        if (np.length < 6) return json({ error: '新密码至少 6 位' }, 400);
+        const { salt: s2, hash: h2 } = await hashPassword(np);
+        await env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(s2 + ':' + h2, id).run();
+      }
+      return json({ ok: true });
+    }
+
+    if (path.startsWith('admin/announcements/') && method === 'PATCH') {
+      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      const id = Number(path.split('/')[2]);
+      const b = await readBody(request);
+      if (b.title !== undefined && !String(b.title).trim()) return json({ error: '标题不能为空' }, 400);
+      await env.DB.prepare('UPDATE announcements SET title = COALESCE(?, title), content = COALESCE(?, content), pinned = COALESCE(?, pinned) WHERE id = ?')
+        .bind(b.title !== undefined ? String(b.title).trim() : null, b.content !== undefined ? String(b.content) : null, b.pinned !== undefined ? (b.pinned ? 1 : 0) : null, id).run();
       return json({ ok: true });
     }
 
