@@ -72,13 +72,25 @@ export default {
     const url = new URL(request.url);
 
     if (!url.pathname.startsWith('/api/')) {
-      // SPA 兜底：先试静态资源，未命中返回 index.html
+      // 静态资源 + SPA 兜底（HTML 不缓存，带 hash 的资源长缓存）
       const res = await env.ASSETS.fetch(request);
       if (res.status === 404) {
         const idx = await env.ASSETS.fetch(new Request('https://placeholder/index.html'));
-        return new Response(idx.body, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+        return new Response(idx.body, {
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-cache, no-store, must-revalidate'
+          }
+        });
       }
-      return res;
+      const ctype = res.headers.get('content-type') || '';
+      const headers = new Headers(res.headers);
+      if (ctype.includes('text/html')) {
+        headers.set('cache-control', 'no-cache, no-store, must-revalidate');
+      } else if (url.pathname.startsWith('/assets/') || url.pathname.startsWith('/fonts/')) {
+        headers.set('cache-control', 'public, max-age=31536000, immutable');
+      }
+      return new Response(res.body, { status: res.status, headers });
     }
 
     const path = url.pathname.slice(5); // 去掉 /api/

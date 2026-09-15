@@ -141,6 +141,7 @@ section[id] { scroll-margin-top: 96px; }
   aspect-ratio: 3 / 4; background: var(--yellow); border: var(--border); box-shadow: var(--hard);
   display: flex; align-items: center; justify-content: center;
 }
+.about-portrait img { width: 100%; height: 100%; object-fit: cover; }
 .about-seal { font-size: clamp(38px, 4.4vw, 60px); font-weight: 900; color: #000; letter-spacing: -.04em; }
 .about-name { font-family: var(--font); font-size: clamp(24px, 2.7vw, 40px); font-weight: 900; letter-spacing: -.015em; }
 .about-role {
