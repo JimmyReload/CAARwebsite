@@ -37,7 +37,7 @@
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   background: var(--bg);
   background-image:
@@ -119,7 +119,7 @@ section[id] { scroll-margin-top: 96px; }
 
 /* ============ 区块 ============ */
 .col {
-  max-width: 1200px; margin: 26px auto 0; padding: clamp(26px, 4vw, 52px);
+  max-width: min(1200px, calc(100% - 24px)); margin: 26px auto 0; padding: clamp(26px, 4vw, 52px);
   background: #fff; border: var(--border); box-shadow: var(--hard);
 }
 .col--dark { background: #000; color: #fff; border-color: #000; box-shadow: 6px 6px 0 var(--yellow); }
@@ -205,7 +205,7 @@ section[id] { scroll-margin-top: 96px; }
 
 /* ============ 05 联系 ============ */
 .colophon {
-  max-width: 1200px; margin: 26px auto 60px; padding: clamp(30px, 5vw, 60px);
+  max-width: min(1200px, calc(100% - 24px)); margin: 26px auto 60px; padding: clamp(30px, 5vw, 60px);
   background: #000; color: #fff; border: 3px solid #000; box-shadow: 6px 6px 0 var(--yellow);
 }
 .colophon-mail {
@@ -223,7 +223,7 @@ section[id] { scroll-margin-top: 96px; }
 .colophon-foot { margin-top: 40px; padding-top: 20px; border-top: 3px solid var(--yellow); font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--yellow); }
 
 /* ============ 登录 / 注册 ============ */
-.auth-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 118px 18px 60px; }
+.auth-page { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 118px 18px 60px; }
 .auth-card {
   width: 100%; max-width: 460px; background: #fff;
   border: var(--border); box-shadow: var(--hard); padding: clamp(26px, 4vw, 40px);
@@ -252,7 +252,7 @@ section[id] { scroll-margin-top: 96px; }
 .auth-alt a:hover { background: var(--yellow); }
 
 /* ============ 面板 ============ */
-.panel-page { min-height: 100vh; padding: 112px clamp(16px, 4vw, 48px) 80px; max-width: 1040px; margin: 0 auto; }
+.panel-page { min-height: 100vh; min-height: 100dvh; padding: 112px clamp(16px, 4vw, 48px) 80px; max-width: 1040px; margin: 0 auto; }
 .panel-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 24px; border-bottom: 4px solid #000; padding-bottom: 16px; }
 .panel-title { font-family: var(--font); font-size: clamp(26px, 3.5vw, 44px); font-weight: 900; letter-spacing: -.02em; }
 .panel-back {
@@ -372,13 +372,57 @@ section[id] { scroll-margin-top: 96px; }
   .dash-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 700px) {
-  .mast-in { height: 60px; }
-  .mast-nav a:not(.mast-cta) { display: none; }
-  .cover { padding-top: 100px; }
+  /* 刊头：站名一行、链接一行（可横滑），不再隐藏任何入口 */
+  .mast-in { height: auto; min-height: 56px; padding: 8px clamp(12px, 4vw, 18px); flex-wrap: wrap; row-gap: 2px; }
+  .mast-name { font-size: 17px; }
+  .mast-nav { order: 2; width: 100%; gap: 4px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; }
+  .mast-nav::-webkit-scrollbar { display: none; }
+  .mast-nav a { font-size: 12px; padding: 6px 9px; }
+
+  .cover { padding-top: 122px; padding-bottom: 34px; }
+  .cover-title { text-shadow: 3px 3px 0 var(--yellow); }
+  .cover-cta { display: block; text-align: center; margin-top: 24px; padding: 15px 20px; }
+
+  .col { padding: 20px clamp(14px, 4vw, 22px); }
+  .col-head { gap: 10px; margin-bottom: 22px; }
+  .col-en { display: none; white-space: nowrap; }
   .about-stats { grid-template-columns: repeat(2, 1fr); }
   .staff-grid { grid-template-columns: 1fr; }
-  .col-en { display: none; white-space: nowrap; }
+  .staff { padding: 20px 14px; }
+  .record { padding: 18px 16px; }
+  .letter { padding: 16px; }
+  .letter-a { padding-left: 0; }
+  .colophon { padding: 26px 18px; margin-bottom: 40px; }
+  .colophon-mail { font-size: clamp(22px, 7vw, 34px); padding: 5px 12px; }
+  .colophon-row div { flex: 1 1 100%; }
+
+  .panel-page { padding: 104px clamp(14px, 4vw, 22px) 64px; }
+  .panel-sec { padding: 18px 16px; }
+  .panel-back { margin-left: 0; }
+  .auth-page { padding: 122px 14px 56px; }
+
   .msg-row { grid-template-columns: 1fr; gap: 4px; }
-  .panel-page { padding-top: 88px; }
   .chat-box { height: 300px; }
+  .chat-msg { max-width: 88%; }
+  .admin-row { flex-wrap: wrap; }
+  .btn-row { width: 100%; }
+  .mini-btn { padding: 9px 14px; }
+  .search-bar { flex-wrap: wrap; }
+  .search-bar input { min-width: 0; }
+  section[id] { scroll-margin-top: 128px; }
+}
+
+/* 触屏：抑制点按后残留的 hover 态 */
+@media (hover: none) {
+  .stat:hover, .staff:hover, .letter:hover, .dash-card:hover, .admin-row:hover,
+  .panel-back:hover, .mini-btn:hover, .ann:hover, .conv-row:hover,
+  .cover-cta:hover, .auth-btn:hover { transform: none; box-shadow: var(--hard-sm); }
+  .record:hover { transform: none; box-shadow: 6px 6px 0 var(--red); background: #111; color: #fff; border-color: var(--yellow); }
+  .record:hover .record-meta span:first-child { color: var(--red); }
+  .staff:hover { background: #fff; }
+  .admin-tabs button:hover:not(.on) { background: #fff; }
+  .colophon-mail:hover { background: var(--yellow); border-color: var(--yellow); color: #000; }
+  .cover-cta:hover { background: var(--red); }
+  .auth-btn:hover { background: #000; color: #fff; }
+  .mast-nav a:hover { background: transparent; color: inherit; border-color: transparent; }
 }
