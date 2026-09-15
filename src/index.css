@@ -363,53 +363,91 @@ section[id] { scroll-margin-top: 96px; }
 .search-bar input:focus { background: var(--yellow); }
 
 /* ============ 响应式 ============ */
-@media (max-width: 1000px) {
-  .about-grid { grid-template-columns: 1fr; }
-  .about-left { position: static; }
-  .about-portrait { max-width: 300px; }
-  .record { grid-template-columns: 1fr; gap: 12px; }
-  .staff-grid { grid-template-columns: repeat(2, 1fr); }
-  .dash-grid { grid-template-columns: repeat(2, 1fr); }
-}
+/* 1000px 以下不再重排：列数与桌面保持一致，靠 700px 断点做尺寸压缩 */
 @media (max-width: 700px) {
-  /* 刊头：站名一行、链接一行（可横滑），不再隐藏任何入口 */
-  .mast-in { height: auto; min-height: 56px; padding: 8px clamp(12px, 4vw, 18px); flex-wrap: wrap; row-gap: 2px; }
-  .mast-name { font-size: 17px; }
-  .mast-nav { order: 2; width: 100%; gap: 4px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; }
+  /* 版式与桌面一致：同样的栅格列数、同样的元素相对位置，仅压缩尺寸 */
+  .mast-in { height: 58px; padding: 0 12px; gap: 8px; }
+  .mast-name { font-size: 16px; white-space: nowrap; flex: 0 0 auto; }
+  .mast-nav { min-width: 0; margin-left: auto; gap: 2px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none;
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent); }
   .mast-nav::-webkit-scrollbar { display: none; }
-  .mast-nav a { font-size: 12px; padding: 6px 9px; }
+  .mast-nav a { flex: 0 0 auto; font-size: 11.5px; padding: 6px 7px; }
 
-  .cover { padding-top: 122px; padding-bottom: 34px; }
+  .cover { padding: 94px 12px 30px; }
   .cover-title { text-shadow: 3px 3px 0 var(--yellow); }
-  .cover-cta { display: block; text-align: center; margin-top: 24px; padding: 15px 20px; }
+  .cover-meta span { font-size: 11px; padding: 5px 9px; }
+  .cover-sub { font-size: 15px; }
 
-  .col { padding: 20px clamp(14px, 4vw, 22px); }
-  .col-head { gap: 10px; margin-bottom: 22px; }
-  .col-en { display: none; white-space: nowrap; }
-  .about-stats { grid-template-columns: repeat(2, 1fr); }
-  .staff-grid { grid-template-columns: 1fr; }
-  .staff { padding: 20px 14px; }
-  .record { padding: 18px 16px; }
+  .col { padding: 18px 12px; }
+  .col-head { gap: 10px; margin-bottom: 20px; padding-bottom: 12px; }
+  .col-no { font-size: 13px; padding: 6px 10px; }
+  .col-title { font-size: 24px; }
+  .col-en { font-size: 10.5px; padding: 4px 8px; }
+
+  /* 01 编者按：仍是左图右文 */
+  .about-grid { grid-template-columns: 30% minmax(0, 1fr); gap: 12px; }
+  .about-left { position: static; }
+  .about-name { font-size: 21px; }
+  .about-role { font-size: 11px; padding: 4px 9px; }
+  .about-intro { font-size: 14px; margin-top: 14px; gap: 10px; }
+  .about-contact { font-size: 11.5px; margin-top: 18px; }
+  .about-contact div { padding: 5px 8px; }
+  /* 数据格仍是一排四个 */
+  .about-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin-top: 20px; }
+  .stat { padding: 9px 5px; }
+  .stat-v { font-size: 14px; }
+  .stat-l { font-size: 9px; line-height: 1.3; white-space: normal; }
+
+  /* 02 项目：期号 + 正文两栏 */
+  .record { grid-template-columns: 100px minmax(0, 1fr); gap: 12px; padding: 16px 14px; }
+  .record-meta { font-size: 10.5px; }
+  .record-title { font-size: 19px; }
+  .record-desc { font-size: 13.5px; }
+
+  /* 03 成员：一排四个 */
+  .staff-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .staff { padding: 12px 5px; }
+  .staff-avatar { width: 52px; height: 52px; font-size: 22px; }
+  .staff-name { margin-top: 10px; font-size: 13.5px; }
+  .staff-role { font-size: 9.5px; padding: 2px 6px; }
+  .staff-desc { font-size: 11px; margin-top: 8px; }
+
+  /* 04 Q&A / 05 联系 */
   .letter { padding: 16px; }
-  .letter-a { padding-left: 0; }
-  .colophon { padding: 26px 18px; margin-bottom: 40px; }
-  .colophon-mail { font-size: clamp(22px, 7vw, 34px); padding: 5px 12px; }
-  .colophon-row div { flex: 1 1 100%; }
+  .letter-q { font-size: 15px; }
+  .letter-a { font-size: 14px; }
+  .colophon { padding: 24px 16px; margin-bottom: 40px; }
+  .colophon-note { font-size: 14px; }
+  .colophon-row { font-size: 11.5px; gap: 8px; }
+  .colophon-row div { padding: 9px 12px; }
+  .colophon-foot { font-size: 11.5px; }
 
-  .panel-page { padding: 104px clamp(14px, 4vw, 22px) 64px; }
-  .panel-sec { padding: 18px 16px; }
-  .panel-back { margin-left: 0; }
-  .auth-page { padding: 122px 14px 56px; }
-
-  .msg-row { grid-template-columns: 1fr; gap: 4px; }
+  /* 面板 / 后台：栅格不变，仅内边距与字号 */
+  .panel-page { padding: 94px 12px 56px; }
+  .panel-head { gap: 10px; margin-bottom: 18px; }
+  .panel-title { font-size: 24px; }
+  .panel-back { font-size: 11px; padding: 6px 10px; }
+  .panel-sec { padding: 16px 14px; }
+  .panel-sec-title { font-size: 17px; }
+  .auth-page { padding: 94px 14px 48px; }
+  .auth-title { font-size: 24px; }
+  .ann { padding: 14px; }
+  .dash-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .dash-card { padding: 13px 9px; }
+  .dash-n { font-size: 21px; }
+  .dash-l { font-size: 10px; }
+  .dash-pw { padding: 16px 14px; }
+  .admin-tabs { gap: 6px; }
+  .admin-tabs button { padding: 8px 12px; font-size: 11.5px; }
+  .admin-row { padding: 12px; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+  .mini-btn { padding: 6px 9px; font-size: 11px; border-width: 2px; box-shadow: 2px 2px 0 #000; }
+  .search-bar { gap: 8px; }
+  .search-bar input { padding: 10px 12px; }
+  .conv-row { padding: 12px; gap: 10px; }
   .chat-box { height: 300px; }
-  .chat-msg { max-width: 88%; }
-  .admin-row { flex-wrap: wrap; }
-  .btn-row { width: 100%; }
-  .mini-btn { padding: 9px 14px; }
-  .search-bar { flex-wrap: wrap; }
-  .search-bar input { min-width: 0; }
-  section[id] { scroll-margin-top: 128px; }
+  .chat-bubble { font-size: 14px; }
+  section[id] { scroll-margin-top: 84px; }
 }
 
 /* 触屏：抑制点按后残留的 hover 态 */
