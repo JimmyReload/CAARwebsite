@@ -174,8 +174,8 @@ export default function App() {
         <Shell user={user} setUser={setUser} ready={ready} />
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/login" element={<AuthView mode="login" />} />
-          <Route path="/register" element={<AuthView mode="register" />} />
+          <Route path="/login" element={<AuthView mode="login" onLogin={setUser} />} />
+          <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
           <Route path="/member" element={ready && !user ? <Navigate to="/login" replace /> : <MemberView />} />
           <Route path="/admin" element={ready && (!user || user.role !== 'admin') ? <Navigate to="/login" replace /> : <AdminView />} />
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import api from '../api'
 
-export default function AuthView({ mode }) {
+export default function AuthView({ mode, onLogin }) {
   const isLogin = mode === 'login'
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -15,8 +15,11 @@ export default function AuthView({ mode }) {
     e.preventDefault()
     setBusy(true); setMsg('')
     try {
-      await api(isLogin ? '/login' : '/register', { method: 'POST', body: { username, password, nickname } })
-      if (isLogin) { nav('/member') } else { setMsg('注册成功，请登录'); setPassword('') }
+      const d = await api(isLogin ? '/login' : '/register', { method: 'POST', body: { username, password, nickname } })
+      if (isLogin) {
+        if (onLogin) onLogin(d.user)
+        nav(d.user && d.user.role === 'admin' ? '/admin' : '/member')
+      } else { setMsg('注册成功，请登录'); setPassword('') }
     } catch (err) { setMsg(err.message) } finally { setBusy(false) }
   }
 

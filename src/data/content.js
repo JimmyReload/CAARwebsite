@@ -21,7 +21,7 @@ export const hero = {
 }
 
 export const about = {
-  image: "https://q1.qlogo.cn/g?b=qq&nk=743899771&s=100",
+  image: "/images/caar-hero.jpg",
   name: "cn177",
   role: "会长 / 运营",
   intro: [
@@ -61,9 +61,9 @@ export const projects = [
 ]
 
 export const members = [
-  { name: "177", role: "会长", avatar: "https://q1.qlogo.cn/g?b=qq&nk=743899771&s=100", desc: "协会创始人，负责把大家拉进不解完不罢休的坑。" },
-  { name: "Tom", role: "副会长", avatar: "https://q1.qlogo.cn/g?b=qq&nk=3152841984&s=100", desc: "协会的第二个大脑，擅长统筹与后勤。" },
-  { name: "ytyn", role: "纸笔手", avatar: "https://q1.qlogo.cn/g?b=qq&nk=3991453315&s=100", desc: "纸笔题担当，笔尖即武器。" },
+  { name: "177", role: "会长", avatar: "/images/caar-hero.jpg", desc: "协会创始人，负责把大家拉进不解完不罢休的坑。" },
+  { name: "Tom", role: "副会长", avatar: "https://q1.qlogo.cn/g?b=qq&nk=3152841984&s=640", desc: "协会的第二个大脑，擅长统筹与后勤。" },
+  { name: "ytyn", role: "纸笔手", avatar: "https://q1.qlogo.cn/g?b=qq&nk=3991453315&s=640", desc: "纸笔题担当，笔尖即武器。" },
   { name: "虚位以待", role: "等你加入", avatar: "", desc: "下一块拼图，可能是你。" },
 ]
 
