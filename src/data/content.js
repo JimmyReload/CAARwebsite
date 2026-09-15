@@ -11,9 +11,9 @@ export const site = {
 }
 
 export const hero = {
-  kicker: "CHINA ABNORMAL PUZZLING ASSOCIATION",
+  kicker: "China Abnormal Puzzling Association",
   title1: "中国不正常推理协会",
-  title2: "CHINA ABNORMAL PUZZLING ASSOCIATION",
+  title2: "China Abnormal Puzzling Association",
   subtitle: "Everything or Nothing.——我们用不正常的脑回路，解最正经的谜。",
   cta: "加入我们",
   videoSrc: "",
