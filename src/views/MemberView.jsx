@@ -87,7 +87,7 @@ export default function MemberView() {
         {anns.length === 0 && <p className="panel-empty">暂无公告</p>}
         {anns.map((a) => (
           <article key={a.id} className={"ann " + (a.pinned ? 'ann--pinned' : '')}>
-            <div className="ann-meta"><span>{a.pinned ? '📌 置顶' : a.author}</span><span>{String(a.created_at).slice(0, 10)}</span></div>
+            <div className="ann-meta"><span>{a.pinned ? '置顶公告' : a.author}</span><span>{String(a.created_at).slice(0, 10)}</span></div>
             <h3 className="ann-title">{a.title}</h3>
             <p className="ann-content">{a.content}</p>
           </article>
