@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import api from '../api'
+import { t } from '../i18n'
 
 export default function AuthView({ mode, onLogin }) {
   const isLogin = mode === 'login'
@@ -19,38 +20,38 @@ export default function AuthView({ mode, onLogin }) {
       if (isLogin) {
         if (onLogin) onLogin(d.user)
         nav(d.user && d.user.role === 'admin' ? '/admin' : '/member')
-      } else { setMsg('注册成功，请登录'); setPassword('') }
+      } else { setMsg(t('auth.registerOk')); setPassword('') }
     } catch (err) { setMsg(err.message) } finally { setBusy(false) }
   }
 
   return (
     <div className="auth-page">
       <div className="auth-card">
-        <p className="auth-kicker">{isLogin ? 'MEMBER LOGIN' : 'JOIN US'}</p>
-        <h1 className="auth-title">{isLogin ? '成员登录' : '申请入会'}</h1>
-        <p className="auth-sub">{isLogin ? '欢迎回来，继续解谜。' : '开放注册——读完《入会协定》即可申请。'}</p>
+        <p className="auth-kicker">{isLogin ? t('auth.loginKicker') : t('auth.registerKicker')}</p>
+        <h1 className="auth-title">{isLogin ? t('auth.loginTitle') : t('auth.registerTitle')}</h1>
+        <p className="auth-sub">{isLogin ? t('auth.loginSub') : t('auth.registerSub')}</p>
         <form onSubmit={submit} className="auth-form">
           {!isLogin && (
-            <label>昵称（选填）
-              <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="怎么称呼你" maxLength="20" />
+            <label>{t('auth.nicknameLabel')}
+              <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder={t('auth.nicknamePlaceholder')} maxLength="20" />
             </label>
           )}
-          <label>用户名
-            <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="2-20 位，中文/字母/数字/下划线" maxLength="20" required />
+          <label>{t('auth.usernameLabel')}
+            <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder={t('auth.usernamePlaceholder')} maxLength="20" required />
           </label>
-          <label>密码
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="至少 6 位" minLength="6" required />
+          <label>{t('auth.passwordLabel')}
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={t('auth.passwordPlaceholder')} minLength="6" required />
           </label>
           {msg && <p className="auth-msg">{msg}</p>}
-          <button className="auth-btn" disabled={busy}>{busy ? '处理中…' : (isLogin ? '登录' : '注册')}</button>
+          <button className="auth-btn" disabled={busy}>{busy ? t('auth.busy') : (isLogin ? t('auth.login') : t('auth.register'))}</button>
         </form>
         <p className="auth-alt">
           {isLogin ? (
-            <span>还没有账号？<Link to="/register">申请入会</Link></span>
+            <span>{t('auth.noAccount')}<Link to="/register">{t('auth.goRegister')}</Link></span>
           ) : (
-            <span>已有账号？<Link to="/login">直接登录</Link></span>
+            <span>{t('auth.hasAccount')}<Link to="/login">{t('auth.goLogin')}</Link></span>
           )}
-          <Link to="/">← 返回首页</Link>
+          <Link to="/">{t('common.backHome')}</Link>
         </p>
       </div>
     </div>

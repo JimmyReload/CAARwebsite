@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../api'
+import { t } from '../i18n'
 
 export default function MemberView() {
   const [anns, setAnns] = useState([])
@@ -42,7 +43,7 @@ export default function MemberView() {
   /* 增量轮询：新消息自动出现 */
   useEffect(() => {
     if (!conv) return
-    const t = setInterval(async () => {
+    const timer = setInterval(async () => {
       try {
         const lastId = msgs.length ? msgs[msgs.length - 1].id : 0
         const m = await api('/conversation/' + conv.id + '/messages?after=' + lastId)
@@ -53,7 +54,7 @@ export default function MemberView() {
         }
       } catch {}
     }, 8000)
-    return () => clearInterval(t)
+    return () => clearInterval(timer)
   }, [conv, msgs])
 
   const send = async (e) => {
@@ -70,24 +71,24 @@ export default function MemberView() {
 
   const changePw = async (e) => {
     e.preventDefault(); setPwMsg('')
-    try { await api('/change-password', { method: 'POST', body: { old_password: op, new_password: np } }); setOp(''); setNp(''); setPwMsg('✓ 密码已更新') }
+    try { await api('/change-password', { method: 'POST', body: { old_password: op, new_password: np } }); setOp(''); setNp(''); setPwMsg(t('password.ok')) }
     catch (err) { setPwMsg(err.message) }
   }
 
   return (
     <div className="panel-page">
       <div className="panel-head">
-        <p className="auth-kicker">MEMBER DESK</p>
-        <h1 className="panel-title">成员面板</h1>
-        <Link className="panel-back" to="/">← 返回首页</Link>
+        <p className="auth-kicker">{t('member.kicker')}</p>
+        <h1 className="panel-title">{t('member.title')}</h1>
+        <Link className="panel-back" to="/">{t('common.backHome')}</Link>
       </div>
 
       <section className="panel-sec">
-        <h2 className="panel-sec-title">协会公告</h2>
-        {anns.length === 0 && <p className="panel-empty">暂无公告</p>}
+        <h2 className="panel-sec-title">{t('member.announcements')}</h2>
+        {anns.length === 0 && <p className="panel-empty">{t('member.noAnnouncements')}</p>}
         {anns.map((a) => (
           <article key={a.id} className={"ann " + (a.pinned ? 'ann--pinned' : '')}>
-            <div className="ann-meta"><span>{a.pinned ? '置顶公告' : a.author}</span><span>{String(a.created_at).slice(0, 10)}</span></div>
+            <div className="ann-meta"><span>{a.pinned ? t('member.pinned') : a.author}</span><span>{String(a.created_at).slice(0, 10)}</span></div>
             <h3 className="ann-title">{a.title}</h3>
             <p className="ann-content">{a.content}</p>
           </article>
@@ -95,32 +96,32 @@ export default function MemberView() {
       </section>
 
       <section className="panel-sec">
-        <h2 className="panel-sec-title">站内信</h2>
+        <h2 className="panel-sec-title">{t('member.inbox')}</h2>
         <div className="chat">
           <div className="chat-box" ref={boxRef}>
-            {!conv && msgs.length === 0 && <p className="panel-empty">还没有发过站内信——有问题、有想法，直接写给 STAFF（会在此回复你）</p>}
+            {!conv && msgs.length === 0 && <p className="panel-empty">{t('member.inboxEmpty')}</p>}
             {msgs.map((m) => (
               <div key={m.id} className={"chat-msg " + (m.direction === 'to_staff' ? 'chat-msg--me' : 'chat-msg--staff')}>
                 <div className="chat-bubble">{m.content}</div>
-                <span className="chat-meta">{m.direction === 'to_staff' ? '我' : 'STAFF'} · {String(m.created_at).slice(5, 16)}</span>
+                <span className="chat-meta">{m.direction === 'to_staff' ? t('member.me') : t('member.staff')} · {String(m.created_at).slice(5, 16)}</span>
               </div>
             ))}
           </div>
           <form onSubmit={send} className="chat-form">
-            <textarea value={content} onChange={(e) => setContent(e.target.value)} rows="2" maxLength="1000" placeholder="输入消息…（≤1000 字）" required />
+            <textarea value={content} onChange={(e) => setContent(e.target.value)} rows="2" maxLength="1000" placeholder={t('member.messagePlaceholder')} required />
             {msg && <p className="auth-msg">{msg}</p>}
-            <button className="auth-btn">发送</button>
+            <button className="auth-btn">{t('member.send')}</button>
           </form>
         </div>
       </section>
 
       <section className="panel-sec">
-        <h2 className="panel-sec-title">修改密码</h2>
+        <h2 className="panel-sec-title">{t('member.changePassword')}</h2>
         <form onSubmit={changePw} className="msg-form">
-          <label>原密码 <input type="password" value={op} onChange={(e) => setOp(e.target.value)} required /></label>
-          <label>新密码 <input type="password" value={np} onChange={(e) => setNp(e.target.value)} minLength="6" placeholder="至少 6 位" required /></label>
+          <label>{t('password.old')} <input type="password" value={op} onChange={(e) => setOp(e.target.value)} required /></label>
+          <label>{t('password.next')} <input type="password" value={np} onChange={(e) => setNp(e.target.value)} minLength="6" placeholder={t('password.placeholder')} required /></label>
           {pwMsg && <p className={"auth-msg " + (pwMsg.indexOf('✓') === 0 ? 'auth-msg--ok' : '')}>{pwMsg}</p>}
-          <button className="auth-btn">保存新密码</button>
+          <button className="auth-btn">{t('password.save')}</button>
         </form>
       </section>
     </div>

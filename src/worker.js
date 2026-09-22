@@ -1,6 +1,8 @@
 // CAAR 用户系统 API —— Cloudflare Worker（D1 + KV）
 // 密码哈希：PBKDF2-SHA256（Web Crypto）
 // 会话：随机令牌存 KV，HttpOnly Cookie
+// 所有面向用户的提示文案统一取自 locales/zh-CN.js
+import { t } from './i18n'
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -103,11 +105,11 @@ export default {
       const username = String(b.username || '').trim();
       const password = String(b.password || '');
       const nickname = String(b.nickname || '').trim() || username;
-      if (username.length < 2 || username.length > 20) return json({ error: '用户名需 2-20 个字符' }, 400);
-      if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) return json({ error: '用户名只能含中文/字母/数字/下划线' }, 400);
-      if (password.length < 6) return json({ error: '密码至少 6 位' }, 400);
+      if (username.length < 2 || username.length > 20) return json({ error: t('errors.usernameLength') }, 400);
+      if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) return json({ error: t('errors.usernameCharset') }, 400);
+      if (password.length < 6) return json({ error: t('errors.passwordLength') }, 400);
       const exists = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
-      if (exists) return json({ error: '该用户名已被注册' }, 409);
+      if (exists) return json({ error: t('errors.usernameTaken') }, 409);
       const { salt, hash } = await hashPassword(password);
       await env.DB.prepare('INSERT INTO users (username, password, nickname, role) VALUES (?, ?, ?, ?)')
         .bind(username, salt + ':' + hash, nickname, 'user').run();
@@ -117,10 +119,10 @@ export default {
     if (path === 'login' && method === 'POST') {
       const b = await readBody(request);
       const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(String(b.username || '')).first();
-      if (!row) return json({ error: '用户名或密码错误' }, 401);
+      if (!row) return json({ error: t('errors.badCredentials') }, 401);
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: '用户名或密码错误' }, 401);
-      if (row.banned) return json({ error: '该账号已被封禁，请联系 STAFF' }, 403);
+      if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
+      if (row.banned) return json({ error: t('errors.banned') }, 403);
       const token = await createSession(env, row.id);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role } }, token);
     }
@@ -135,9 +137,9 @@ export default {
       const b = await readBody(request);
       const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: '原密码错误' }, 400);
+      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: t('errors.wrongOldPassword') }, 400);
       const np = String(b.new_password || '');
-      if (np.length < 6) return json({ error: '新密码至少 6 位' }, 400);
+      if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
       const { salt: s2, hash: h2 } = await hashPassword(np);
       await env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(s2 + ':' + h2, user.id).run();
       return json({ ok: true });
@@ -148,7 +150,7 @@ export default {
     }
 
     // ---------- 以下需要登录 ----------
-    if (!user) return json({ error: '未登录' }, 401);
+    if (!user) return json({ error: t('errors.unauthorized') }, 401);
 
     // 公告
     if (path === 'announcements' && method === 'GET') {
@@ -157,9 +159,9 @@ export default {
     }
 
     if (path === 'announcements' && method === 'POST') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
-      if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: '标题和内容不能为空' }, 400);
+      if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: t('errors.announceEmpty') }, 400);
       const r = await env.DB.prepare('INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?)')
         .bind(String(b.title).trim(), String(b.content).trim(), user.nickname || user.username, b.pinned ? 1 : 0).run();
       return json({ ok: true, id: r.meta.last_row_id });
@@ -181,8 +183,8 @@ export default {
     if (path === 'conversation/message' && method === 'POST') {
       const b = await readBody(request);
       const content = String(b.content || '').trim();
-      if (!content) return json({ error: '内容不能为空' }, 400);
-      if (content.length > 1000) return json({ error: '内容过长（≤1000 字）' }, 400);
+      if (!content) return json({ error: t('errors.contentEmpty') }, 400);
+      if (content.length > 1000) return json({ error: t('errors.contentTooLong') }, 400);
       let conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
       if (!conv) {
         const cr = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (?)').bind(user.id).run();
@@ -195,14 +197,14 @@ export default {
 
     // STAFF 回复
     if (path === 'conversation/reply' && method === 'POST') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
       const convId = Number(b.conv_id);
       const content = String(b.content || '').trim();
-      if (!convId || !content) return json({ error: '参数不完整' }, 400);
-      if (content.length > 1000) return json({ error: '内容过长（≤1000 字）' }, 400);
+      if (!convId || !content) return json({ error: t('errors.badParams') }, 400);
+      if (content.length > 1000) return json({ error: t('errors.contentTooLong') }, 400);
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-      if (!conv) return json({ error: '会话不存在' }, 404);
+      if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_user', ?)").bind(convId, user.id, content).run();
       await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(convId).run();
       return json({ ok: true, msg_id: ins.meta.last_row_id });
@@ -212,9 +214,9 @@ export default {
     if (path.indexOf('conversation/') === 0 && path.endsWith('/messages') && method === 'GET') {
       const convId = Number(path.split('/')[1]);
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-      if (!conv) return json({ error: '会话不存在' }, 404);
+      if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const isOwner = conv.user_id === user.id;
-      if (!isOwner && user.role !== 'admin') return json({ error: '无权访问' }, 403);
+      if (!isOwner && user.role !== 'admin') return json({ error: t('errors.forbidden') }, 403);
       const after = Number(url.searchParams.get('after') || 0);
       let msgs;
       if (after > 0) {
@@ -230,9 +232,9 @@ export default {
     if (path.indexOf('conversation/') === 0 && path.endsWith('/read') && method === 'POST') {
       const convId = Number(path.split('/')[1]);
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-      if (!conv) return json({ error: '会话不存在' }, 404);
+      if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const isOwner = conv.user_id === user.id;
-      if (!isOwner && user.role !== 'admin') return json({ error: '无权访问' }, 403);
+      if (!isOwner && user.role !== 'admin') return json({ error: t('errors.forbidden') }, 403);
       const last = await env.DB.prepare('SELECT MAX(id) AS n FROM messages WHERE conv_id = ?').bind(convId).first();
       if (isOwner) await env.DB.prepare('UPDATE conversations SET user_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
       else await env.DB.prepare('UPDATE conversations SET staff_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
@@ -240,7 +242,7 @@ export default {
     }
     // 管理概览
     if (path === 'admin/stats' && method === 'GET') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const total = (await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first()).n;
       const admins = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").first()).n;
       const convs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations').first()).n;
@@ -252,7 +254,7 @@ export default {
 
     // 管理员：用户管理
     if (path === 'admin/users' && method === 'GET') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const q = String(url.searchParams.get('q') || '').trim();
       let list;
       if (q) {
@@ -264,25 +266,25 @@ export default {
     }
 
     if (path.startsWith('admin/users/') && method === 'PATCH') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
       const b = await readBody(request);
-      if (b.role && !['user', 'admin'].includes(b.role)) return json({ error: '非法角色' }, 400);
-      if (id === user.id && b.role && b.role !== 'admin') return json({ error: '不能撤销自己的管理员' }, 400);
+      if (b.role && !['user', 'admin'].includes(b.role)) return json({ error: t('errors.invalidRole') }, 400);
+      if (id === user.id && b.role && b.role !== 'admin') return json({ error: t('errors.cannotDemoteSelf') }, 400);
       if (b.role) {
-        if (id === user.id && b.role !== 'admin') return json({ error: '不能撤销自己的管理员' }, 400);
+        if (id === user.id && b.role !== 'admin') return json({ error: t('errors.cannotDemoteSelf') }, 400);
         await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(b.role, id).run();
       }
       if (b.nickname !== undefined) {
         await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(String(b.nickname).trim(), id).run();
       }
       if (b.banned !== undefined) {
-        if (id === user.id && b.banned) return json({ error: '不能封禁自己' }, 400);
+        if (id === user.id && b.banned) return json({ error: t('errors.cannotBanSelf') }, 400);
         await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
       }
       if (b.new_password !== undefined) {
         const np = String(b.new_password);
-        if (np.length < 6) return json({ error: '新密码至少 6 位' }, 400);
+        if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
         await env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(s2 + ':' + h2, id).run();
       }
@@ -290,17 +292,17 @@ export default {
     }
 
     if (path.startsWith('admin/announcements/') && method === 'PATCH') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
       const b = await readBody(request);
-      if (b.title !== undefined && !String(b.title).trim()) return json({ error: '标题不能为空' }, 400);
+      if (b.title !== undefined && !String(b.title).trim()) return json({ error: t('errors.titleEmpty') }, 400);
       await env.DB.prepare('UPDATE announcements SET title = COALESCE(?, title), content = COALESCE(?, content), pinned = COALESCE(?, pinned) WHERE id = ?')
         .bind(b.title !== undefined ? String(b.title).trim() : null, b.content !== undefined ? String(b.content) : null, b.pinned !== undefined ? (b.pinned ? 1 : 0) : null, id).run();
       return json({ ok: true });
     }
 
     if (path.startsWith('admin/announcements/') && method === 'DELETE') {
-      if (user.role !== 'admin') return json({ error: '需要管理员权限' }, 403);
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(Number(path.split('/')[2])).run();
       return json({ ok: true });
     }
