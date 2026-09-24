@@ -40,22 +40,28 @@ export default function MemberView() {
     load()
   }, [])
 
-  /* 增量轮询：新消息自动出现 */
+  /* 增量轮询：新消息自动出现
+     用 ref 持有最新消息 id，避免把 msgs 放进依赖导致每次新消息都重建定时器 */
+  const lastIdRef = useRef(0)
+  useEffect(() => { lastIdRef.current = msgs.length ? msgs[msgs.length - 1].id : 0 }, [msgs])
+
   useEffect(() => {
     if (!conv) return
     const timer = setInterval(async () => {
       try {
-        const lastId = msgs.length ? msgs[msgs.length - 1].id : 0
-        const m = await api('/conversation/' + conv.id + '/messages?after=' + lastId)
+        const m = await api('/conversation/' + conv.id + '/messages?after=' + lastIdRef.current)
         if (m.list && m.list.length) {
-          setMsgs((old) => old.concat(m.list))
+          setMsgs((old) => {
+            const seen = new Set(old.map((x) => x.id))
+            return old.concat(m.list.filter((x) => !seen.has(x.id)))
+          })
           await api('/conversation/' + conv.id + '/read', { method: 'POST' })
           scrollDown()
         }
       } catch {}
     }, 8000)
     return () => clearInterval(timer)
-  }, [conv, msgs])
+  }, [conv])
 
   const send = async (e) => {
     e.preventDefault()

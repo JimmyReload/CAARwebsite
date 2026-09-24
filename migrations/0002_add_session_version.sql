@@ -1,0 +1,23 @@
+-- ============================================================
+-- CAAR · 安全修复 migration（2026-09-24）
+--
+-- 用途：为 F-04（改密后旧会话失效）提供数据库支持。
+--
+-- 线上实际状态（2026-09-24 经 D1 API 只读查证）：
+--   users 列 = id, username, password, nickname, role, created_at, banned
+--   → banned 列【已存在】（代码早就在用，只是 schema.sql 未收录）
+--   → session_version 列【缺失】，本 migration 只需补这一列
+--
+-- 因此不要执行 ADD COLUMN banned，会因列已存在而失败。
+--
+-- 执行方式（需先备份）：
+--   wrangler d1 export caar-db --remote --output=backup-before-session-version.sql
+--   wrangler d1 execute caar-db --remote --file=./migrations/0001_add_session_version.sql
+--
+-- 注意：本文件尚未执行。
+-- ============================================================
+
+-- F-04 需要：会话版本号。改密时 +1，使所有旧会话失效。
+-- 默认值 0，与代码里 sessVersion() 对旧会话值（无冒号）返回 0 的行为一致，
+-- 因此部署后【现有会话不会立即失效】，用户需重新登录一次才带上版本号。
+ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0;

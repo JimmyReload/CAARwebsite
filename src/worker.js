@@ -7,11 +7,29 @@ import { t } from './i18n'
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+// 统一安全响应头（全站出口统一附加）
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'strict-transport-security': 'max-age=31536000; includeSubDomains',
+  'permissions-policy': 'geolocation=(), microphone=(), camera=()'
+};
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...SECURITY_HEADERS
+    }
   });
+}
+function harden(res) {
+  const headers = new Headers(res.headers);
+  for (const k in SECURITY_HEADERS) if (!headers.has(k)) headers.set(k, SECURITY_HEADERS[k]);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
 async function readBody(req) {
@@ -30,6 +48,7 @@ async function hashPassword(pw, saltHex) {
 }
 function hexToBytes(h) { const a = new Uint8Array(h.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16); return a; }
 function bytesToHex(b) { return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join(''); }
+const DUMMY_SALT = '00000000000000000000000000000000';
 async function verifyPassword(pw, saltHex, hashHex) {
   const { hash } = await hashPassword(pw, saltHex);
   return hash === hashHex;
@@ -39,9 +58,9 @@ async function verifyPassword(pw, saltHex, hashHex) {
 const SESSION_COOKIE = 'caar_session';
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 天
 
-async function createSession(env, userId) {
+async function createSession(env, userId, version = 0) {
   const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');
-  await env.SESSIONS.put('s:' + token, String(userId), { expirationTtl: SESSION_TTL });
+  await env.SESSIONS.put('s:' + token, String(userId) + ':' + Number(version || 0), { expirationTtl: SESSION_TTL });
   return token;
 }
 async function getSessionUser(env, cookie) {
@@ -51,9 +70,21 @@ async function getSessionUser(env, cookie) {
   const token = m.slice(SESSION_COOKIE.length + 1);
   const uid = await env.SESSIONS.get('s:' + token);
   if (!uid) return null;
-  const user = await env.DB.prepare('SELECT id, username, nickname, role, created_at FROM users WHERE id = ?').bind(Number(uid)).first();
-  return user || null;
+  const userId = Number(String(uid).split(':')[0]);
+  if (!Number.isFinite(userId)) return null;
+  const user = await env.DB.prepare('SELECT id, username, nickname, role, banned, session_version, created_at FROM users WHERE id = ?').bind(userId).first();
+  if (!user) return null;
+  // 封禁即时生效：不依赖用户重新登录
+  if (user.banned) { await env.SESSIONS.delete('s:' + token); return null; }
+  // 改密后旧会话失效（compare 版本号）
+  if (Number(user.session_version) !== Number(sessVersion(uid))) {
+    await env.SESSIONS.delete('s:' + token);
+    return null;
+  }
+  return user;
 }
+// 会话记录形如 "<userId>:<sessionVersion>"；兼容早期只存 userId 的旧值
+function sessVersion(v) { const s = String(v); const i = s.indexOf(':'); return i < 0 ? 0 : Number(s.slice(i + 1)); }
 function sessionCookie(token) {
   return SESSION_COOKIE + '=' + token + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' + SESSION_TTL;
 }
@@ -78,12 +109,12 @@ export default {
       const res = await env.ASSETS.fetch(request);
       if (res.status === 404) {
         const idx = await env.ASSETS.fetch(new Request('https://placeholder/index.html'));
-        return new Response(idx.body, {
+        return harden(new Response(idx.body, {
           headers: {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-cache, no-store, must-revalidate'
           }
-        });
+        }));
       }
       const ctype = res.headers.get('content-type') || '';
       const headers = new Headers(res.headers);
@@ -92,7 +123,7 @@ export default {
       } else if (url.pathname.startsWith('/assets/') || url.pathname.startsWith('/fonts/')) {
         headers.set('cache-control', 'public, max-age=31536000, immutable');
       }
-      return new Response(res.body, { status: res.status, headers });
+      return harden(new Response(res.body, { status: res.status, headers }));
     }
 
     const path = url.pathname.slice(5); // 去掉 /api/
@@ -119,11 +150,15 @@ export default {
     if (path === 'login' && method === 'POST') {
       const b = await readBody(request);
       const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(String(b.username || '')).first();
-      if (!row) return json({ error: t('errors.badCredentials') }, 401);
+      if (!row) {
+        // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致
+        await hashPassword(String(b.password || ''), DUMMY_SALT);
+        return json({ error: t('errors.badCredentials') }, 401);
+      }
       const [salt, hash] = String(row.password).split(':');
       if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
       if (row.banned) return json({ error: t('errors.banned') }, 403);
-      const token = await createSession(env, row.id);
+      const token = await createSession(env, row.id, row.session_version);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role } }, token);
     }
 
@@ -133,24 +168,25 @@ export default {
       return okWithCookie({ ok: true }, null);
     }
 
-    if (path === 'change-password' && method === 'POST') {
-      const b = await readBody(request);
-      const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
-      const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: t('errors.wrongOldPassword') }, 400);
-      const np = String(b.new_password || '');
-      if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
-      const { salt: s2, hash: h2 } = await hashPassword(np);
-      await env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(s2 + ':' + h2, user.id).run();
-      return json({ ok: true });
-    }
-
     if (path === 'me' && method === 'GET') {
       return json({ user });
     }
 
     // ---------- 以下需要登录 ----------
     if (!user) return json({ error: t('errors.unauthorized') }, 401);
+
+    if (path === 'change-password' && method === 'POST') {
+      const b = await readBody(request);
+      const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
+      if (!row) return json({ error: t('errors.unauthorized') }, 401);
+      const [salt, hash] = String(row.password).split(':');
+      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: t('errors.wrongOldPassword') }, 400);
+      const np = String(b.new_password || '');
+      if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
+      const { salt: s2, hash: h2 } = await hashPassword(np);
+      await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, user.id).run();
+      return json({ ok: true });
+    }
 
     // 公告
     if (path === 'announcements' && method === 'GET') {
@@ -286,7 +322,7 @@ export default {
         const np = String(b.new_password);
         if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
-        await env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(s2 + ':' + h2, id).run();
+        await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, id).run();
       }
       return json({ ok: true });
     }
