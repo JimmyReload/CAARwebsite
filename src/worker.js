@@ -121,7 +121,11 @@ export default {
       if (ctype.includes('text/html')) {
         headers.set('cache-control', 'no-cache, no-store, must-revalidate');
       } else if (url.pathname.startsWith('/assets/') || url.pathname.startsWith('/fonts/')) {
+        // 带内容 hash，可无限缓存
         headers.set('cache-control', 'public, max-age=31536000, immutable');
+      } else if (url.pathname === '/favicon.ico' || url.pathname.startsWith('/images/')) {
+        // 文件名固定、内容极少变：给 1 天缓存 + 后台校验，避免每次访问都重新下载
+        headers.set('cache-control', 'public, max-age=86400, stale-while-revalidate=604800');
       }
       return harden(new Response(res.body, { status: res.status, headers }));
     }

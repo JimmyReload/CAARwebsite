@@ -63,7 +63,12 @@ function Home() {
         <div className="about-grid">
           <Reveal className="about-left">
             <div className="about-portrait">
-              {t('about.image') ? <img src={t('about.image')} alt={t('about.name')} /> : <span className="about-seal">{t('about.name')}</span>}
+              {t('about.image') ? (
+                <picture>
+                  <source srcSet="/images/caar-hero-portrait.webp" type="image/webp" />
+                  <img src={t('about.image')} alt={t('about.name')} width={480} height={640} />
+                </picture>
+              ) : <span className="about-seal">{t('about.name')}</span>}
             </div>
           </Reveal>
           <div className="about-right">
