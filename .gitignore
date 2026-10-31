@@ -5,3 +5,17 @@ npm-debug.log
 dist/
 .wrangler/
 _bak-*/
+
+# 本地工作区数据：含 QQ 群聊天导出（第三方个人信息）、会话记忆，禁止入库
+.workbuddy-ai/
+
+# 环境变量与密钥（Cloudflare / 第三方 API）
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+
+# 数据库导出与备份（含用户表，含口令哈希）
+*.sql.bak
+backup-*.sql
+d1-export-*.sql

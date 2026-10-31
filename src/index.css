@@ -137,9 +137,10 @@ section[id] { scroll-margin-top: 96px; }
 
 /* ============ 01 编者按 ============ */
 .about-grid { display: grid; grid-template-columns: minmax(240px, 330px) 1fr; gap: clamp(24px, 3.6vw, 48px); align-items: start; }
-.about-left { position: sticky; top: 92px; }
+.about-left { position: static; }
 .about-portrait {
-  aspect-ratio: 3 / 4; background: var(--yellow); border: var(--border); box-shadow: var(--hard);
+  aspect-ratio: 1 / 1; border-radius: 50%; overflow: hidden;
+  background: transparent; border: var(--border);
   display: flex; align-items: center; justify-content: center;
 }
 .about-portrait img { width: 100%; height: 100%; object-fit: cover; }
@@ -174,6 +175,11 @@ section[id] { scroll-margin-top: 96px; }
 .record:hover .record-meta span:first-child { color: #000; }
 .record-title { font-family: var(--font); font-size: clamp(20px, 2.2vw, 30px); font-weight: 900; letter-spacing: -.015em; }
 .record-desc { margin-top: 8px; font-weight: 500; opacity: .86; max-width: 64ch; }
+.record-more {
+  margin-top: 22px; text-align: center;
+  font-family: var(--mono); font-size: clamp(44px, 5vw, 64px); font-weight: 900; line-height: .8;
+  letter-spacing: .3em; color: var(--yellow); user-select: none;
+}
 
 /* ============ 03 成员 ============ */
 .staff-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
@@ -210,13 +216,22 @@ section[id] { scroll-margin-top: 96px; }
   background: #000; color: #fff; border: 3px solid #000; box-shadow: 6px 6px 0 var(--yellow);
 }
 .colophon-mail {
-  display: inline-block; margin-top: 8px;
-  font-family: var(--font); font-weight: 900; letter-spacing: -.015em;
-  font-size: clamp(26px, 4.6vw, 62px);
-  background: var(--yellow); color: #000; padding: 6px 16px;
-  border: 3px solid var(--yellow); transition: none;
+  display: inline-flex; align-items: center; gap: 12px;
+  margin-top: 8px; padding: 16px 32px;
+  font-family: var(--font); font-weight: 900; letter-spacing: .01em;
+  font-size: clamp(16px, 1.7vw, 20px); line-height: 1.2;
+  background: var(--yellow); color: #000;
+  border: 3px solid #000; box-shadow: 7px 7px 0 var(--red);
+  transition: none;
 }
-.colophon-mail:hover { background: var(--red); border-color: #000; color: #000; }
+.colophon-mail::after {
+  content: '↗'; font-family: var(--mono); font-size: .95em; line-height: 1;
+  transform: translateY(-1px);
+}
+.colophon-mail:hover {
+  background: #fff; color: #000; border-color: #000;
+  transform: translate(-2px, -2px); box-shadow: 10px 10px 0 var(--red);
+}
 .colophon-note { margin-top: 20px; color: #ddd; max-width: 56ch; white-space: pre-line; font-weight: 500; }
 .colophon-row { margin-top: 32px; display: flex; flex-wrap: wrap; gap: 12px; font-family: var(--mono); font-size: 13px; font-weight: 700; }
 .colophon-row div { display: flex; flex-direction: column; gap: 3px; background: #fff; color: #000; border: 3px solid var(--yellow); padding: 12px 18px; }
@@ -460,7 +475,7 @@ section[id] { scroll-margin-top: 96px; }
   .record:hover .record-meta span:first-child { color: var(--red); }
   .staff:hover { background: #fff; }
   .admin-tabs button:hover:not(.on) { background: #fff; }
-  .colophon-mail:hover { background: var(--yellow); border-color: var(--yellow); color: #000; }
+  .colophon-mail:hover { background: var(--yellow); border-color: #000; color: #000; transform: none; box-shadow: 7px 7px 0 var(--red); }
   .cover-cta:hover { background: var(--red); }
   .auth-btn:hover { background: #000; color: #fff; }
   .mast-nav a:hover { background: transparent; color: inherit; border-color: transparent; }

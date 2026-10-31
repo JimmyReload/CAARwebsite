@@ -44,7 +44,6 @@ function Home() {
   const projects = t('projects')
   const members = t('members')
   const faqs = t('faqs')
-  const aboutContact = t('about.contact')
   const contact = t('contact')
 
   return (
@@ -54,7 +53,7 @@ function Home() {
         <h1 className="cover-title">{t('hero.title1')}</h1>
         <p className="cover-eng">{t('hero.title2')}</p>
         <p className="cover-sub">{t('hero.subtitle')}</p>
-        <a className="cover-cta" href="#/login">{t('hero.cta')}</a>
+        <a className="cover-cta" href={t('contact.joinUrl')} target="_blank" rel="noreferrer">{t('hero.cta')}</a>
         <div className="cover-scroll">{t('hero.scroll')}</div>
       </section>
 
@@ -65,8 +64,8 @@ function Home() {
             <div className="about-portrait">
               {t('about.image') ? (
                 <picture>
-                  <source srcSet="/images/caar-hero-portrait.webp" type="image/webp" />
-                  <img src={t('about.image')} alt={t('about.name')} width={480} height={640} />
+                  <source srcSet="/images/caar-seal.webp" type="image/webp" />
+                  <img src={t('about.image')} alt={t('about.name')} width={760} height={760} />
                 </picture>
               ) : <span className="about-seal">{t('about.name')}</span>}
             </div>
@@ -74,12 +73,6 @@ function Home() {
           <div className="about-right">
             <Reveal><h3 className="about-name">{t('about.name')}</h3><p className="about-role">{t('about.role')}</p></Reveal>
             <Reveal className="about-intro">{aboutIntro.map((p, i) => <p key={i}>{p}</p>)}</Reveal>
-            <Reveal className="about-contact">
-              <div><span>{t('about.labels.email')}</span>{aboutContact.email}</div>
-              <div><span>{t('about.labels.phone')}</span>{aboutContact.phone}</div>
-              <div><span>{t('about.labels.location')}</span>{aboutContact.location}</div>
-              <div><span>{t('about.labels.qq')}</span>{aboutContact.qq}</div>
-            </Reveal>
             <Reveal className="about-stats">
               {aboutStats.map((s, i) => (
                 <div key={i} className="stat"><span className="stat-v">{s.value}</span><span className="stat-l">{s.label}</span></div>
@@ -99,6 +92,7 @@ function Home() {
             </Reveal>
           ))}
         </div>
+        <div className="record-more" aria-hidden="true">…</div>
       </section>
 
       <section id="members" className="col">
@@ -130,15 +124,13 @@ function Home() {
       <footer id="contact" className="colophon">
         <div className="col-head col-head--light"><span className="col-no">{t('sections.contact.no')}</span><h2 className="col-title">{t('sections.contact.title')}</h2><span className="col-en">{t('sections.contact.en')}</span></div>
         <Reveal>
-          <a className="colophon-mail" href={"mailto:" + contact.email}>{contact.email}</a>
+          <a className="colophon-mail" href={contact.joinUrl} target="_blank" rel="noreferrer">{contact.joinLabel}</a>
           <p className="colophon-note">{contact.note}</p>
         </Reveal>
         <Reveal className="colophon-row" delay={120}>
-          <div><span>{t('contact.labels.phone')}</span>{contact.phone}</div>
-          <div><span>{t('contact.labels.address')}</span>{contact.location}</div>
-          <div><span>{t('contact.labels.qq')}</span>{contact.qq}</div>
+          <div><span>{t('contact.labels.email')}</span>{contact.email}</div>
         </Reveal>
-        <div className="colophon-foot">{contact.footer} · {t('site.name')}</div>
+        <div className="colophon-foot">{contact.footer}</div>
       </footer>
     </main>
   )
