@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { HashRouter, Routes, Route, Link, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import Reveal from './components/Reveal'
 import AuthView from './views/AuthView'
@@ -33,6 +33,61 @@ function Anchor({ to, id, className, children }) {
 /* ============ 首页 ============ */
 function Home() {
   const loc = useLocation()
+  const pagesRef = useRef(null)
+  const [pageIndex, setPageIndex] = useState(0)
+  const pageCount = 5
+  const goToPage = (index) => {
+    const pages = pagesRef.current
+    if (!pages) return
+    pages.scrollTo({ top: Math.max(0, Math.min(pageCount - 1, index)) * pages.clientHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+  }
+  const onPageKey = (e) => {
+    if (e.target !== e.currentTarget) return
+    const next = { PageDown: pageIndex + 1, PageUp: pageIndex - 1, Home: 0, End: pageCount - 1 }[e.key]
+    if (next !== undefined) { e.preventDefault(); goToPage(next) }
+  }
+  useEffect(() => {
+    const pages = pagesRef.current
+    let lastWheel = -Infinity
+    let lockedUntil = 0
+    let handled = false
+    let innerGesture = false
+    let distance = 0
+    const onWheel = (event) => {
+      // Keep browser zoom and horizontal gestures native.
+      if (event.ctrlKey || Math.abs(event.deltaX) > Math.abs(event.deltaY) || !event.deltaY) return
+      const now = performance.now()
+      if (now - lastWheel > 220 && now >= lockedUntil) {
+        handled = false
+        innerGesture = false
+        distance = 0
+      }
+      lastWheel = now
+      if (handled || now < lockedUntil) { event.preventDefault(); return }
+      const index = Math.round(pages.scrollTop / pages.clientHeight)
+      const page = pages.children[index]
+      const down = event.deltaY > 0
+      const canScrollInside = down
+        ? page.scrollTop + page.clientHeight < page.scrollHeight - 2
+        : page.scrollTop > 2
+      if (canScrollInside) {
+        innerGesture = true
+        return
+      }
+      event.preventDefault()
+      // Reaching the end of long content must not spill into the next page.
+      if (innerGesture) return
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? pages.clientHeight : 1)
+      if (Math.sign(delta) !== Math.sign(distance)) distance = 0
+      distance += delta
+      if (Math.abs(distance) < 40) return
+      handled = true
+      lockedUntil = now + 700
+      goToPage(index + (down ? 1 : -1))
+    }
+    pages.addEventListener('wheel', onWheel, { passive: false })
+    return () => pages.removeEventListener('wheel', onWheel)
+  }, [])
   useEffect(() => {
     const t2 = loc.state && loc.state.scrollTo
     if (t2) setTimeout(() => { const el = document.getElementById(t2); el && el.scrollIntoView({ behavior: 'smooth' }) }, 60)
@@ -47,7 +102,9 @@ function Home() {
   const contact = t('contact')
 
   return (
-    <main>
+    <>
+    <main ref={pagesRef} className="home-pages" tabIndex={0} aria-label={t('pageNavigation.label')} onKeyDown={onPageKey} onScroll={(e) => { if (e.target === e.currentTarget) setPageIndex(Math.round(e.currentTarget.scrollTop / e.currentTarget.clientHeight)) }}>
+      <div className="home-intro home-page">
       <section id="top" className="cover">
         <div className="cover-meta">{heroMeta.map((m, i) => <span key={i}>{m}</span>)}</div>
         <h1 className="cover-title">{t('hero.title1')}</h1>
@@ -82,8 +139,11 @@ function Home() {
         </div>
       </section>
 
-      <section id="projects" className="col col--dark">
+      </div>
+
+      <section id="projects" className="col col--dark home-page">
         <div className="col-head"><span className="col-no">{t('sections.projects.no')}</span><h2 className="col-title">{t('sections.projects.title')}</h2><span className="col-en">{t('sections.projects.en')}</span></div>
+        <p className="record-desc">{t('recordsNote')}</p>
         <div className="record-list">
           {projects.map((p, i) => (
             <Reveal key={i} className="record" delay={i * 90}>
@@ -92,11 +152,12 @@ function Home() {
             </Reveal>
           ))}
         </div>
-        <div className="record-more" aria-hidden="true">…</div>
+
       </section>
 
-      <section id="members" className="col">
+      <section id="members" className="col home-page">
         <div className="col-head"><span className="col-no">{t('sections.members.no')}</span><h2 className="col-title">{t('sections.members.title')}</h2><span className="col-en">{t('sections.members.en')}</span></div>
+        <p className="staff-desc">{t('membersNote')}</p>
         <div className="staff-grid">
           {members.map((m, i) => (
             <Reveal key={i} className="staff" delay={i * 80}>
@@ -109,7 +170,7 @@ function Home() {
         </div>
       </section>
 
-      <section id="faq" className="col col--tint">
+      <section id="faq" className="col col--tint home-page">
         <div className="col-head"><span className="col-no">{t('sections.faq.no')}</span><h2 className="col-title">{t('sections.faq.title')}</h2><span className="col-en">{t('sections.faq.en')}</span></div>
         <div className="letter-list">
           {faqs.map((f, i) => (
@@ -121,7 +182,7 @@ function Home() {
         </div>
       </section>
 
-      <footer id="contact" className="colophon">
+      <footer id="contact" className="colophon home-page">
         <div className="col-head col-head--light"><span className="col-no">{t('sections.contact.no')}</span><h2 className="col-title">{t('sections.contact.title')}</h2><span className="col-en">{t('sections.contact.en')}</span></div>
         <Reveal>
           <a className="colophon-mail" href={contact.joinUrl} target="_blank" rel="noreferrer">{contact.joinLabel}</a>
@@ -133,6 +194,12 @@ function Home() {
         <div className="colophon-foot">{contact.footer}</div>
       </footer>
     </main>
+    <nav className="page-controls" aria-label={t('pageNavigation.label')}>
+      <button type="button" disabled={pageIndex === 0} onClick={() => goToPage(pageIndex - 1)} aria-label={t('pageNavigation.previous')}>↑</button>
+      <span aria-live="polite">{pageIndex + 1} / {pageCount}</span>
+      <button type="button" disabled={pageIndex === pageCount - 1} onClick={() => goToPage(pageIndex + 1)} aria-label={t('pageNavigation.next')}>↓</button>
+    </nav>
+    </>
   )
 }
 

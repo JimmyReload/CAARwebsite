@@ -161,6 +161,32 @@ section[id] { scroll-margin-top: 96px; }
 .stat-v { font-family: var(--font); font-size: clamp(22px, 2.3vw, 32px); font-weight: 900; letter-spacing: -.015em; line-height: 1.1; }
 .stat-l { font-family: var(--mono); font-size: 12px; font-weight: 700; white-space: nowrap; }
 
+/* 首屏随窗口高度分配留白；内容超出时自然撑开，不裁切。 */
+@media (min-width: 1000px) {
+  .home-intro { min-height: calc(100svh - 26px); display: flex; flex-direction: column; }
+  .home-intro > .cover { width: 100%; flex-grow: 1; align-content: center; }
+  .home-intro > #about { width: min(1200px, calc(100% - 24px)); flex-grow: 1; display: flex; flex-direction: column; justify-content: space-evenly; }
+  .cover { padding-top: 88px; padding-bottom: 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 24px; }
+  .cover-meta, .cover-title, .cover-eng { grid-column: 1 / -1; }
+  .cover-meta { margin-bottom: 12px; }
+  .cover-meta span { padding: 2px 8px; }
+  .cover-title { font-size: clamp(40px, 4.2vw, 60px); }
+  .cover-eng { justify-self: start; margin-top: 8px; font-size: 13px; padding: 3px 8px; }
+  .cover-sub { margin-top: 12px; max-width: 76ch; font-size: 16px; }
+  .cover-cta { align-self: center; margin-top: 12px; padding: 12px 24px; font-size: 16px; }
+  #about { margin-top: 8px; padding: 20px 24px; }
+  #about .col-head { margin-bottom: 16px; padding-bottom: 8px; }
+  #about .col-title { font-size: 28px; }
+  #about .col-no { padding: 4px 10px; }
+  .about-grid { grid-template-columns: 112px minmax(0, 1fr); gap: 24px; }
+  .about-name { font-size: 24px; display: inline; }
+  .about-role { margin: 0 0 0 12px; vertical-align: middle; }
+  .about-intro { max-width: none; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; font-size: 16px; line-height: 1.6; }
+  .about-stats { margin-top: 16px; }
+  .about-stats .stat { padding: 8px 12px; }
+  .about-stats .stat-v { font-size: 24px; }
+}
+
 /* ============ 02 项目 ============ */
 .record-list { display: grid; gap: 16px; }
 .record {
@@ -464,6 +490,99 @@ section[id] { scroll-margin-top: 96px; }
   .chat-box { height: 300px; }
   .chat-bubble { font-size: 14px; }
   section[id] { scroll-margin-top: 84px; }
+}
+
+/* 首页整屏翻页：导航留在页外，长内容在各页内自然滚动。 */
+.home-pages {
+  position: fixed; inset: 69px 0 0; overflow-y: auto;
+  scroll-snap-type: y mandatory; scroll-behavior: smooth;
+  background: var(--bg); scrollbar-width: thin;
+}
+.home-pages:focus-visible { outline: 3px solid var(--red); outline-offset: -3px; }
+.home-pages > .home-page {
+  width: 100%; max-width: none; height: 100%; min-height: 0;
+  margin: 0; padding: 24px max(28px, calc((100% - 1200px) / 2)) 64px;
+  border: 0; box-shadow: none; overflow-y: auto;
+  scroll-snap-align: start; scroll-snap-stop: always; scroll-margin: 0;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.home-pages > .home-intro { padding: 0 0 16px; gap: 0; }
+.home-pages .cover { padding-top: 16px; padding-bottom: 12px; }
+.home-pages .home-intro > #about { margin-top: 0; margin-bottom: 6px; }
+.home-pages .home-page > .col-head { flex: 0 0 auto; margin: 0; padding-bottom: 12px; }
+.home-pages .home-page > .col-head .col-title { font-size: clamp(24px, 2.5vw, 36px); }
+.home-pages .home-page > .record-desc,
+.home-pages .home-page > .staff-desc { margin: 0; max-width: none; font-size: 14px; }
+.home-pages .record-list {
+  flex: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(min-content, 1fr)); gap: 0;
+  border-top: 2px solid var(--yellow); border-left: 2px solid var(--yellow);
+}
+.home-pages .record {
+  display: flex; flex-direction: column; gap: 8px; padding: 14px;
+  border: 0; border-right: 2px solid var(--yellow); border-bottom: 2px solid var(--yellow);
+  box-shadow: none; transform: none;
+}
+.home-pages .record-meta { flex-direction: row; justify-content: space-between; gap: 8px; font-size: 11px; }
+.home-pages .record-meta span:first-child { color: var(--yellow); font-weight: 900; }
+.home-pages .record-title { font-size: 18px; line-height: 1.4; }
+.home-pages .record-desc { font-size: 13px; line-height: 1.55; margin-top: 6px; }
+.home-pages .record:hover { transform: none; box-shadow: none; background: var(--yellow); color: #000; }
+.home-pages .record:hover .record-meta span:first-child { color: #000; }
+.home-pages .staff-grid { flex: 1; grid-template-rows: repeat(2, minmax(min-content, 1fr)); gap: 16px; }
+.home-pages .staff { padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.home-pages .staff-avatar { width: 64px; height: 64px; flex-shrink: 0; }
+.home-pages .staff-name { margin-top: 8px; }
+.home-pages .staff-role { white-space: normal; }
+.home-pages .staff-desc { font-size: 14px; }
+.home-pages .letter-list { flex: 1; max-width: none; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(min-content, 1fr)); gap: 16px; }
+.home-pages .letter { padding: 18px 20px; }
+.home-pages .letter-a { font-size: 15px; line-height: 1.6; padding-left: 0; }
+.home-pages .colophon { justify-content: center; gap: 28px; }
+.home-pages .colophon-note { max-width: 68ch; }
+.home-pages .colophon-foot { margin-top: 8px; }
+.page-controls {
+  position: fixed; right: 24px; bottom: 12px; z-index: 1001;
+  display: flex; align-items: center; gap: 12px; padding: 4px;
+  background: var(--yellow); border: 2px solid #000; color: #000;
+  font: 700 13px var(--mono); box-shadow: var(--hard-sm);
+}
+.page-controls button { width: 36px; height: 36px; border: 2px solid #000; background: #fff; font-size: 20px; }
+.page-controls button:hover:not(:disabled) { background: #000; color: var(--yellow); }
+.page-controls button:disabled { opacity: .35; cursor: default; }
+.page-controls button:focus-visible { outline: 3px solid var(--red); outline-offset: 2px; }
+@media (min-width: 1000px) and (max-height: 800px) {
+  .home-pages > .home-page:not(.home-intro) { padding-top: 16px; gap: 8px; }
+  .home-pages .home-intro > #about { padding-top: 16px; padding-bottom: 16px; }
+  .home-pages .record { padding: 12px; gap: 6px; }
+  .home-pages .staff { padding: 12px; }
+  .home-pages .staff-avatar { width: 56px; height: 56px; }
+}
+@media (max-width: 999px) {
+  .home-pages .record-list { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: none; }
+  .home-pages .staff-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; }
+  .home-pages .home-intro > #about { flex-grow: 0; }
+}
+@media (max-width: 700px) {
+  .home-pages { top: 61px; }
+  .home-pages > .home-page { padding: 20px 16px 76px; }
+  .home-pages > .home-intro { padding: 0 0 76px; }
+  .home-pages .cover { padding: 20px 16px; }
+  .home-pages .about-grid { grid-template-columns: 1fr; }
+  .home-pages .about-left { width: 88px; }
+  .home-pages .about-role { white-space: normal; }
+  .home-pages .record-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .home-pages .record { padding: 12px; }
+  .home-pages .record-meta { flex-direction: column; }
+  .home-pages .record-title { font-size: 16px; }
+  .home-pages .letter-list { grid-template-columns: 1fr; grid-template-rows: none; }
+  .home-pages .staff { padding: 16px 10px; }
+  .home-pages .staff-name { font-size: 17px; }
+  .home-pages .staff-role { font-size: 11px; }
+  .page-controls { right: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .home-pages { scroll-behavior: auto; }
 }
 
 /* 触屏：抑制点按后残留的 hover 态 */
