@@ -55,6 +55,100 @@ async function verifyPassword(pw, saltHex, hashHex) {
   return hash === hashHex;
 }
 
+// ---------- 邮箱验证码 ----------
+const CODE_TTL_MS = 10 * 60 * 1000;      // 验证码 10 分钟有效
+const CODE_COOLDOWN_MS = 60 * 1000;      // 同一邮箱 60 秒内只能发一次
+const CODE_MAX_PER_HOUR = 5;             // 同一邮箱每小时最多 5 封
+const CODE_MAX_ATTEMPTS = 5;             // 同一验证码最多试 5 次
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/;
+
+// 表结构与 users.email 由 migrations/0006 补；这里兜底建一次，
+// 让「代码先上线、迁移后补」也不会 500。每个 isolate 只执行一次。
+let emailSchemaReady = null;
+function ensureEmailSchema(env) {
+  if (!emailSchemaReady) {
+    emailSchemaReady = (async () => {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS email_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        used INTEGER NOT NULL DEFAULT 0,
+        ip TEXT NOT NULL DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+      )`).run();
+      await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_email_codes ON email_codes(email, purpose, id)').run();
+      try { await env.DB.prepare('ALTER TABLE users ADD COLUMN email TEXT').run(); } catch { /* 列已存在 */ }
+      await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL').run();
+    })().catch((err) => { emailSchemaReady = null; throw err; });
+  }
+  return emailSchemaReady;
+}
+
+// 验证码不落明文：email + code + 签发时间戳 做 SHA-256
+async function hashCode(email, code, issuedAt) {
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(email + ':' + code + ':' + issuedAt));
+  return bytesToHex(new Uint8Array(buf));
+}
+
+function randomCode() {
+  const n = crypto.getRandomValues(new Uint32Array(1))[0] % 900000;
+  return String(100000 + n);
+}
+
+async function sendMail(env, to, subject, text, html) {
+  if (!env.RESEND_API_KEY) throw new Error('MAIL_NOT_CONFIGURED');
+  // MAIL_API_BASE 便于本地用假邮件服务联调，生产不配即走 Resend
+  const base = (env.MAIL_API_BASE || 'https://api.resend.com').replace(/\/+$/, '');
+  const res = await fetch(base + '/emails', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + env.RESEND_API_KEY, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      from: env.MAIL_FROM || 'CAAR 中不正协 <noreply@caar.fun>',
+      to: [to],
+      subject,
+      text,
+      html
+    }),
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!res.ok) throw new Error('MAIL_' + res.status);
+}
+
+async function sendCodeMail(env, email, code, purpose) {
+  const isBind = purpose === 'bind';
+  const subject = (isBind ? '绑定邮箱验证码' : '注册验证码') + ' · CAAR 中不正协';
+  const text = `你的验证码是 ${code}，10 分钟内有效。\n\n${isBind ? '用于给账号绑定这个邮箱' : '用于注册 CAAR 账号'}。如果这不是你本人操作，忽略本邮件即可。`;
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:520px;margin:0 auto;padding:28px;border:3px solid #000">
+    <p style="margin:0 0 6px;font-size:12px;letter-spacing:.12em;font-weight:700">CAAR · 中国不正常推理协会</p>
+    <h2 style="margin:0 0 18px;font-size:20px">${isBind ? '绑定邮箱' : '注册'}验证码</h2>
+    <p style="margin:0 0 14px;font-size:32px;font-weight:900;letter-spacing:.28em;background:#ffe94a;display:inline-block;padding:10px 16px;border:3px solid #000">${code}</p>
+    <p style="margin:14px 0 0;font-size:14px;line-height:1.7">10 分钟内有效，仅可使用一次。</p>
+    <p style="margin:10px 0 0;font-size:13px;color:#555;line-height:1.7">如果这不是你本人操作，忽略本邮件即可，你的账号不受影响。</p>
+  </div>`;
+  await sendMail(env, email, subject, text, html);
+}
+
+// 校验验证码；成功即标记已用，失败累计尝试次数
+async function verifyCode(env, email, purpose, code) {
+  const row = await env.DB.prepare(
+    'SELECT * FROM email_codes WHERE email = ? AND purpose = ? AND used = 0 ORDER BY id DESC LIMIT 1'
+  ).bind(email, purpose).first();
+  if (!row) return { ok: false, error: 'errors.codeMissing' };
+  if (Number(row.expires_at) < Date.now()) return { ok: false, error: 'errors.codeExpired' };
+  if (Number(row.attempts) >= CODE_MAX_ATTEMPTS) return { ok: false, error: 'errors.codeTooMany' };
+  const issuedAt = Number(row.expires_at) - CODE_TTL_MS;
+  const hash = await hashCode(email, String(code), issuedAt);
+  if (hash !== row.code_hash) {
+    await env.DB.prepare('UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?').bind(row.id).run();
+    return { ok: false, error: 'errors.codeWrong' };
+  }
+  await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE id = ?').bind(row.id).run();
+  return { ok: true };
+}
+
 // ---------- 会话 ----------
 const SESSION_COOKIE = 'caar_session';
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 天
@@ -100,6 +194,11 @@ async function allAdmins(env) {
   return (await env.DB.prepare("SELECT id, username, nickname FROM users WHERE role = 'admin' ORDER BY id").all()).results;
 }
 
+// ---------- 角色 ----------
+// user < admin < superadmin。superadmin 只有一个，负责授权与删号
+const isStaff = (u) => !!u && (u.role === 'admin' || u.role === 'superadmin');
+const isSuper = (u) => !!u && u.role === 'superadmin';
+
 // ---------- 公告 ----------
 // 公告列表与管理端列表共用同一查询，避免两处排序口径不一致
 async function loadAnnouncements(env) {
@@ -124,7 +223,7 @@ async function markRead(env, convId, lastId, isOwner) {
 async function adminStats(env) {
   const row = await env.DB.prepare(
     `SELECT (SELECT COUNT(*) FROM users) AS total,
-            (SELECT COUNT(*) FROM users WHERE role = 'admin') AS admins,
+            (SELECT COUNT(*) FROM users WHERE role IN ('admin','superadmin')) AS admins,
             (SELECT COUNT(*) FROM conversations) AS convs,
             (SELECT COUNT(*) FROM conversations c WHERE EXISTS (
                SELECT 1 FROM messages m
@@ -257,19 +356,85 @@ export default {
     const user = await getSessionUser(env, getCookie(request));
 
     // ---------- 公开 ----------
+    // 发送邮箱验证码（注册 / 绑定邮箱共用）
+    if (path === 'email-code' && method === 'POST') {
+      const b = await readBody(request);
+      const email = String(b.email || '').trim().toLowerCase();
+      const purpose = b.purpose === 'bind' ? 'bind' : 'register';
+      if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: t('errors.emailInvalid') }, 400);
+      if (purpose === 'bind' && !user) return json({ error: t('errors.unauthorized') }, 401);
+      try {
+        await ensureEmailSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      // 邮箱已被别的账号占用：不发码，直接说清楚
+      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND id <> ?').bind(email, user ? user.id : 0).first();
+      if (taken) return json({ error: t('errors.emailTaken') }, 409);
+
+      const now = Date.now();
+      // 同邮箱冷却
+      const last = await env.DB.prepare('SELECT expires_at FROM email_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1').bind(email, purpose).first();
+      if (last) {
+        const wait = CODE_COOLDOWN_MS - (now - (Number(last.expires_at) - CODE_TTL_MS));
+        if (wait > 0) return json({ error: t('errors.codeCooldown', { s: Math.ceil(wait / 1000) }) }, 429);
+      }
+      // 同邮箱每小时上限
+      const hourly = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_codes WHERE email = ? AND purpose = ? AND expires_at > ?')
+        .bind(email, purpose, now - 60 * 60 * 1000 + CODE_TTL_MS).first();
+      if (hourly && Number(hourly.n) >= CODE_MAX_PER_HOUR) return json({ error: t('errors.codeRateLimit') }, 429);
+      // 同 IP 每小时上限（防批量刷别人的邮箱）
+      const ip = request.headers.get('cf-connecting-ip') || '';
+      if (ip) {
+        const byIp = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_codes WHERE ip = ? AND expires_at > ?')
+          .bind(ip, now - 60 * 60 * 1000 + CODE_TTL_MS).first();
+        if (byIp && Number(byIp.n) >= 15) return json({ error: t('errors.codeRateLimit') }, 429);
+      }
+
+      const code = randomCode();
+      const issuedAt = now;
+      const expiresAt = now + CODE_TTL_MS;
+      await env.DB.prepare(
+        'INSERT INTO email_codes (email, purpose, code_hash, expires_at, ip) VALUES (?, ?, ?, ?, ?)'
+      ).bind(email, purpose, await hashCode(email, code, issuedAt), expiresAt, ip).run();
+
+      try {
+        await sendCodeMail(env, email, code, purpose);
+      } catch (err) {
+        // 发信失败：把刚写入的码作废，避免用户拿着收不到的码干等
+        await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE email = ? AND purpose = ? AND expires_at = ?').bind(email, purpose, expiresAt).run();
+        const reason = String(err && err.message || '');
+        return json({ error: reason === 'MAIL_NOT_CONFIGURED' ? t('errors.mailNotConfigured') : t('errors.mailFailed') }, 502);
+      }
+      return json({ ok: true, ttl: Math.round(CODE_TTL_MS / 1000) });
+    }
+
     if (path === 'register' && method === 'POST') {
       const b = await readBody(request);
       const username = String(b.username || '').trim();
       const password = String(b.password || '');
       const nickname = String(b.nickname || '').trim() || username;
+      const email = String(b.email || '').trim().toLowerCase();
+      const code = String(b.code || '').trim();
       if (username.length < 2 || username.length > 20) return json({ error: t('errors.usernameLength') }, 400);
       if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) return json({ error: t('errors.usernameCharset') }, 400);
       if (password.length < 6) return json({ error: t('errors.passwordLength') }, 400);
+      if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: t('errors.emailInvalid') }, 400);
+      if (!code) return json({ error: t('errors.codeRequired') }, 400);
       const exists = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
       if (exists) return json({ error: t('errors.usernameTaken') }, 409);
+      try {
+        await ensureEmailSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+      if (taken) return json({ error: t('errors.emailTaken') }, 409);
+      const v = await verifyCode(env, email, 'register', code);
+      if (!v.ok) return json({ error: t(v.error) }, 400);
       const { salt, hash } = await hashPassword(password);
-      await env.DB.prepare('INSERT INTO users (username, password, nickname, role) VALUES (?, ?, ?, ?)')
-        .bind(username, salt + ':' + hash, nickname, 'user').run();
+      await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
+        .bind(username, salt + ':' + hash, nickname, 'user', email).run();
       return json({ ok: true });
     }
 
@@ -285,7 +450,7 @@ export default {
       if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
       if (row.banned) return json({ error: t('errors.banned') }, 403);
       const token = await createSession(env, row.id, row.session_version);
-      return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at } }, token);
+      return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at, email: row.email || null } }, token);
     }
 
     if (path === 'logout' && method === 'POST') {
@@ -297,13 +462,19 @@ export default {
     if (path === 'me' && method === 'GET') {
       // 顺带带回未读动态数，导航角标首屏就能显示，省一次请求
       let notifUnread = 0;
+      let email = null;
       if (user) {
         try {
           const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM hunt_notifications WHERE user_id = ? AND read_at IS NULL').bind(user.id).first();
           notifUnread = row ? Number(row.n) || 0 : 0;
         } catch { notifUnread = 0; }
+        // email 列由迁移补，未迁移时也不能让 /me 500
+        try {
+          const row = await env.DB.prepare('SELECT email FROM users WHERE id = ?').bind(user.id).first();
+          email = row ? (row.email || null) : null;
+        } catch { /* 列不存在 */ }
       }
-      return json({ user, notifUnread });
+      return json({ user: user ? { ...user, email } : null, notifUnread });
     }
 
     // ---------- 以下需要登录 ----------
@@ -332,13 +503,33 @@ export default {
       return json({ ok: true, nickname });
     }
 
+    // 绑定 / 更换自己的邮箱（需验证码；老账号自愿补绑走这里）
+    if (path === 'profile/email' && method === 'POST') {
+      const b = await readBody(request);
+      const email = String(b.email || '').trim().toLowerCase();
+      const code = String(b.code || '').trim();
+      if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: t('errors.emailInvalid') }, 400);
+      if (!code) return json({ error: t('errors.codeRequired') }, 400);
+      try {
+        await ensureEmailSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND id <> ?').bind(email, user.id).first();
+      if (taken) return json({ error: t('errors.emailTaken') }, 409);
+      const v = await verifyCode(env, email, 'bind', code);
+      if (!v.ok) return json({ error: t(v.error) }, 400);
+      await env.DB.prepare('UPDATE users SET email = ? WHERE id = ?').bind(email, user.id).run();
+      return json({ ok: true, email });
+    }
+
     // 公告
     if (path === 'announcements' && method === 'GET') {
       return json({ list: await loadAnnouncements(env) });
     }
 
     if (path === 'announcements' && method === 'POST') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
       if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: t('errors.announceEmpty') }, 400);
       // 返回完整行：前端可直接插入列表，不必依赖紧随其后的刷新
@@ -366,7 +557,7 @@ export default {
 
       if (after > 0) {
         const [msgs, annVersion] = await Promise.all([
-          env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(conv.id, after).all(),
+          env.DB.prepare('SELECT m.*, COALESCE(u.nickname, \'已注销用户\') AS sender_name FROM messages m LEFT JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(conv.id, after).all(),
           annVersionP
         ]);
         const list = msgs.results;
@@ -382,7 +573,7 @@ export default {
       const [anns, annVersion, msgs, unreadRow] = await Promise.all([
         loadAnnouncements(env),
         annVersionP,
-        env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(conv.id).all(),
+        env.DB.prepare('SELECT m.*, COALESCE(u.nickname, \'已注销用户\') AS sender_name FROM messages m LEFT JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(conv.id).all(),
         env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND direction = 'to_user' AND id > ?").bind(conv.id, conv.user_last_read_id).first()
       ]);
       const list = msgs.results.reverse();
@@ -539,7 +730,7 @@ export default {
 
     // ---------- 工单会话（会员↔STAFF 双向） ----------
     if (path === 'conversation' && method === 'GET') {
-      if (user.role === 'admin') {
+      if (isStaff(user)) {
         const list = (await env.DB.prepare("SELECT c.*, u.username, u.nickname, (SELECT COUNT(*) FROM messages m WHERE m.conv_id = c.id AND m.direction = 'to_staff' AND m.id > c.staff_last_read_id) AS unread FROM conversations c JOIN users u ON u.id = c.user_id ORDER BY c.updated_at DESC").all()).results;
         return json({ list });
       }
@@ -576,7 +767,7 @@ export default {
 
     // STAFF 回复
     if (path === 'conversation/reply' && method === 'POST') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
       const convId = Number(b.conv_id);
       const content = String(b.content || '').trim();
@@ -603,13 +794,13 @@ export default {
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
       if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const isOwner = conv.user_id === user.id;
-      if (!isOwner && user.role !== 'admin') return json({ error: t('errors.forbidden') }, 403);
+      if (!isOwner && !isStaff(user)) return json({ error: t('errors.forbidden') }, 403);
       const after = Number(url.searchParams.get('after') || 0);
       let msgs;
       if (after > 0) {
-        msgs = (await env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(convId, after).all()).results;
+        msgs = (await env.DB.prepare('SELECT m.*, COALESCE(u.nickname, \'已注销用户\') AS sender_name FROM messages m LEFT JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(convId, after).all()).results;
       } else {
-        msgs = (await env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(convId).all()).results;
+        msgs = (await env.DB.prepare('SELECT m.*, COALESCE(u.nickname, \'已注销用户\') AS sender_name FROM messages m LEFT JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(convId).all()).results;
         msgs.reverse();
       }
       return json({ conv: { id: conv.id, user_id: conv.user_id }, list: msgs });
@@ -621,7 +812,7 @@ export default {
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
       if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const isOwner = conv.user_id === user.id;
-      if (!isOwner && user.role !== 'admin') return json({ error: t('errors.forbidden') }, 403);
+      if (!isOwner && !isStaff(user)) return json({ error: t('errors.forbidden') }, 403);
       const last = await env.DB.prepare('SELECT MAX(id) AS n FROM messages WHERE conv_id = ?').bind(convId).first();
       if (isOwner) await env.DB.prepare('UPDATE conversations SET user_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
       else await env.DB.prepare('UPDATE conversations SET staff_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
@@ -629,14 +820,14 @@ export default {
     }
     // 管理概览
     if (path === 'admin/stats' && method === 'GET') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       return json(await adminStats(env));
     }
 
     // 管理端一次取全：公告 + 用户 + 会话 + 统计
     // 原先管理台首屏要 4 个请求（每个都要重新验一次会话），这里合并成 1 个
     if (path === 'admin/overview' && method === 'GET') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const [anns, users, convs, stats] = await Promise.all([
         loadAnnouncements(env),
         env.DB.prepare('SELECT id, username, nickname, role, banned, created_at FROM users ORDER BY id').all(),
@@ -648,7 +839,7 @@ export default {
 
     // 管理员：用户管理
     if (path === 'admin/users' && method === 'GET') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const q = String(url.searchParams.get('q') || '').trim();
       let list;
       if (q) {
@@ -660,23 +851,34 @@ export default {
     }
 
     if (path.startsWith('admin/users/') && method === 'PATCH') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
+      if (!id) return json({ error: t('errors.badParams') }, 400);
+      const target = await env.DB.prepare('SELECT id, username, role FROM users WHERE id = ?').bind(id).first();
+      if (!target) return json({ error: t('errors.userNotFound') }, 404);
+      const targetIsSuper = target.role === 'superadmin';
       const b = await readBody(request);
-      if (b.role && !['user', 'admin'].includes(b.role)) return json({ error: t('errors.invalidRole') }, 400);
-      if (id === user.id && b.role && b.role !== 'admin') return json({ error: t('errors.cannotDemoteSelf') }, 400);
-      if (b.role) {
-        if (id === user.id && b.role !== 'admin') return json({ error: t('errors.cannotDemoteSelf') }, 400);
+
+      // 授权（设为/撤销管理员）只给超管
+      if (b.role !== undefined) {
+        if (!isSuper(user)) return json({ error: t('errors.superOnly') }, 403);
+        if (!['user', 'admin'].includes(b.role)) return json({ error: t('errors.invalidRole') }, 400);
+        if (targetIsSuper || id === user.id) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(b.role, id).run();
       }
+      // 其余改动不允许落到超管账号上（自己改自己除外）
+      const guarded = targetIsSuper && id !== user.id;
       if (b.nickname !== undefined) {
+        if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(String(b.nickname).trim(), id).run();
       }
       if (b.banned !== undefined) {
-        if (id === user.id && b.banned) return json({ error: t('errors.cannotBanSelf') }, 400);
+        if (id === user.id) return json({ error: t('errors.cannotBanSelf') }, 400);
+        if (targetIsSuper) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
       }
       if (b.new_password !== undefined) {
+        if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         const np = String(b.new_password);
         if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
@@ -685,8 +887,31 @@ export default {
       return json({ ok: true });
     }
 
+    // 删除账号：仅超管，且不能删自己或另一个超管
+    if (path.startsWith('admin/users/') && method === 'DELETE') {
+      if (!isSuper(user)) return json({ error: t('errors.superOnly') }, 403);
+      const id = Number(path.split('/')[2]);
+      if (!id) return json({ error: t('errors.badParams') }, 400);
+      if (id === user.id) return json({ error: t('errors.cannotDeleteSelf') }, 400);
+      const target = await env.DB.prepare('SELECT id, username, role, email FROM users WHERE id = ?').bind(id).first();
+      if (!target) return json({ error: t('errors.userNotFound') }, 404);
+      if (target.role === 'superadmin') return json({ error: t('errors.cannotEditSuper') }, 400);
+      // 没有外键级联，手动按顺序清：消息 → 会话 → 赛事标记/通知 → 验证码 → 用户
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM messages WHERE conv_id IN (SELECT id FROM conversations WHERE user_id = ?)').bind(id),
+        env.DB.prepare('DELETE FROM conversations WHERE user_id = ?').bind(id),
+        env.DB.prepare('DELETE FROM hunt_interests WHERE user_id = ?').bind(id),
+        env.DB.prepare('DELETE FROM hunt_notifications WHERE user_id = ?').bind(id),
+        env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id)
+      ]);
+      if (target.email) {
+        try { await env.DB.prepare('DELETE FROM email_codes WHERE email = ?').bind(target.email).run(); } catch { /* 表未建 */ }
+      }
+      return json({ ok: true, id });
+    }
+
     if (path.startsWith('admin/announcements/') && method === 'PATCH') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
       const b = await readBody(request);
       if (b.title !== undefined && !String(b.title).trim()) return json({ error: t('errors.titleEmpty') }, 400);
@@ -698,7 +923,7 @@ export default {
     }
 
     if (path.startsWith('admin/announcements/') && method === 'DELETE') {
-      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const r = await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(Number(path.split('/')[2])).run();
       if (!r.meta.changes) return json({ error: t('errors.announceGone') }, 404);
       return json({ ok: true });

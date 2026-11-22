@@ -1,20 +1,70 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import api from '../api'
 import { t } from '../i18n'
 import { fmtDate } from '../time'
 
-/* 个人主页：账号信息 + 修改密码 + 退出登录
+/* 个人主页：账号信息 + 绑定邮箱 + 修改昵称 + 修改密码 + 退出登录
    修改密码原来在「成员面板」和「管理后台」各有一份，现在统一收到这里 */
 export default function AccountView({ user, setUser }) {
   const nav = useNavigate()
   const [nick, setNick] = useState((user && (user.nickname || user.username)) || '')
   const [nickMsg, setNickMsg] = useState('')
   const [nickSaving, setNickSaving] = useState(false)
+  const [mail, setMail] = useState((user && user.email) || '')
+  const [mailCode, setMailCode] = useState('')
+  const [mailMsg, setMailMsg] = useState('')
+  const [mailOk, setMailOk] = useState(false)
+  const [mailSaving, setMailSaving] = useState(false)
+  const [cooldown, setCooldown] = useState(0)
+  const [sendingCode, setSendingCode] = useState(false)
   const [op, setOp] = useState('')
   const [np, setNp] = useState('')
   const [pwMsg, setPwMsg] = useState('')
   const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (cooldown <= 0) return
+    const timer = setTimeout(() => setCooldown((c) => c - 1), 1000)
+    return () => clearTimeout(timer)
+  }, [cooldown])
+
+  const sendCode = async () => {
+    setMailMsg(''); setMailOk(false)
+    const addr = mail.trim()
+    if (!addr) { setMailMsg(t('errors.emailInvalid')); return }
+    setSendingCode(true)
+    try {
+      await api('/email-code', { method: 'POST', body: { email: addr, purpose: 'bind' } })
+      setCooldown(60)
+      setMailOk(true)
+      setMailMsg(t('auth.codeSent'))
+    } catch (err) {
+      setMailMsg(err.message)
+    } finally {
+      setSendingCode(false)
+    }
+  }
+
+  const saveMail = async (e) => {
+    e.preventDefault()
+    if (mailSaving) return
+    setMailMsg(''); setMailOk(false)
+    setMailSaving(true)
+    try {
+      const r = await api('/profile/email', { method: 'POST', body: { email: mail.trim(), code: mailCode.trim() } })
+      const saved = r.email || mail.trim()
+      setUser({ ...user, email: saved })
+      setMail(saved)
+      setMailCode('')
+      setMailOk(true)
+      setMailMsg(t('account.emailOk'))
+    } catch (err) {
+      setMailMsg(err.message)
+    } finally {
+      setMailSaving(false)
+    }
+  }
 
   const saveNick = async (e) => {
     e.preventDefault()
@@ -60,7 +110,8 @@ export default function AccountView({ user, setUser }) {
 
   if (!user) return null
   const name = user.nickname || user.username
-  const isAdmin = user.role === 'admin'
+  const isSuper = user.role === 'superadmin'
+  const isAdmin = isSuper || user.role === 'admin'
 
   return (
     <div className="panel-page">
@@ -83,11 +134,15 @@ export default function AccountView({ user, setUser }) {
           </div>
           <div className="acct-item">
             <span className="acct-label">{t('account.role')}</span>
-            <span className="acct-value">{isAdmin ? t('account.roleAdmin') : t('account.roleMember')}</span>
+            <span className="acct-value">{isSuper ? t('account.roleSuper') : isAdmin ? t('account.roleAdmin') : t('account.roleMember')}</span>
           </div>
           <div className="acct-item">
             <span className="acct-label">{t('account.joined')}</span>
             <span className="acct-value">{fmtDate(user.created_at)}</span>
+          </div>
+          <div className="acct-item">
+            <span className="acct-label">{t('auth.emailLabel')}</span>
+            <span className="acct-value">{user.email || t('account.emailUnbound')}</span>
           </div>
         </div>
         <div className="btn-row acct-links">
@@ -95,6 +150,27 @@ export default function AccountView({ user, setUser }) {
           {isAdmin && <Link className="mini-btn" to="/admin">{t('nav.adminPanel')}</Link>}
           <Link className="mini-btn" to="/hunts">{t('nav.hunts')}</Link>
         </div>
+      </section>
+
+      <section className="panel-sec acct-form">
+        <h2 className="panel-sec-title">{t('account.emailTitle')}</h2>
+        <form onSubmit={saveMail} className="msg-form">
+          <label>{t('auth.emailLabel')}
+            <input type="email" value={mail} onChange={(e) => setMail(e.target.value)} placeholder={t('auth.emailPlaceholder')} autoComplete="email" maxLength="100" required />
+          </label>
+          <div className="field">
+            <span>{t('auth.codeLabel')}</span>
+            <span className="code-row">
+              <input value={mailCode} onChange={(e) => setMailCode(e.target.value.replace(/\D/g, ''))} placeholder={t('auth.codePlaceholder')} inputMode="numeric" maxLength="6" required />
+              <button type="button" className="mini-btn" onClick={sendCode} disabled={sendingCode || cooldown > 0}>
+                {sendingCode ? t('auth.sendingCode') : cooldown > 0 ? t('auth.resendIn', { s: cooldown }) : t('auth.sendCode')}
+              </button>
+            </span>
+          </div>
+          {mailMsg && <p className={"auth-msg " + (mailOk ? 'auth-msg--ok' : '')}>{mailMsg}</p>}
+          <button className="auth-btn" disabled={mailSaving}>{mailSaving ? t('account.saving') : t('account.bindEmail')}</button>
+        </form>
+        <p className="acct-note">{t('account.emailNote')}</p>
       </section>
 
       <section className="panel-sec acct-form">

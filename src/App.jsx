@@ -10,6 +10,9 @@ import api from './api'
 import { prefetchHunts, clearHuntsCache } from './huntsCache'
 import { prefetchPanel, clearPanelCache, startInboxPrefetch, readUserCache, writeUserCache } from './panelCache'
 
+/* 角色：admin 与 superadmin 都算职员 */
+const isStaff = (u) => !!u && (u.role === 'admin' || u.role === 'superadmin')
+
 /* 用户态 */
 function useUser() {
   // 先用上次的登录态快照渲染，避免刷新时先干等一次 /me；随后再用 /me 校验
@@ -351,7 +354,7 @@ function Shell({ user, setUser, ready, notifUnread }) {
                 {notifUnread > 0 && <span className="mast-badge" aria-label={t('hunts.notif.badgeLabel')}>{notifUnread > 99 ? '99+' : notifUnread}</span>}
               </Link>
               <Link to="/member">{t('nav.memberPanel')}</Link>
-              {user.role === 'admin' && <Link to="/admin">{t('nav.adminPanel')}</Link>}
+              {isStaff(user) && <Link to="/admin">{t('nav.adminPanel')}</Link>}
               <Link to="/account">{t('nav.account')}</Link>
             </>
           )}
@@ -400,7 +403,7 @@ export default function App() {
           <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
           <Route path="/hunts" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <HuntsView user={user} onNotifRead={() => setNotifUnread(0)} />} />
           <Route path="/member" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <MemberView user={user} />} />
-          <Route path="/admin" element={!ready ? null : !user || user.role !== 'admin' ? <Navigate to="/login" replace /> : <AdminView user={user} />} />
+          <Route path="/admin" element={!ready ? null : !isStaff(user) ? <Navigate to="/login" replace /> : <AdminView user={user} />} />
           <Route path="/account" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <AccountView user={user} setUser={setUser} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

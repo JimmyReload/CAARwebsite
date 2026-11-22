@@ -899,3 +899,14 @@ section[id] { scroll-margin-top: 96px; }
 .chat-skel i:nth-child(3) { width: 54%; animation-delay: .3s; }
 @keyframes skel-pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .chat-skel i { animation: none; opacity: .7; } }
+
+/* ============ 验证码输入 ============ */
+/* .field 与 .auth-form label / .msg-form label 同款排版，但不带 label 的点击聚焦行为 */
+.auth-form .field, .msg-form .field { display: grid; gap: 7px; font-family: var(--mono); font-size: 12px; font-weight: 700; }
+.code-row { display: flex; gap: 8px; align-items: stretch; }
+.code-row input { flex: 1 1 auto; min-width: 0; letter-spacing: .18em; }
+.code-row .mini-btn { flex: 0 0 auto; display: inline-flex; align-items: center; }
+.auth-note { font-family: var(--mono); font-size: 12px; font-weight: 700; color: #555; line-height: 1.6; }
+
+/* 超管标记：与管理员（黑底黄字）区分 */
+.role-tag--super { background: #fff; color: #000; border-color: #000; box-shadow: inset 0 0 0 3px var(--yellow); }

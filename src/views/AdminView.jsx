@@ -176,6 +176,19 @@ export default function AdminView({ user }) {
   const setRole = async (u, role) => { try { await api('/admin/users/' + u.id, { method: 'PATCH', body: { role } }); loadOverview() } catch (err) { setMsg(err.message) } }
   const setBanned = async (u, banned) => { try { await api('/admin/users/' + u.id, { method: 'PATCH', body: { banned } }); loadOverview() } catch (err) { setMsg(err.message) } }
 
+  /* 删号：不可恢复，二次确认写清会连带删除什么 */
+  const delUser = async (u) => {
+    const label = u.nickname || u.username
+    if (!window.confirm(t('admin.users.confirmDelete', { name: label, username: u.username }))) return
+    try {
+      await api('/admin/users/' + u.id, { method: 'DELETE' })
+      setUsers((old) => old.filter((x) => x.id !== u.id))
+      setConvs((old) => old.filter((c) => c.user_id !== u.id))
+      flash(t('admin.users.deleted', { username: u.username }))
+      loadOverview()
+    } catch (err) { setMsg(err.message) }
+  }
+
   const resetUserPw = async (u) => {
     const npw = window.prompt(t('admin.users.promptNewPassword', { name: u.nickname || u.username }))
     if (!npw) return
@@ -183,6 +196,8 @@ export default function AdminView({ user }) {
   }
 
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0)
+  const me = user
+  const iAmSuper = !!(user && user.role === 'superadmin')
 
   return (
     <div className="panel-page panel-page--admin">
@@ -213,13 +228,6 @@ export default function AdminView({ user }) {
             <div className="dash-card"><span className="dash-n">{stats.convs}</span><span className="dash-l">{t('admin.stats.convs')}</span></div>
             <div className="dash-card"><span className="dash-n">{stats.unreadConvs}</span><span className="dash-l">{t('admin.stats.unreadConvs')}</span></div>
             <div className="dash-card"><span className="dash-n">{stats.anns}</span><span className="dash-l">{t('admin.stats.anns')}</span></div>
-          </div>
-          <div className="dash-pw">
-            <h3 className="panel-sec-title">{t('admin.myAccount')}</h3>
-            <p className="acct-note">{t('admin.myAccountNote')}</p>
-            <div className="btn-row acct-links">
-              <Link className="mini-btn" to="/account">{t('account.password')}</Link>
-            </div>
           </div>
         </>
       )}
@@ -301,28 +309,42 @@ export default function AdminView({ user }) {
             <button className="mini-btn" type="submit">{t('admin.users.search')}</button>
             {q && <button className="mini-btn" type="button" onClick={() => { setQ(''); searchUsers() }}>{t('admin.users.clear')}</button>}
           </form>
+          <p className="acct-note">{iAmSuper ? t('admin.users.superHint') : t('admin.users.staffHint')}</p>
           <div className="admin-list">
-            {users.map((u) => (
-              <div key={u.id} className={"admin-row " + (u.banned ? 'admin-row--banned' : '')}>
-                <div>
-                  <strong>{u.nickname || u.username}</strong>
-                  <span className="msg-date"> @{u.username} · {fmtDate(u.created_at)}</span>
-                  <span className={"role-tag " + (u.role === 'admin' ? 'role-tag--admin' : '')}>{u.role === 'admin' ? t('admin.users.roleStaff') : t('admin.users.roleMember')}</span>
-                  {u.banned ? <span className="role-tag role-tag--ban">{t('admin.users.banned')}</span> : null}
+            {users.map((u) => {
+              const isSuperRow = u.role === 'superadmin'
+              const isSelf = !!(me && me.id === u.id)
+              const locked = isSuperRow || isSelf          // 超管账号与自己都不给动
+              return (
+                <div key={u.id} className={"admin-row " + (u.banned ? 'admin-row--banned' : '')}>
+                  <div>
+                    <strong>{u.nickname || u.username}</strong>
+                    <span className="msg-date"> @{u.username} · {fmtDate(u.created_at)}</span>
+                    <span className={"role-tag " + (isSuperRow ? 'role-tag--super' : u.role === 'admin' ? 'role-tag--admin' : '')}>
+                      {isSuperRow ? t('admin.users.roleSuper') : u.role === 'admin' ? t('admin.users.roleStaff') : t('admin.users.roleMember')}
+                    </span>
+                    {u.banned ? <span className="role-tag role-tag--ban">{t('admin.users.banned')}</span> : null}
+                    {isSelf ? <span className="role-tag">{t('admin.users.self')}</span> : null}
+                  </div>
+                  <div className="btn-row">
+                    {iAmSuper && !locked && (
+                      <button className="mini-btn" onClick={() => setRole(u, u.role === 'admin' ? 'user' : 'admin')}>
+                        {u.role === 'admin' ? t('admin.users.demote') : t('admin.users.promote')}
+                      </button>
+                    )}
+                    {!locked && <button className="mini-btn" onClick={() => resetUserPw(u)}>{t('admin.users.resetPassword')}</button>}
+                    {!locked && (
+                      <button className={"mini-btn " + (u.banned ? '' : 'mini-btn--danger')} onClick={() => setBanned(u, !u.banned)}>
+                        {u.banned ? t('admin.users.unban') : t('admin.users.ban')}
+                      </button>
+                    )}
+                    {iAmSuper && !locked && (
+                      <button className="mini-btn mini-btn--danger" onClick={() => delUser(u)}>{t('admin.users.deleteAccount')}</button>
+                    )}
+                  </div>
                 </div>
-                <div className="btn-row">
-                  <button className="mini-btn" onClick={() => setRole(u, u.role === 'admin' ? 'user' : 'admin')}>
-                    {u.role === 'admin' ? t('admin.users.demote') : t('admin.users.promote')}
-                  </button>
-                  <button className="mini-btn" onClick={() => resetUserPw(u)}>{t('admin.users.resetPassword')}</button>
-                  {u.username !== 'admin' && (
-                    <button className={"mini-btn " + (u.banned ? '' : 'mini-btn--danger')} onClick={() => setBanned(u, !u.banned)}>
-                      {u.banned ? t('admin.users.unban') : t('admin.users.ban')}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </>
       )}
