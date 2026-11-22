@@ -2,77 +2,163 @@ import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../api'
 import { t } from '../i18n'
+import { fmtDate, fmtDateTime } from '../time'
+import { readInboxCache, writeInboxCache, fetchInbox } from '../panelCache'
 
-export default function MemberView() {
-  const [anns, setAnns] = useState([])
-  const [conv, setConv] = useState(null)
-  const [msgs, setMsgs] = useState([])
+/* 私信轮询间隔：4 秒。页面切到后台时暂停，切回来立即补一次 */
+const POLL_MS = 4000
+
+/* 按 id 合并两批消息（本地已渲染的不会被服务端响应覆盖掉） */
+function mergeMsgs(a, b) {
+  if (!b || !b.length) return a
+  const seen = new Set(a.map((x) => x.id))
+  const add = b.filter((x) => !seen.has(x.id))
+  if (!add.length) return a
+  return a.concat(add).sort((x, y) => x.id - y.id)
+}
+
+export default function MemberView({ user }) {
+  const userId = user && user.id
+  /* 首屏直接用预取缓存渲染：进入面板不再等一次网络往返 */
+  const [cached] = useState(() => readInboxCache(userId))
+  const [anns, setAnns] = useState((cached && cached.announcements) || [])
+  const [conv, setConv] = useState((cached && cached.conv) || null)
+  const [msgs, setMsgs] = useState((cached && cached.list) || [])
   const [content, setContent] = useState('')
   const [msg, setMsg] = useState('')
-  const [op, setOp] = useState('')
-  const [np, setNp] = useState('')
-  const [pwMsg, setPwMsg] = useState('')
+  const [loading, setLoading] = useState(!cached)
+  const [showLoading, setShowLoading] = useState(false)
+  const [sending, setSending] = useState(false)
   const boxRef = useRef(null)
+  const msgsRef = useRef(msgs)
+  const annsRef = useRef(anns)
+  const convRef = useRef(conv)
+  const lastIdRef = useRef(msgs.length ? msgs[msgs.length - 1].id : 0)
+  const annVerRef = useRef(cached && cached.annVersion != null ? cached.annVersion : -1)
 
-  const scrollDown = () => { if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight }
+  useEffect(() => { msgsRef.current = msgs }, [msgs])
+  useEffect(() => { annsRef.current = anns }, [anns])
+  useEffect(() => { convRef.current = conv }, [conv])
 
-  const loadConv = async () => {
-    try {
-      const d = await api('/conversation')
-      setConv(d.conv)
-      if (d.conv) {
-        const m = await api('/conversation/' + d.conv.id + '/messages')
-        setMsgs(m.list || [])
-        await api('/conversation/' + d.conv.id + '/read', { method: 'POST' })
-        scrollDown()
-      }
-    } catch {}
+  /* 「加载中」延迟出现：请求通常几十毫秒就回来了，不该闪一下文案 */
+  useEffect(() => {
+    if (!loading) { setShowLoading(false); return }
+    const timer = setTimeout(() => setShowLoading(true), 180)
+    return () => clearTimeout(timer)
+  }, [loading])
+
+  /* 首帧可能拿不到 userId（/me 还没回来）：等它到位后立刻用缓存补上，避免白等一次网络 */
+  useEffect(() => {
+    if (!userId || msgsRef.current.length || annsRef.current.length) return
+    const c = readInboxCache(userId)
+    if (!c) return
+    if (c.announcements) { setAnns(c.announcements); annsRef.current = c.announcements }
+    if (c.annVersion != null) annVerRef.current = c.annVersion
+    if (c.conv) setConv(c.conv)
+    if (c.list && c.list.length) {
+      msgsRef.current = c.list
+      setMsgs(c.list)
+      lastIdRef.current = c.list[c.list.length - 1].id
+    }
+    setLoading(false)
+  }, [userId])
+
+  const scrollDown = () => {
+    const box = boxRef.current
+    if (box) box.scrollTop = box.scrollHeight
   }
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [a] = await Promise.all([api('/announcements')])
-        setAnns(a.list || [])
-      } catch {}
-      loadConv()
-    }
-    load()
-  }, [])
+  /* 本地状态回写缓存，下次进面板/刷新时首屏仍是最新的 */
+  const persist = (next) => {
+    writeInboxCache(userId, {
+      announcements: next.announcements !== undefined ? next.announcements : annsRef.current,
+      annVersion: annVerRef.current,
+      conv: next.conv !== undefined ? next.conv : convRef.current,
+      list: next.list !== undefined ? next.list : msgsRef.current
+    })
+  }
 
-  /* 增量轮询：新消息自动出现
-     用 ref 持有最新消息 id，避免把 msgs 放进依赖导致每次新消息都重建定时器 */
-  const lastIdRef = useRef(0)
-  useEffect(() => { lastIdRef.current = msgs.length ? msgs[msgs.length - 1].id : 0 }, [msgs])
-
+  /* 进入面板：先用缓存渲染，再静默回源对齐服务端 */
   useEffect(() => {
-    if (!conv) return
-    const timer = setInterval(async () => {
+    if (!userId) return
+    let alive = true
+    fetchInbox(userId)
+      .then((d) => {
+        if (!alive || !d) return
+        if (d.announcements) { setAnns(d.announcements); annsRef.current = d.announcements }
+        if (d.annVersion != null) annVerRef.current = d.annVersion
+        setConv(d.conv || null)
+        const merged = mergeMsgs(msgsRef.current, d.list || [])
+        msgsRef.current = merged
+        setMsgs(merged)
+        lastIdRef.current = merged.length ? merged[merged.length - 1].id : 0
+        scrollDown()
+      })
+      .catch((err) => { if (alive) setMsg(String(err.message)) })
+      .finally(() => { if (alive) setLoading(false) })
+    return () => { alive = false }
+  }, [userId])
+
+  /* 增量轮询：只取比本地最新一条更新的消息 */
+  useEffect(() => {
+    if (!userId) return
+    let stopped = false
+    const tick = async () => {
+      if (stopped || document.hidden) return
       try {
-        const m = await api('/conversation/' + conv.id + '/messages?after=' + lastIdRef.current)
-        if (m.list && m.list.length) {
-          setMsgs((old) => {
-            const seen = new Set(old.map((x) => x.id))
-            return old.concat(m.list.filter((x) => !seen.has(x.id)))
-          })
-          await api('/conversation/' + conv.id + '/read', { method: 'POST' })
+        const d = await api('/inbox?after=' + lastIdRef.current)
+        if (stopped) return
+        // 公告变了才重新拉正文，平时只比对版本号
+        if (d.annVersion != null && d.annVersion !== annVerRef.current) {
+          annVerRef.current = d.annVersion
+          const a = await api('/announcements')
+          if (stopped) return
+          setAnns(a.list || [])
+          annsRef.current = a.list || []
+          persist({})
+        }
+        if (d.convId) setConv((c) => c || { id: d.convId })
+        if (d.list && d.list.length) {
+          const merged = mergeMsgs(msgsRef.current, d.list)
+          msgsRef.current = merged
+          setMsgs(merged)
+          lastIdRef.current = Math.max(lastIdRef.current, d.list[d.list.length - 1].id)
+          persist({ list: merged })
           scrollDown()
         }
-      } catch {}
-    }, 8000)
-    return () => clearInterval(timer)
-  }, [conv])
+      } catch { /* 网络抖动下一轮再试 */ }
+    }
+    const timer = setInterval(tick, POLL_MS)
+    const onVisible = () => { if (!document.hidden) tick() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVisible) }
+  }, [userId])
 
   const send = async (e) => {
     e.preventDefault()
+    if (sending || !content.trim()) return
     setMsg('')
+    setSending(true)
+    const text = content
     try {
-      const r = await api('/conversation/message', { method: 'POST', body: { content } })
+      const r = await api('/conversation/message', { method: 'POST', body: { content: text } })
       setContent('')
-      if (!conv) return loadConv()
-      const m = await api('/conversation/' + (conv ? conv.id : r.conv_id) + '/messages?after=' + (msgs.length ? msgs[msgs.length - 1].id : 0))
-      if (m.list && m.list.length) { setMsgs((old) => old.concat(m.list)); scrollDown() }
-    } catch (err) { setMsg(err.message) }
+      // 服务端返回整行，直接追加，不再为确认而多跑一次查询
+      if (r.msg && r.msg.id) {
+        const merged = mergeMsgs(msgsRef.current, [r.msg])
+        msgsRef.current = merged
+        setMsgs(merged)
+        lastIdRef.current = Math.max(lastIdRef.current, r.msg.id)
+        persist({ list: merged })
+      }
+      if (r.conv_id) setConv((c) => c || { id: r.conv_id })
+      scrollDown()
+    } catch (err) {
+      setMsg(err.message)
+      setContent(text)
+    } finally {
+      setSending(false)
+    }
   }
 
   const changePw = async (e) => {
@@ -86,6 +172,7 @@ export default function MemberView() {
       <div className="panel-head">
         <p className="auth-kicker">{t('member.kicker')}</p>
         <h1 className="panel-title">{t('member.title')}</h1>
+        <Link className="panel-back" to="/account">{t('account.title')}</Link>
         <Link className="panel-back" to="/">{t('common.backHome')}</Link>
       </div>
 
@@ -94,7 +181,7 @@ export default function MemberView() {
         {anns.length === 0 && <p className="panel-empty">{t('member.noAnnouncements')}</p>}
         {anns.map((a) => (
           <article key={a.id} className={"ann " + (a.pinned ? 'ann--pinned' : '')}>
-            <div className="ann-meta"><span>{a.pinned ? t('member.pinned') : a.author}</span><span>{String(a.created_at).slice(0, 10)}</span></div>
+            <div className="ann-meta"><span>{a.pinned ? t('member.pinned') : a.author}</span><span>{fmtDate(a.created_at)}</span></div>
             <h3 className="ann-title">{a.title}</h3>
             <p className="ann-content">{a.content}</p>
           </article>
@@ -105,30 +192,21 @@ export default function MemberView() {
         <h2 className="panel-sec-title">{t('member.inbox')}</h2>
         <div className="chat">
           <div className="chat-box" ref={boxRef}>
-            {!conv && msgs.length === 0 && <p className="panel-empty">{t('member.inboxEmpty')}</p>}
+            {showLoading && msgs.length === 0 && <div className="chat-skel" aria-hidden="true"><i /><i /><i /></div>}
+            {!loading && !conv && msgs.length === 0 && <p className="panel-empty">{t('member.inboxEmpty')}</p>}
             {msgs.map((m) => (
               <div key={m.id} className={"chat-msg " + (m.direction === 'to_staff' ? 'chat-msg--me' : 'chat-msg--staff')}>
                 <div className="chat-bubble">{m.content}</div>
-                <span className="chat-meta">{m.direction === 'to_staff' ? t('member.me') : t('member.staff')} · {String(m.created_at).slice(5, 16)}</span>
+                <span className="chat-meta">{m.direction === 'to_staff' ? t('member.me') : t('member.staff')} · {fmtDateTime(m.created_at)}</span>
               </div>
             ))}
           </div>
           <form onSubmit={send} className="chat-form">
             <textarea value={content} onChange={(e) => setContent(e.target.value)} rows="2" maxLength="1000" placeholder={t('member.messagePlaceholder')} required />
             {msg && <p className="auth-msg">{msg}</p>}
-            <button className="auth-btn">{t('member.send')}</button>
+            <button className="auth-btn" disabled={sending}>{sending ? t('member.sending') : t('member.send')}</button>
           </form>
         </div>
-      </section>
-
-      <section className="panel-sec">
-        <h2 className="panel-sec-title">{t('member.changePassword')}</h2>
-        <form onSubmit={changePw} className="msg-form">
-          <label>{t('password.old')} <input type="password" value={op} onChange={(e) => setOp(e.target.value)} required /></label>
-          <label>{t('password.next')} <input type="password" value={np} onChange={(e) => setNp(e.target.value)} minLength="6" placeholder={t('password.placeholder')} required /></label>
-          {pwMsg && <p className={"auth-msg " + (pwMsg.indexOf('✓') === 0 ? 'auth-msg--ok' : '')}>{pwMsg}</p>}
-          <button className="auth-btn">{t('password.save')}</button>
-        </form>
       </section>
     </div>
   )

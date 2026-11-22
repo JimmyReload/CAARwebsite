@@ -1,20 +1,35 @@
 import { useEffect, useRef, useState } from 'react'
 import { HashRouter, Routes, Route, Link, useNavigate, useLocation, Navigate } from 'react-router-dom'
-import Reveal from './components/Reveal'
 import AuthView from './views/AuthView'
 import MemberView from './views/MemberView'
 import AdminView from './views/AdminView'
+import HuntsView from './views/HuntsView'
+import AccountView from './views/AccountView'
 import { t } from './i18n'
 import api from './api'
+import { prefetchHunts, clearHuntsCache } from './huntsCache'
+import { prefetchPanel, clearPanelCache, startInboxPrefetch, readUserCache, writeUserCache } from './panelCache'
 
 /* 用户态 */
 function useUser() {
-  const [user, setUser] = useState(null)
-  const [ready, setReady] = useState(false)
+  // 先用上次的登录态快照渲染，避免刷新时先干等一次 /me；随后再用 /me 校验
+  const [user, setUserState] = useState(() => readUserCache())
+  const [notifUnread, setNotifUnread] = useState(0)
+  const [ready, setReady] = useState(() => !!readUserCache())
   useEffect(() => {
-    api('/me').then((d) => setUser(d.user || null)).catch(() => {}).finally(() => setReady(true))
+    api('/me')
+      .then((d) => {
+        const u = d.user || null
+        writeUserCache(u)
+        setUserState(u)
+        setNotifUnread(d.notifUnread || 0)
+      })
+      .catch(() => {})
+      .finally(() => setReady(true))
   }, [])
-  return { user, setUser, ready }
+  // 所有改用户态的地方（登录、改昵称、退出）都同步写快照
+  const setUser = (u) => { writeUserCache(u); setUserState(u) }
+  return { user, setUser, notifUnread, setNotifUnread, ready }
 }
 
 /* 首页锚点链接（兼容 HashRouter） */
@@ -34,13 +49,41 @@ function Anchor({ to, id, className, children }) {
 function Home() {
   const loc = useLocation()
   const pagesRef = useRef(null)
+  const animRef = useRef(0)
   const [pageIndex, setPageIndex] = useState(0)
   const pageCount = 5
+  // 固定 200ms 的自行缓动：CSS scroll-behavior: smooth 的时长由浏览器决定（整屏约 500ms），不可控。
   const goToPage = (index) => {
     const pages = pagesRef.current
     if (!pages) return
-    pages.scrollTo({ top: Math.max(0, Math.min(pageCount - 1, index)) * pages.clientHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+    const target = Math.max(0, Math.min(pageCount - 1, index)) * pages.clientHeight
+    const from = pages.scrollTop
+    cancelAnimationFrame(animRef.current)
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (reduced || Math.abs(target - from) < 2) {
+      pages.style.scrollBehavior = ''
+      pages.style.scrollSnapType = ''
+      pages.scrollTop = target
+      return
+    }
+    // 动画期间关掉平滑与吸附，否则每帧赋值会被浏览器再套一层缓动/回弹。
+    pages.style.scrollBehavior = 'auto'
+    pages.style.scrollSnapType = 'none'
+    const start = performance.now()
+    const duration = 200
+    const ease = (p) => 1 - Math.pow(1 - p, 3)
+    const step = (now) => {
+      const p = Math.min(1, (now - start) / duration)
+      pages.scrollTop = from + (target - from) * ease(p)
+      if (p < 1) { animRef.current = requestAnimationFrame(step); return }
+      pages.scrollTop = target
+      pages.style.scrollBehavior = ''
+      pages.style.scrollSnapType = ''
+      animRef.current = 0
+    }
+    animRef.current = requestAnimationFrame(step)
   }
+  useEffect(() => () => cancelAnimationFrame(animRef.current), [])
   const onPageKey = (e) => {
     if (e.target !== e.currentTarget) return
     const next = { PageDown: pageIndex + 1, PageUp: pageIndex - 1, Home: 0, End: pageCount - 1 }[e.key]
@@ -57,7 +100,7 @@ function Home() {
       // Keep browser zoom and horizontal gestures native.
       if (event.ctrlKey || Math.abs(event.deltaX) > Math.abs(event.deltaY) || !event.deltaY) return
       const now = performance.now()
-      if (now - lastWheel > 220 && now >= lockedUntil) {
+      if (now - lastWheel > 120 && now >= lockedUntil) {
         handled = false
         innerGesture = false
         distance = 0
@@ -80,9 +123,9 @@ function Home() {
       const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? pages.clientHeight : 1)
       if (Math.sign(delta) !== Math.sign(distance)) distance = 0
       distance += delta
-      if (Math.abs(distance) < 40) return
+      if (Math.abs(distance) < 24) return
       handled = true
-      lockedUntil = now + 700
+      lockedUntil = now + 150
       goToPage(index + (down ? 1 : -1))
     }
     pages.addEventListener('wheel', onWheel, { passive: false })
@@ -100,6 +143,11 @@ function Home() {
   const members = t('members')
   const faqs = t('faqs')
   const contact = t('contact')
+  // 05 的标题拆成「问句 + 填空答案」两段：第二段压在高亮块上
+  const joinTitle = t('sections.contact.title')
+  const joinCut = joinTitle.indexOf('，')
+  const joinHead = joinCut > -1 ? joinTitle.slice(0, joinCut + 1) : joinTitle
+  const joinAnswer = joinCut > -1 ? joinTitle.slice(joinCut + 1) : ''
 
   return (
     <>
@@ -110,111 +158,181 @@ function Home() {
         <h1 className="cover-title">{t('hero.title1')}</h1>
         <p className="cover-eng">{t('hero.title2')}</p>
         <p className="cover-sub">{t('hero.subtitle')}</p>
-        <a className="cover-cta" href={t('contact.joinUrl')} target="_blank" rel="noreferrer">{t('hero.cta')}</a>
-        <div className="cover-scroll">{t('hero.scroll')}</div>
+        <button type="button" className="cover-cta" onClick={() => goToPage(pageCount - 1)}>
+          <span>{t('hero.cta')}</span><span className="cover-cta-arrow" aria-hidden="true">↓</span>
+        </button>
       </section>
 
-      <section id="about" className="col">
-        <div className="col-head"><span className="col-no">{t('sections.about.no')}</span><h2 className="col-title">{t('sections.about.title')}</h2><span className="col-en">{t('sections.about.en')}</span></div>
+      <section id="about" className="sec">
+        <div className="rail">
+          <span className="rail-no">{t('sections.about.no')}</span>
+          <span className="rail-line" aria-hidden="true" />
+          <span className="rail-en">{t('sections.about.en')}</span>
+        </div>
+        <div className="sec-head">
+          <h2 className="sec-title">{t('sections.about.title')}</h2>
+          <p className="sec-lead">{t('about.role')}</p>
+        </div>
         <div className="about-grid">
-          <Reveal className="about-left">
-            <div className="about-portrait">
-              {t('about.image') ? (
-                <picture>
-                  <source srcSet="/images/caar-seal.webp" type="image/webp" />
-                  <img src={t('about.image')} alt={t('about.name')} width={760} height={760} />
-                </picture>
-              ) : <span className="about-seal">{t('about.name')}</span>}
-            </div>
-          </Reveal>
-          <div className="about-right">
-            <Reveal><h3 className="about-name">{t('about.name')}</h3><p className="about-role">{t('about.role')}</p></Reveal>
-            <Reveal className="about-intro">{aboutIntro.map((p, i) => <p key={i}>{p}</p>)}</Reveal>
-            <Reveal className="about-stats">
-              {aboutStats.map((s, i) => (
-                <div key={i} className="stat"><span className="stat-v">{s.value}</span><span className="stat-l">{s.label}</span></div>
-              ))}
-            </Reveal>
+          <div className="about-portrait">
+            {t('about.image') ? (
+              <picture>
+                <source srcSet="/images/caar-seal.webp" type="image/webp" />
+                <img src={t('about.image')} alt={t('about.name')} width={760} height={760} />
+              </picture>
+            ) : <span className="about-seal">{t('about.name')}</span>}
+          </div>
+          <ol className="about-intro">
+            {aboutIntro.map((p, i) => (
+              <li key={i}><span className="about-intro-no" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span><p>{p}</p></li>
+            ))}
+          </ol>
+          <div className="about-stats">
+            {aboutStats.map((s, i) => (
+              <div key={i} className="stat"><span className="stat-v">{s.value}</span><span className="stat-l">{s.label}</span></div>
+            ))}
           </div>
         </div>
       </section>
 
       </div>
 
-      <section id="projects" className="col col--dark home-page">
-        <div className="col-head"><span className="col-no">{t('sections.projects.no')}</span><h2 className="col-title">{t('sections.projects.title')}</h2><span className="col-en">{t('sections.projects.en')}</span></div>
-        <p className="record-desc">{t('recordsNote')}</p>
+      <section id="projects" className="sec sec--dark home-page">
+        <div className="rail rail--dark">
+          <span className="rail-no">{t('sections.projects.no')}</span>
+          <span className="rail-line" aria-hidden="true" />
+          <span className="rail-en">{t('sections.projects.en')}</span>
+        </div>
+        <div className="sec-head">
+          <h2 className="sec-title">{t('sections.projects.title')}</h2>
+          <p className="sec-lead">{t('recordsNote')}</p>
+        </div>
         <div className="record-list">
           {projects.map((p, i) => (
-            <Reveal key={i} className="record" delay={i * 90}>
+            <article className="record" key={i}>
+              <span className="record-no" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span>
               <div className="record-meta"><span>{p.year}</span><span>{p.tag}</span></div>
-              <div><h3 className="record-title">{p.title}</h3><p className="record-desc">{p.desc}</p></div>
-            </Reveal>
+              <h3 className="record-title">{p.title}</h3>
+              <p className="record-desc">{p.desc}</p>
+            </article>
           ))}
+          <div className="record-end"><b>{t('recordsEnd')}</b><span aria-hidden="true">…</span></div>
         </div>
-
       </section>
 
-      <section id="members" className="col home-page">
-        <div className="col-head"><span className="col-no">{t('sections.members.no')}</span><h2 className="col-title">{t('sections.members.title')}</h2><span className="col-en">{t('sections.members.en')}</span></div>
-        <p className="staff-desc">{t('membersNote')}</p>
+      <section id="members" className="sec home-page">
+        <div className="rail">
+          <span className="rail-no">{t('sections.members.no')}</span>
+          <span className="rail-line" aria-hidden="true" />
+          <span className="rail-en">{t('sections.members.en')}</span>
+        </div>
+        <div className="sec-head">
+          <h2 className="sec-title">{t('sections.members.title')}</h2>
+          <p className="sec-lead">{t('membersNote')}</p>
+        </div>
         <div className="staff-grid">
           {members.map((m, i) => (
-            <Reveal key={i} className="staff" delay={i * 80}>
+            <article className="staff" key={i}>
               <div className="staff-avatar">{m.avatar ? <img src={m.avatar} alt={m.name} /> : <span>{m.name.slice(0, 1)}</span>}</div>
-              <h3 className="staff-name">{m.name}</h3>
-              <p className="staff-role">{m.role}</p>
-              <p className="staff-desc">{m.desc}</p>
-            </Reveal>
+              <div className="staff-body">
+                <span className="staff-no" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span>
+                <h3 className="staff-name">{m.name}</h3>
+                <p className="staff-role">{m.role}</p>
+                <p className="staff-desc">{m.desc}</p>
+              </div>
+            </article>
           ))}
         </div>
       </section>
 
-      <section id="faq" className="col col--tint home-page">
-        <div className="col-head"><span className="col-no">{t('sections.faq.no')}</span><h2 className="col-title">{t('sections.faq.title')}</h2><span className="col-en">{t('sections.faq.en')}</span></div>
+      <section id="faq" className="sec sec--tint home-page">
+        <div className="rail">
+          <span className="rail-no">{t('sections.faq.no')}</span>
+          <span className="rail-line" aria-hidden="true" />
+          <span className="rail-en">{t('sections.faq.en')}</span>
+        </div>
+        <div className="sec-head">
+          <h2 className="sec-title">{t('sections.faq.title')}</h2>
+        </div>
         <div className="letter-list">
           {faqs.map((f, i) => (
-            <Reveal key={i} className="letter" delay={i * 60}>
+            <article className="letter" key={i}>
+              <span className="letter-no" aria-hidden="true">Q{i + 1}</span>
               <h3 className="letter-q">{f.q}</h3>
               <p className="letter-a">{f.a}</p>
-            </Reveal>
+            </article>
           ))}
         </div>
       </section>
 
       <footer id="contact" className="colophon home-page">
-        <div className="col-head col-head--light"><span className="col-no">{t('sections.contact.no')}</span><h2 className="col-title">{t('sections.contact.title')}</h2><span className="col-en">{t('sections.contact.en')}</span></div>
-        <Reveal>
-          <a className="colophon-mail" href={contact.joinUrl} target="_blank" rel="noreferrer">{contact.joinLabel}</a>
-          <p className="colophon-note">{contact.note}</p>
-        </Reveal>
-        <Reveal className="colophon-row" delay={120}>
-          <div><span>{t('contact.labels.email')}</span>{contact.email}</div>
-        </Reveal>
-        <div className="colophon-foot">{contact.footer}</div>
+        <div className="rail rail--dark">
+          <span className="rail-no">{t('sections.contact.no')}</span>
+          <span className="rail-line" aria-hidden="true" />
+          <span className="rail-en">{t('sections.contact.en')}</span>
+        </div>
+
+        <div className="join-stage">
+          <div className="join-lead">
+            <p className="join-label">{contact.answerLabel}</p>
+            <h2 className="join-head">
+              <span className="join-head-a">{joinHead}</span>
+              <span className="join-blank">{joinAnswer}</span>
+            </h2>
+            <p className="join-note">{contact.note.split('\n').map((line, i) => <span key={i}>{line}</span>)}</p>
+            <a className="join-cta" href={contact.joinUrl} target="_blank" rel="noreferrer">
+              <span>{contact.joinLabel}</span>
+              <span className="join-cta-arrow" aria-hidden="true">↗</span>
+            </a>
+          </div>
+
+          <aside className="join-ticket">
+            <div className="join-ticket-head">
+              <span>{contact.ticket.kicker}</span>
+              <span>{contact.ticket.no}</span>
+            </div>
+            <div className="join-ticket-perf" aria-hidden="true" />
+            <div className="join-ticket-body">
+              <p className="join-ticket-title">{contact.ticket.title}</p>
+              <p className="join-ticket-meta">{contact.ticket.meta}</p>
+              <div className="join-ticket-mail">
+                <span>{t('contact.labels.email')}</span>
+                <strong>{contact.email}</strong>
+              </div>
+              <div className="join-ticket-code" aria-hidden="true" />
+            </div>
+          </aside>
+        </div>
+
+        <div className="join-foot"><span>{contact.footer}</span></div>
       </footer>
     </main>
-    <nav className="page-controls" aria-label={t('pageNavigation.label')}>
-      <button type="button" disabled={pageIndex === 0} onClick={() => goToPage(pageIndex - 1)} aria-label={t('pageNavigation.previous')}>↑</button>
-      <span aria-live="polite">{pageIndex + 1} / {pageCount}</span>
-      <button type="button" disabled={pageIndex === pageCount - 1} onClick={() => goToPage(pageIndex + 1)} aria-label={t('pageNavigation.next')}>↓</button>
+    <nav className="page-dots" aria-label={t('pageNavigation.label')}>
+      <span className="page-dots-count" aria-live="polite">{pageIndex + 1}/{pageCount}</span>
+      {Array.from({ length: pageCount }, (_, i) => (
+        <button
+          key={i}
+          type="button"
+          className={'page-dot' + (i === pageIndex ? ' on' : '')}
+          onClick={() => goToPage(i)}
+          aria-label={t('pageNavigation.dot', { n: i + 1 })}
+          aria-current={i === pageIndex ? 'true' : undefined}
+        />
+      ))}
     </nav>
     </>
   )
 }
 
 /* ============ 布局（刊头导航） ============ */
-function Shell({ user, setUser, ready }) {
+function Shell({ user, setUser, ready, notifUnread }) {
   const [scrolled, setScrolled] = useState(false)
-  const nav = useNavigate()
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 60)
     onScroll()
     window.addEventListener('scroll', onScroll, { passive: true })
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
-
-  const logout = async () => { try { await api('/logout', { method: 'POST' }) } catch {} setUser(null); nav('/') }
 
   return (
     <header className={"mast " + (scrolled ? 'on' : '')}>
@@ -228,9 +346,13 @@ function Shell({ user, setUser, ready }) {
           {ready && !user && <Link className="mast-cta" to="/login">{t('nav.login')}</Link>}
           {ready && user && (
             <>
+              <Link to="/hunts" className="mast-hunts">
+                {t('nav.hunts')}
+                {notifUnread > 0 && <span className="mast-badge" aria-label={t('hunts.notif.badgeLabel')}>{notifUnread > 99 ? '99+' : notifUnread}</span>}
+              </Link>
               <Link to="/member">{t('nav.memberPanel')}</Link>
               {user.role === 'admin' && <Link to="/admin">{t('nav.adminPanel')}</Link>}
-              <Link to="/" onClick={logout}>{t('nav.logout', { name: user.nickname || user.username })}</Link>
+              <Link to="/account">{t('nav.account')}</Link>
             </>
           )}
         </nav>
@@ -240,17 +362,46 @@ function Shell({ user, setUser, ready }) {
 }
 
 export default function App() {
-  const { user, setUser, ready } = useUser()
+  const { user, setUser, notifUnread, setNotifUnread, ready } = useUser()
+  // 冷启动先并行抓一次收件箱：不必等 /me 回来才知道用户是谁
+  useEffect(() => { startInboxPrefetch() }, [])
+  // 登录后立刻在后台预取赛事列表与面板数据：点开「赛事总览 / 成员面板 / 管理后台」时直接出内容
+  // 注意：必须等 /me 回来（ready）再决定清不清缓存。首屏 user 还是 null 时清缓存，
+  // 会把上一次访问写进 sessionStorage 的数据抹掉，刷新就永远命中不了缓存。
+  useEffect(() => {
+    if (!ready) return
+    if (user) {
+      prefetchHunts(user.id)
+      prefetchPanel(user)
+    } else {
+      clearHuntsCache()
+      clearPanelCache()
+    }
+  }, [user, ready])
+
+  // 切回标签页时刷新未读动态数（不轮询，避免常驻请求）
+  useEffect(() => {
+    if (!user) return
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      api('/me').then((d) => setNotifUnread(d.notifUnread || 0)).catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [user, setNotifUnread])
+
   return (
     <>
       <HashRouter>
-        <Shell user={user} setUser={setUser} ready={ready} />
+        <Shell user={user} setUser={setUser} ready={ready} notifUnread={notifUnread} />
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<AuthView mode="login" onLogin={setUser} />} />
           <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
-          <Route path="/member" element={ready && !user ? <Navigate to="/login" replace /> : <MemberView />} />
-          <Route path="/admin" element={ready && (!user || user.role !== 'admin') ? <Navigate to="/login" replace /> : <AdminView />} />
+          <Route path="/hunts" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <HuntsView user={user} onNotifRead={() => setNotifUnread(0)} />} />
+          <Route path="/member" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <MemberView user={user} />} />
+          <Route path="/admin" element={!ready ? null : !user || user.role !== 'admin' ? <Navigate to="/login" replace /> : <AdminView user={user} />} />
+          <Route path="/account" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <AccountView user={user} setUser={setUser} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </HashRouter>

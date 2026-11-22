@@ -3,6 +3,7 @@
 // 会话：随机令牌存 KV，HttpOnly Cookie
 // 所有面向用户的提示文案统一取自 locales/zh-CN.js
 import { t } from './i18n'
+import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts'
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -99,9 +100,130 @@ async function allAdmins(env) {
   return (await env.DB.prepare("SELECT id, username, nickname FROM users WHERE role = 'admin' ORDER BY id").all()).results;
 }
 
+// ---------- 公告 ----------
+// 公告列表与管理端列表共用同一查询，避免两处排序口径不一致
+async function loadAnnouncements(env) {
+  return (await env.DB.prepare('SELECT * FROM announcements ORDER BY pinned DESC, id DESC LIMIT 50').all()).results;
+}
+// 公告版本号（最大 id）：成员端轮询只比这个数，变了才重新拉正文
+async function announcementVersion(env) {
+  const row = await env.DB.prepare('SELECT COALESCE(MAX(id), 0) AS v FROM announcements').first();
+  return row ? Number(row.v) || 0 : 0;
+}
+
+// ---------- 会话 ----------
+// 已读位只前进不后退，避免并发请求把游标写小
+async function markRead(env, convId, lastId, isOwner) {
+  if (!lastId) return;
+  const col = isOwner ? 'user_last_read_id' : 'staff_last_read_id';
+  await env.DB.prepare(`UPDATE conversations SET ${col} = MAX(${col}, ?) WHERE id = ?`).bind(lastId, convId).run();
+}
+
+// ---------- 管理统计 ----------
+// 6 个 COUNT 合成一条语句：原来是 6 次串行往返
+async function adminStats(env) {
+  const row = await env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM users) AS total,
+            (SELECT COUNT(*) FROM users WHERE role = 'admin') AS admins,
+            (SELECT COUNT(*) FROM conversations) AS convs,
+            (SELECT COUNT(*) FROM conversations c WHERE EXISTS (
+               SELECT 1 FROM messages m
+                WHERE m.conv_id = c.id AND m.direction = 'to_staff' AND m.id > c.staff_last_read_id)) AS unreadConvs,
+            (SELECT COUNT(*) FROM announcements) AS anns,
+            (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')) AS new7`
+  ).first();
+  const n = (k) => (row ? Number(row[k]) || 0 : 0);
+  return { total: n('total'), admins: n('admins'), convs: n('convs'), unreadConvs: n('unreadConvs'), anns: n('anns'), new7: n('new7') };
+}
+
+// ---------- 赛事总览 ----------
+// 表结构见 migrations/0003_add_hunt_interests.sql；这里再兜底建一次，
+// 让「代码先上线、迁移后补」也不会 500。每个 isolate 只执行一次。
+let huntSchemaReady = null;
+function ensureHuntSchema(env) {
+  if (!huntSchemaReady) {
+    huntSchemaReady = (async () => {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS hunt_interests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        hunt_id TEXT NOT NULL,
+        hunt_title TEXT NOT NULL DEFAULT '',
+        hunt_url TEXT NOT NULL DEFAULT '',
+        hunt_start TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(user_id, hunt_id)
+      )`).run();
+      await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_hunt_interests_hunt ON hunt_interests(hunt_id)').run();
+      // 上游赛事快照（单行），避免每次请求都跨站抓取
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS hunt_feed (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        payload TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL
+      )`).run();
+      // 别人标记了我已标记的 hunt → 给我留一条动态
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS hunt_notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        hunt_id TEXT NOT NULL,
+        hunt_title TEXT NOT NULL DEFAULT '',
+        actor_id INTEGER NOT NULL,
+        actor_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        read_at TEXT,
+        UNIQUE(user_id, hunt_id, actor_id)
+      )`).run();
+      await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_hunt_notif_user ON hunt_notifications(user_id, id DESC)').run();
+    })().catch((err) => { huntSchemaReady = null; throw err; });
+  }
+  return huntSchemaReady;
+}
+
+// 所有「我想参加」记录（封禁账号不计入展示）
+async function loadInterests(env) {
+  const rows = (await env.DB.prepare(
+    `SELECT hi.hunt_id, hi.hunt_title, hi.hunt_url, hi.hunt_start, hi.created_at,
+            u.id AS user_id, u.nickname, u.username
+       FROM hunt_interests hi
+       JOIN users u ON u.id = hi.user_id
+      WHERE u.banned = 0
+      ORDER BY hi.created_at, hi.id`
+  ).all()).results;
+  const map = new Map();
+  for (const r of rows) {
+    if (!map.has(r.hunt_id)) map.set(r.hunt_id, { people: [], title: '', url: '', startAt: null });
+    const bucket = map.get(r.hunt_id);
+    bucket.people.push({ id: r.user_id, name: r.nickname || r.username });
+    if (!bucket.title) {
+      bucket.title = r.hunt_title;
+      bucket.url = r.hunt_url;
+      bucket.startAt = r.hunt_start;
+    }
+  }
+  return map;
+}
+
+async function huntInterestCount(env, huntId) {
+  const row = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM hunt_interests hi JOIN users u ON u.id = hi.user_id WHERE hi.hunt_id = ? AND u.banned = 0'
+  ).bind(huntId).first();
+  return row ? Number(row.n) || 0 : 0;
+}
+
 // ---------- 主路由 ----------
 export default {
-  async fetch(request, env) {
+  // Cron Trigger：每 10 分钟把 puzzle.cat 的快照写进 D1，用户请求只读库
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await ensureHuntSchema(env);
+          await refreshFeed(env);
+        } catch { /* 上游抖动时保留旧快照，下个周期再试 */ }
+      })()
+    );
+  },
+
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (!url.pathname.startsWith('/api/')) {
@@ -163,7 +285,7 @@ export default {
       if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
       if (row.banned) return json({ error: t('errors.banned') }, 403);
       const token = await createSession(env, row.id, row.session_version);
-      return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role } }, token);
+      return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at } }, token);
     }
 
     if (path === 'logout' && method === 'POST') {
@@ -173,7 +295,15 @@ export default {
     }
 
     if (path === 'me' && method === 'GET') {
-      return json({ user });
+      // 顺带带回未读动态数，导航角标首屏就能显示，省一次请求
+      let notifUnread = 0;
+      if (user) {
+        try {
+          const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM hunt_notifications WHERE user_id = ? AND read_at IS NULL').bind(user.id).first();
+          notifUnread = row ? Number(row.n) || 0 : 0;
+        } catch { notifUnread = 0; }
+      }
+      return json({ user, notifUnread });
     }
 
     // ---------- 以下需要登录 ----------
@@ -192,19 +322,219 @@ export default {
       return json({ ok: true });
     }
 
+    // 修改自己的昵称（管理员改他人昵称走 admin/users/:id）
+    if (path === 'profile' && method === 'PATCH') {
+      const b = await readBody(request);
+      const nickname = String(b.nickname || '').trim();
+      if (!nickname) return json({ error: t('errors.nicknameEmpty') }, 400);
+      if ([...nickname].length > 20) return json({ error: t('errors.nicknameTooLong') }, 400);
+      await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(nickname, user.id).run();
+      return json({ ok: true, nickname });
+    }
+
     // 公告
     if (path === 'announcements' && method === 'GET') {
-      const list = (await env.DB.prepare('SELECT * FROM announcements ORDER BY pinned DESC, id DESC LIMIT 50').all()).results;
-      return json({ list });
+      return json({ list: await loadAnnouncements(env) });
     }
 
     if (path === 'announcements' && method === 'POST') {
       if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
       if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: t('errors.announceEmpty') }, 400);
-      const r = await env.DB.prepare('INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?)')
-        .bind(String(b.title).trim(), String(b.content).trim(), user.nickname || user.username, b.pinned ? 1 : 0).run();
-      return json({ ok: true, id: r.meta.last_row_id });
+      // 返回完整行：前端可直接插入列表，不必依赖紧随其后的刷新
+      const rows = (await env.DB.prepare(
+        'INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?) RETURNING *'
+      ).bind(String(b.title).trim(), String(b.content).trim(), user.nickname || user.username, b.pinned ? 1 : 0).all()).results;
+      const ann = rows && rows[0];
+      return json({ ok: true, id: ann ? ann.id : null, ann: ann || null });
+    }
+
+    // ---------- 收件箱（成员一次取全） ----------
+    // 一次请求返回 公告 + 会话 + 消息 + 未读数，替代原先的 4 次串行往返
+    // after>0 时只取增量消息（公告只回版本号，变了前端再单独拉）
+    if (path === 'inbox' && method === 'GET') {
+      const after = Number(url.searchParams.get('after') || 0);
+      // mark=0：只取数据、不推进已读位。用于「登录后在首页后台预取」，避免用户还没看就把消息标成已读
+      const mark = url.searchParams.get('mark') !== '0';
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
+      const annVersionP = announcementVersion(env);
+
+      if (!conv) {
+        const [anns, annVersion] = await Promise.all([loadAnnouncements(env), annVersionP]);
+        return json({ announcements: anns, annVersion, conv: null, list: [], unread: 0 });
+      }
+
+      if (after > 0) {
+        const [msgs, annVersion] = await Promise.all([
+          env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? AND m.id > ? ORDER BY m.id LIMIT 50').bind(conv.id, after).all(),
+          annVersionP
+        ]);
+        const list = msgs.results;
+        if (list.length && mark) {
+          const last = list[list.length - 1].id;
+          // 已读标记放到响应之后执行，不占用户等待时间
+          if (ctx && ctx.waitUntil) ctx.waitUntil(markRead(env, conv.id, last, true));
+          else await markRead(env, conv.id, last, true);
+        }
+        return json({ annVersion, convId: conv.id, list, unread: 0 });
+      }
+
+      const [anns, annVersion, msgs, unreadRow] = await Promise.all([
+        loadAnnouncements(env),
+        annVersionP,
+        env.DB.prepare('SELECT m.*, u.nickname AS sender_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.conv_id = ? ORDER BY m.id DESC LIMIT 50').bind(conv.id).all(),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND direction = 'to_user' AND id > ?").bind(conv.id, conv.user_last_read_id).first()
+      ]);
+      const list = msgs.results.reverse();
+      const last = list.length ? list[list.length - 1].id : 0;
+      if (last && mark) {
+        if (ctx && ctx.waitUntil) ctx.waitUntil(markRead(env, conv.id, last, true));
+        else await markRead(env, conv.id, last, true);
+      }
+      return json({
+        announcements: anns,
+        annVersion,
+        conv: { id: conv.id, user_id: conv.user_id, created_at: conv.created_at, updated_at: conv.updated_at },
+        list,
+        unread: unreadRow ? Number(unreadRow.n) || 0 : 0
+      });
+    }
+
+    // ---------- 赛事总览（登录可见） ----------
+    // 列表来自 puzzle.cat；「我想参加」标记对所有登录成员可见
+    if (path === 'hunts' && method === 'GET') {
+      const force = url.searchParams.get('refresh') === '1';
+      try {
+        await ensureHuntSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      const started = Date.now();
+      let feed;
+      try {
+        feed = await getHuntFeed(env, { force, ctx });
+      } catch {
+        return json({ error: t('errors.huntsUnavailable') }, 502);
+      }
+      const feedMs = Date.now() - started;
+      const marks = await loadInterests(env);
+      const seen = new Set();
+      const list = feed.items.map((h) => {
+        seen.add(h.id);
+        const m = marks.get(h.id);
+        const people = m ? m.people : [];
+        return {
+          ...h,
+          interested: people.map((p) => ({ name: p.name, me: p.id === user.id })),
+          mine: people.some((p) => p.id === user.id)
+        };
+      });
+      // 已标记但上游列表里没有的赛事：保留展示，避免标记无声消失
+      for (const [huntId, m] of marks) {
+        if (seen.has(huntId)) continue;
+        list.push({
+          id: huntId,
+          title: m.title || huntId,
+          summary: '',
+          url: m.url || 'https://puzzle.cat/hunts/' + encodeURIComponent(huntId),
+          startAt: m.startAt || null,
+          endAt: null,
+          timezone: 'Asia/Shanghai',
+          status: '',
+          type: '',
+          tags: [],
+          lang: '',
+          rating: 0,
+          difficulty: 0,
+          thumb: '',
+          authors: [],
+          external: false,
+          missing: true,
+          interested: m.people.map((p) => ({ name: p.name, me: p.id === user.id })),
+          mine: m.people.some((p) => p.id === user.id)
+        });
+      }
+      const res = json({
+        updatedAt: feed.at,
+        list,
+        total: list.length,
+        mineCount: list.filter((h) => h.mine).length
+      });
+      // 便于线上排查：快照来源与读库耗时
+      res.headers.set('x-feed-source', feed.source || 'unknown');
+      res.headers.set('server-timing', 'feed;desc=' + (feed.source || 'unknown') + ';dur=' + feedMs);
+      return res;
+    }
+
+    // 标记 / 取消标记「我想参加」
+    if (path === 'hunts/interest' && method === 'POST') {
+      const b = await readBody(request);
+      const huntId = String(b.hunt_id || '');
+      if (!isValidHuntId(huntId)) return json({ error: t('errors.badParams') }, 400);
+      const interested = !(b.interested === false || b.interested === 0 || b.interested === '0');
+      try {
+        await ensureHuntSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      if (interested) {
+        let feed;
+        try {
+          feed = await getHuntFeed(env, { ctx });
+        } catch {
+          return json({ error: t('errors.huntsUnavailable') }, 502);
+        }
+        const h = feed.items.find((x) => x.id === huntId);
+        // 只允许标记上游真实存在的赛事，标题等快照一律取服务端数据
+        if (!h) return json({ error: t('errors.huntNotFound') }, 404);
+        const existed = await env.DB.prepare('SELECT 1 AS x FROM hunt_interests WHERE user_id = ? AND hunt_id = ?')
+          .bind(user.id, h.id).first();
+        await env.DB.prepare(
+          `INSERT INTO hunt_interests (user_id, hunt_id, hunt_title, hunt_url, hunt_start)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, hunt_id) DO UPDATE SET
+             hunt_title = excluded.hunt_title,
+             hunt_url = excluded.hunt_url,
+             hunt_start = excluded.hunt_start`
+        ).bind(user.id, h.id, h.title, h.url, h.startAt || null).run();
+        // 新标记才通知：给同一赛事下已经标记过的其他成员各留一条动态
+        if (!existed) {
+          try {
+            await env.DB.prepare(
+              `INSERT OR IGNORE INTO hunt_notifications (user_id, hunt_id, hunt_title, actor_id, actor_name)
+               SELECT hi.user_id, ?, ?, ?, ?
+                 FROM hunt_interests hi
+                 JOIN users u ON u.id = hi.user_id AND u.banned = 0
+                WHERE hi.hunt_id = ? AND hi.user_id <> ?`
+            ).bind(h.id, h.title, user.id, user.nickname || user.username, h.id, user.id).run();
+          } catch { /* 通知失败不影响标记本身 */ }
+        }
+      } else {
+        await env.DB.prepare('DELETE FROM hunt_interests WHERE user_id = ? AND hunt_id = ?').bind(user.id, huntId).run();
+      }
+      return json({ ok: true, interested, count: await huntInterestCount(env, huntId) });
+    }
+
+    // ---------- 赛事动态（别人标记了我已标记的 hunt） ----------
+    if (path === 'notifications' && method === 'GET') {
+      try {
+        await ensureHuntSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      const [rows, unreadRow] = await Promise.all([
+        env.DB.prepare(
+          `SELECT id, hunt_id, hunt_title, actor_name, created_at, read_at
+             FROM hunt_notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30`
+        ).bind(user.id).all(),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM hunt_notifications WHERE user_id = ? AND read_at IS NULL').bind(user.id).first()
+      ]);
+      return json({ list: rows.results, unread: unreadRow ? Number(unreadRow.n) || 0 : 0 });
+    }
+
+    if (path === 'notifications/read' && method === 'POST') {
+      await env.DB.prepare("UPDATE hunt_notifications SET read_at = datetime('now') WHERE user_id = ? AND read_at IS NULL").bind(user.id).run();
+      return json({ ok: true });
     }
 
     // ---------- 工单会话（会员↔STAFF 双向） ----------
@@ -230,9 +560,18 @@ export default {
         const cr = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (?)').bind(user.id).run();
         conv = { id: cr.meta.last_row_id };
       }
-      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_staff', ?)").bind(conv.id, user.id, content).run();
+      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_staff', ?) RETURNING id, created_at").bind(conv.id, user.id, content).all();
       await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(conv.id).run();
-      return json({ ok: true, msg_id: ins.meta.last_row_id });
+      const row = (ins.results && ins.results[0]) || {};
+      return json({
+        ok: true,
+        conv_id: conv.id,
+        msg_id: row.id || null,
+        msg: {
+          id: row.id, conv_id: conv.id, sender_id: user.id, direction: 'to_staff',
+          content, created_at: row.created_at || null, sender_name: user.nickname || user.username
+        }
+      });
     }
 
     // STAFF 回复
@@ -245,9 +584,17 @@ export default {
       if (content.length > 1000) return json({ error: t('errors.contentTooLong') }, 400);
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
       if (!conv) return json({ error: t('errors.convNotFound') }, 404);
-      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_user', ?)").bind(convId, user.id, content).run();
+      const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_user', ?) RETURNING id, created_at").bind(convId, user.id, content).all();
       await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(convId).run();
-      return json({ ok: true, msg_id: ins.meta.last_row_id });
+      const row = (ins.results && ins.results[0]) || {};
+      return json({
+        ok: true,
+        msg_id: row.id || null,
+        msg: {
+          id: row.id, conv_id: convId, sender_id: user.id, direction: 'to_user',
+          content, created_at: row.created_at || null, sender_name: user.nickname || user.username
+        }
+      });
     }
 
     // 拉取消息（after=增量，默认最近 50 条）
@@ -283,13 +630,20 @@ export default {
     // 管理概览
     if (path === 'admin/stats' && method === 'GET') {
       if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
-      const total = (await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first()).n;
-      const admins = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").first()).n;
-      const convs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations').first()).n;
-      const unreadConvs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations c WHERE EXISTS (SELECT 1 FROM messages m WHERE m.conv_id = c.id AND m.direction = ' + "'to_staff'" + ' AND m.id > c.staff_last_read_id)').first()).n;
-      const anns = (await env.DB.prepare('SELECT COUNT(*) AS n FROM announcements').first()).n;
-      const new7 = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE created_at >= datetime('now', '-7 days')").first()).n;
-      return json({ total, admins, convs, unreadConvs, anns, new7 });
+      return json(await adminStats(env));
+    }
+
+    // 管理端一次取全：公告 + 用户 + 会话 + 统计
+    // 原先管理台首屏要 4 个请求（每个都要重新验一次会话），这里合并成 1 个
+    if (path === 'admin/overview' && method === 'GET') {
+      if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
+      const [anns, users, convs, stats] = await Promise.all([
+        loadAnnouncements(env),
+        env.DB.prepare('SELECT id, username, nickname, role, banned, created_at FROM users ORDER BY id').all(),
+        env.DB.prepare("SELECT c.*, u.username, u.nickname, (SELECT COUNT(*) FROM messages m WHERE m.conv_id = c.id AND m.direction = 'to_staff' AND m.id > c.staff_last_read_id) AS unread FROM conversations c JOIN users u ON u.id = c.user_id ORDER BY c.updated_at DESC").all(),
+        adminStats(env)
+      ]);
+      return json({ anns, users: users.results, convs: convs.results, stats });
     }
 
     // 管理员：用户管理
@@ -336,14 +690,17 @@ export default {
       const id = Number(path.split('/')[2]);
       const b = await readBody(request);
       if (b.title !== undefined && !String(b.title).trim()) return json({ error: t('errors.titleEmpty') }, 400);
-      await env.DB.prepare('UPDATE announcements SET title = COALESCE(?, title), content = COALESCE(?, content), pinned = COALESCE(?, pinned) WHERE id = ?')
+      const r = await env.DB.prepare('UPDATE announcements SET title = COALESCE(?, title), content = COALESCE(?, content), pinned = COALESCE(?, pinned) WHERE id = ?')
         .bind(b.title !== undefined ? String(b.title).trim() : null, b.content !== undefined ? String(b.content) : null, b.pinned !== undefined ? (b.pinned ? 1 : 0) : null, id).run();
-      return json({ ok: true });
+      // 影响 0 行 = 这条公告已不存在（可能被别的管理员删了）：必须报错，不能静默返回 ok
+      if (!r.meta.changes) return json({ error: t('errors.announceGone') }, 404);
+      return json({ ok: true, id });
     }
 
     if (path.startsWith('admin/announcements/') && method === 'DELETE') {
       if (user.role !== 'admin') return json({ error: t('errors.adminOnly') }, 403);
-      await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(Number(path.split('/')[2])).run();
+      const r = await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(Number(path.split('/')[2])).run();
+      if (!r.meta.changes) return json({ error: t('errors.announceGone') }, 404);
       return json({ ok: true });
     }
 

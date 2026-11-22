@@ -13,18 +13,44 @@ export default {
   /* ---------- 通用 ---------- */
   common: {
     backHome: '← 返回首页',
+    loading: '加载中…',
   },
   pageNavigation: {
     label: '页面翻页',
     previous: '上一页',
     next: '下一页',
+    dot: '跳到第 {n} 页',
   },
   password: {
     old: '原密码',
     next: '新密码',
     placeholder: '至少 6 位',
     save: '保存新密码',
+    saving: '保存中…',
     ok: '✓ 密码已更新',
+  },
+
+  /* ---------- 个人主页 ---------- */
+  account: {
+    kicker: 'MY ACCOUNT',
+    title: '个人主页',
+    profile: '账号信息',
+    nickname: '昵称',
+    username: '用户名',
+    role: '身份',
+    roleAdmin: '管理员',
+    roleMember: '普通成员',
+    joined: '注册时间',
+    nicknameEdit: '修改昵称',
+    nicknameNote: '昵称会显示在站内信和「我想参加」名单里；用户名（@）不可修改。',
+    saveNick: '保存昵称',
+    saving: '保存中…',
+    nickOk: '✓ 昵称已更新',
+    password: '修改密码',
+    passwordNote: '修改后其他设备上的登录会失效，需要用新密码重新登录。',
+    session: '登录状态',
+    logoutNote: '退出后需要重新输入用户名和密码。',
+    logout: '退出登录',
   },
 
   /* ---------- 站点 / 刊头 ---------- */
@@ -39,8 +65,10 @@ export default {
     members: '成员',
     faq: 'Q&A',
     login: '登录 / 注册',
+    hunts: '赛事总览',
     memberPanel: '成员面板',
     adminPanel: '管理后台',
+    account: '个人主页',
     logout: '退出（{name}）',
   },
 
@@ -85,6 +113,7 @@ export default {
 
   /* ---------- 02 参赛记录（按时间倒序；月份为参赛记录，不是官方赛期） ---------- */
   recordsNote: '选录队伍的参赛经历，名次与用时来自赛后记录。更新至 2026 年 11 月；未列出名次的场次仅记录完赛情况。',
+  recordsEnd: '未完待续',
   projects: [
     {
       title: 'Quotidian Chapter · 完赛',
@@ -254,6 +283,8 @@ export default {
     note: '告诉我们你喜欢的题型、参加过的比赛，以及什么时候有空。还没有参赛经历，也可以从这里开始。\n问卷由问卷星提供，提交前请阅读《入会信息收集声明》。其他事宜可通过邮件联系。',
     footer: '© 2026 中不正协 · 一起想，接着解',
     labels: { email: '邮箱' },
+    answerLabel: '答案 · ANSWER',
+    ticket: { kicker: 'ADMIT ONE', no: 'NO.05', title: '入会券', meta: '不限经验 · 随时入场' },
   },
 
   /* ---------- 登录 / 注册 ---------- */
@@ -293,7 +324,49 @@ export default {
     staff: '管理员',
     messagePlaceholder: '输入消息…（≤1000 字）',
     send: '发送',
-    changePassword: '修改密码',
+    sending: '发送中…',
+  },
+
+  /* ---------- 赛事总览 ---------- */
+  hunts: {
+    kicker: 'HUNT BOARD',
+    title: '赛事总览',
+    intro: '列表取自 puzzle.cat，按开赛时间从新到旧。点「我想参加」标记你的意向，其他成员登录后就能看到谁想一起打。',
+    refresh: '刷新列表',
+    updatedAt: '数据更新于 {time}',
+    loading: '正在读取赛事列表…',
+    searchPlaceholder: '搜索赛事名称、标签或作者…',
+    filterAll: '全部',
+    filterMine: '我想参加',
+    filterOpen: '未结束',
+    summary: '共 {total} 场 · 你标记了 {mine} 场 · {people} 位成员留下意向',
+    mark: '我想参加',
+    marked: '✓ 已标记',
+    marking: '处理中…',
+    nobodyYet: '还没有人标记',
+    more: '+{n}',
+    me: '我',
+    longTerm: '长期赛',
+    regular: '常规赛',
+    startSuffix: '开赛',
+    dateUnknown: '时间待定',
+    missing: '已不在 puzzle.cat 列表',
+    empty: '没有符合条件的赛事',
+    emptyMine: '你还没有标记任何赛事。点卡片下方的「我想参加」开始。',
+    loadFailed: '赛事列表读取失败，请稍后重试',
+    status: { running: '进行中', ended: '已结束', upcoming: '未开始' },
+    notif: {
+      title: '新动态',
+      unread: '{n} 条未读',
+      markAllRead: '全部已读',
+      body: '{name} 也想参加「{hunt}」',
+      more: '还有 {n} 条动态',
+      justNow: '刚刚',
+      minutesAgo: '{n} 分钟前',
+      hoursAgo: '{n} 小时前',
+      daysAgo: '{n} 天前',
+      badgeLabel: '赛事动态未读',
+    },
   },
 
   /* ---------- 管理后台 ---------- */
@@ -316,7 +389,8 @@ export default {
       unreadConvs: '未读对话',
       anns: '公告总数',
     },
-    myPassword: '修改我的密码',
+    myAccount: '账号与密码',
+    myAccountNote: '修改密码、退出登录已统一收到「个人主页」，这里不再重复放置。',
     noConversations: '暂无用户来信',
     unreadCount: '{n} 条未读',
     read: '已读',
@@ -325,15 +399,20 @@ export default {
     roleMemberSuffix: '（普通用户）',
     replyPlaceholder: '输入回复…',
     reply: '回复',
+    replying: '回复中…',
     annForm: {
       titleLabel: '标题',
       contentLabel: '内容',
       pinnedLabel: '置顶',
       save: '保存修改',
       publish: '发布公告',
+      publishing: '发布中…',
+      published: '已发布',
+      saved: '已保存修改',
       cancelEdit: '取消编辑',
       edit: '编辑',
       delete: '删除',
+      confirmDelete: '确定删除这条公告？删除后无法恢复。',
     },
     users: {
       searchPlaceholder: '搜索用户名 / 昵称…',
@@ -380,5 +459,11 @@ export default {
     cannotDemoteSelf: '不能撤销自己的管理员权限',
     cannotBanSelf: '不能封禁自己',
     titleEmpty: '标题不能为空',
+    nicknameEmpty: '昵称不能为空',
+    nicknameTooLong: '昵称最多 20 个字',
+    announceGone: '这条公告已不存在（可能已被删除），请刷新后重试',
+    huntsUnavailable: '暂时取不到 puzzle.cat 的赛事列表，请稍后重试',
+    huntNotFound: '该赛事不在当前列表中，请刷新后重试',
+    serverError: '服务异常，请稍后重试',
   },
 }
