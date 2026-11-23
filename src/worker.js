@@ -575,11 +575,16 @@ const app = {
     if (isApi || status >= 400 || ms >= 800) log.info('http.request', line);
     else log.debug('http.request', line);
 
-    try {
-      res.headers.set('x-request-id', rid);
-      const prev = res.headers.get('server-timing');
-      res.headers.set('server-timing', (prev ? prev + ', ' : '') + 'app;dur=' + ms);
-    } catch { /* 响应头不可写（极少见）时放弃，不影响正文 */ }
+    // 只给 API 与 HTML 加 rid：/assets/* 是 immutable 缓存，把 rid 写进被缓存的响应会
+    // 让同一个 id 反复出现在不同请求上，反而失去唯一的排障意义
+    const wantsRid = isApi || String(res.headers.get('content-type') || '').includes('text/html');
+    if (wantsRid) {
+      try {
+        res.headers.set('x-request-id', rid);
+        const prev = res.headers.get('server-timing');
+        res.headers.set('server-timing', (prev ? prev + ', ' : '') + 'app;dur=' + ms);
+      } catch { /* 响应头不可写（极少见）时放弃，不影响正文 */ }
+    }
 
     return res;
   },
