@@ -22,7 +22,7 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 `/api/admin/logs` 会返回 500 并提示执行迁移，写入只落控制台。确实需要先上线后补迁移时，
 可临时设 `AUDIT_BOOTSTRAP=1` 让代码兜底建表，建完立刻取消。
 
-## 执行记录（截至 2026-11-23）
+## 执行记录（截至 2026-11-24）
 
 | 文件 | 内容 | 线上状态 |
 |---|---|---|
@@ -34,8 +34,8 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0007_superadmin.sql` | 把 `admin` 升为 `superadmin` | 已应用 |
 | `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 已应用 |
 | `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 列已由 `cdcfb83` 部署时的 runtime 补上；文件改为版本登记，可安全执行 |
-| `0010_add_audit_logs.sql` | `audit_logs`（审计流水，默认保留 90 天） | 待应用 |
-| `0011_news_articles.sql` | 会员新闻投稿、富文本稿件与管理员审核状态 | 待应用 |
+| `0010_add_audit_logs.sql` | `audit_logs`（审计流水，默认保留 90 天） | 已应用 |
+| `0011_news_articles.sql` | 会员新闻投稿、富文本稿件与管理员审核状态 | 已应用（2026-11-23） |
 
 > `0010` 只依赖 `0008` 建好的 `schema_migrations`，与 `0009` 互不依赖，应用顺序不分先后。
 
