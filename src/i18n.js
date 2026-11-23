@@ -4,7 +4,7 @@
    插值：t('nav.logout', { name: 'Tom' })  ← 文案里写 {name}
    切换语言：setLocale('en-US')（需先在 locales 里注册）
    ========================================================== */
-import zhCN from './locales/zh-CN'
+import zhCN from './locales/zh-CN.js'
 
 export const locales = {
   'zh-CN': zhCN,
