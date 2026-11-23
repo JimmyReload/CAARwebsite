@@ -3,7 +3,7 @@
 // 会话：随机令牌存 KV，HttpOnly Cookie
 // 所有面向用户的提示文案统一取自 locales/zh-CN.js
 import { t } from './i18n.js'
-import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentText } from './newsContent.js'
+import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentExcerpt, newsDocumentText } from './newsContent.js'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts.js'
 // 登录节流单独成模块：不依赖 Workers 运行时，可被 tests/ 直接驱动
 import {
@@ -1078,10 +1078,14 @@ const app = {
     if (path === 'news' && method === 'GET') {
       const page = Math.max(1, Math.min(10000, Number(url.searchParams.get('page') || 1) || 1));
       const rows = await env.DB.prepare(
-        "SELECT id, title, summary, excerpt, author_name, published_at FROM news_articles WHERE status = 'published' ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?"
+        "SELECT id, title, summary, excerpt, content, content_format, author_name, published_at FROM news_articles WHERE status = 'published' ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?"
       ).bind(NEWS_PAGE_SIZE, (page - 1) * NEWS_PAGE_SIZE).all();
       const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM news_articles WHERE status = 'published'").first();
-      return json({ list: rows.results, page, pageSize: NEWS_PAGE_SIZE, total: Number(count && count.n) || 0 });
+      const list = rows.results.map((row) => ({
+        id: row.id, title: row.title, summary: row.summary, author_name: row.author_name, published_at: row.published_at,
+        excerpt: newsDocumentExcerpt(newsDocumentFromRow(row), 240)
+      }));
+      return json({ list, page, pageSize: NEWS_PAGE_SIZE, total: Number(count && count.n) || 0 });
     }
     if (path.startsWith('news/') && path !== 'news/mine' && !path.startsWith('news/mine/') && method === 'GET') {
       const parts = path.split('/');

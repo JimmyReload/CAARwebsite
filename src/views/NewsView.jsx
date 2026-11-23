@@ -11,7 +11,7 @@ function ArticleCard({ article }) {
       <div className="news-card-meta"><span>{article.author_name || t('news.author')}</span><time>{fmtDateTime(article.published_at)}</time></div>
       <h2 className="news-card-title"><Link to={'/news/' + article.id}>{article.title}</Link></h2>
       {article.summary && <p className="news-card-summary">{article.summary}</p>}
-      {article.excerpt && <p className="news-card-excerpt">{article.excerpt}{article.excerpt.length >= 300 ? '…' : ''}</p>}
+      {article.excerpt && <div className="news-card-excerpt"><NewsContent value={article.excerpt} /></div>}
       <Link className="news-read-more" to={'/news/' + article.id}>{t('news.readMore')} <span aria-hidden="true">→</span></Link>
     </article>
   )

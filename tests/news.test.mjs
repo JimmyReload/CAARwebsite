@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeEnv, api } from './helpers/d1.mjs'
+import { makeEnv, api, ctx } from './helpers/d1.mjs'
 import worker from '../src/worker.js'
 
 const SUPER = 's'.repeat(32)
@@ -41,6 +41,9 @@ test('仅已发布稿件出现在公开列表和详情；详情以结构化富�
   const before = await api(worker, env, 'news')
   assert.equal(before.status, 200)
   assert.deepEqual(before.body.list, [])
+  const guestPreview = await worker.fetch(new Request('https://caar.test/api/news'), env, ctx)
+  assert.equal(guestPreview.status, 200, 'anonymous list endpoint must be dispatched before auth gate')
+  assert.deepEqual((await guestPreview.json()).list, [])
   const hidden = await api(worker, env, `news/${id}`)
   assert.equal(hidden.status, 404)
 
@@ -48,7 +51,10 @@ test('仅已发布稿件出现在公开列表和详情；详情以结构化富�
   assert.equal(publish.status, 200)
   const after = await api(worker, env, 'news')
   assert.equal(after.body.total, 1)
-  assert.equal(after.body.list[0].excerpt, '现场记录\n\n会员来稿')
+  assert.equal(after.body.list[0].excerpt.type, 'doc')
+  assert.equal(after.body.list[0].excerpt.children[0].type, 'heading')
+  assert.equal(after.body.list[0].excerpt.children[0].children[0].text, '现场记录')
+  assert.equal(after.body.list[0].excerpt.children[0].children[0].marks[0], 'bold')
   const detail = await api(worker, env, `news/${id}`)
   assert.equal(detail.status, 200)
   assert.equal((await api(worker, env, `news/${id}/extra`)).status, 404)
@@ -200,6 +206,20 @@ test('富文本拖放/粘贴转换只输出安全标签并过滤危险元素和�
     if (previousParser === undefined) delete globalThis.DOMParser
     else globalThis.DOMParser = previousParser
   }
+})
+
+test('公开新闻摘录保留格式并严格限制文本长度', async () => {
+  const { NEWS_CONTENT_MAX, newsDocumentExcerpt, newsDocumentText, normalizeNewsDocument } = await import('../src/newsContent.js')
+  const excerpt = newsDocumentExcerpt({ type: 'doc', children: [
+    { type: 'heading', level: 2, children: [{ type: 'text', text: '标题', marks: ['bold'] }] },
+    { type: 'paragraph', children: [{ type: 'text', text: '甲乙丙丁戊己庚辛', marks: ['italic'], href: 'javascript:alert(1)' }] },
+  ] }, 6)
+  assert.deepEqual(excerpt.children[0].children[0].marks, ['bold'])
+  assert.equal(Object.hasOwn(excerpt.children[1].children[0], 'href'), false)
+  const long = { type: 'doc', children: [{ type: 'paragraph', children: [{ type: 'text', text: '甲'.repeat(NEWS_CONTENT_MAX), marks: [] }] }] }
+  const teaser = newsDocumentText(newsDocumentExcerpt(long, 240))
+  assert.equal([...teaser].length, 240)
+  assert.doesNotThrow(() => normalizeNewsDocument(newsDocumentExcerpt(long, 240)))
 })
 
 test('拒绝非 allow-list 富文本结构、不安全链接及超长内容', async () => {

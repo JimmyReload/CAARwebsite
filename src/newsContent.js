@@ -86,6 +86,49 @@ export function newsDocumentText(document) {
   return blockText(safe.children)
 }
 
+// Produce a compact, sanitized rich-text teaser for the public list API.
+// It preserves formatting/link allowlists while bounding the returned text size.
+export function newsDocumentExcerpt(document, maxChars = 240) {
+  const safe = normalizeNewsDocument(document)
+  if (!safe) return { type: 'doc', children: [] }
+  let remaining = Math.max(1, Math.min(1000, Math.floor(Number(maxChars) || 240)))
+  let nodesRemaining = Math.min(1200, remaining + 300)
+  const clipInline = (nodes) => {
+    const out = []
+    for (const node of nodes) {
+      if (nodesRemaining <= 0 || remaining <= 0) break
+      nodesRemaining--
+      if (node.type === 'hardBreak') {
+        out.push({ type: 'hardBreak' })
+        continue
+      }
+      const chars = [...node.text]
+      const text = chars.slice(0, remaining).join('')
+      if (text) out.push({ ...node, text })
+      remaining -= [...text].length
+    }
+    return out
+  }
+  const children = []
+  for (const block of safe.children) {
+    if (remaining <= 0) break
+    if (block.type === 'bulletList' || block.type === 'orderedList') {
+      const items = []
+      for (const item of block.children) {
+        if (remaining <= 0 || nodesRemaining <= 0) break
+        nodesRemaining--
+        const itemChildren = clipInline(item.children)
+        if (itemChildren.length) items.push({ type: 'listItem', children: itemChildren })
+      }
+      if (items.length) children.push({ type: block.type, children: items })
+    } else {
+      const blockChildren = clipInline(block.children)
+      if (blockChildren.length) children.push({ ...block, children: blockChildren })
+    }
+  }
+  return { type: 'doc', children }
+}
+
 function escapeNewsText(text) {
   return String(text).replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' })[char])
 }
