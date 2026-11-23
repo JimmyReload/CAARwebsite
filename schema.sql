@@ -116,3 +116,21 @@ CREATE TABLE IF NOT EXISTS login_fails (
   until INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL DEFAULT 0
 );
+
+-- ============================================================
+-- 迁移版本登记（仅全新环境）
+--
+-- 上面建出的结构已经包含 0002–0009 的全部变更，这里直接登记，避免
+-- 「全新环境」与「生产环境」的 schema_migrations 对不上（生产是逐条执行迁移记的）。
+-- 0007 是数据迁移（把 admin 升为 superadmin），新库里没有 admin 账号、
+-- 执行也是空操作，同样登记，避免之后被重复执行。
+-- ============================================================
+INSERT OR REPLACE INTO schema_migrations (version) VALUES
+  ('0002_add_session_version'),
+  ('0003_add_hunt_interests'),
+  ('0004_add_hunt_feed'),
+  ('0005_add_hunt_notifications'),
+  ('0006_add_email_verification'),
+  ('0007_superadmin'),
+  ('0008_add_schema_migrations_and_login_fails'),
+  ('0009_add_login_fails_blocks');

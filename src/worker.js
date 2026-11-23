@@ -697,7 +697,10 @@ export default {
       const b = await readBody(request);
       try {
         await ensureLoginSchema(env);
-      } catch {
+      } catch (err) {
+        // 与登录同一口径：缺列是可解释的部署问题，报 503 + 可读文案，
+        // 不要混成 500「服务器异常」——那会让人去翻代码而不是去查迁移。
+        if (err && err.schemaMismatch) return json({ error: t('errors.throttleUnavailable') }, 503);
         return json({ error: t('errors.serverError') }, 500);
       }
       // 改密也校验旧密码：不节流就是一条绕过登录限流的口令猜测通道
