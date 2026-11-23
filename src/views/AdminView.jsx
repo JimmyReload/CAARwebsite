@@ -79,16 +79,16 @@ export default function AdminView({ user }) {
   /* 日志查询：filters 显式传入，避免 setState 之后还没生效就发请求 */
   const loadLogs = async (opts = {}) => {
     const f = { level: logLevel, event: logEvent, q: logQ, ip: logIp, ...(opts.filters || {}) }
+    // 这里不校验 q 长度：IP 按钮、清 chip、切页签都走这个函数，拦住会让人以为筛选失效。
+    // 只在用户主动点「查询」时校验（submitSearch），过短的 q 干脆不发（服务端也会忽略）。
     const q = String(f.q || '').trim()
-    // 服务端对 <3 字会忽略 q（前导通配太贵），前端直接拦住，避免「搜了 2 字却显示全部」
-    if (q.length > 0 && q.length < 3) { setMsg(t('admin.logs.qTooShort')); return }
     setLogLoading(true)
     try {
       const qs = new URLSearchParams()
       if (f.level) qs.set('level', f.level)
       if (f.event) qs.set('event', f.event)
       if (f.ip) qs.set('ip', f.ip)
-      if (q) qs.set('q', q)
+      if (q.length >= 3) qs.set('q', q)
       if (opts.append && logNext) qs.set('before', String(logNext))
       const d = await api('/admin/logs' + (qs.toString() ? '?' + qs.toString() : ''))
       setLogs((old) => (opts.append ? old.concat(d.list || []) : (d.list || [])))
@@ -101,6 +101,14 @@ export default function AdminView({ user }) {
   }
 
   useEffect(() => { if (tab === 'logs') loadLogs() }, [tab])
+
+  /* 只有主动搜索才校验长度：1–2 字此前会让 IP 筛选/清 chip/切页签全部早退 */
+  const submitSearch = (e) => {
+    e.preventDefault()
+    const q = logQ.trim()
+    if (q && q.length < 3) { setMsg(t('admin.logs.qTooShort')); return }
+    loadLogs()
+  }
 
   /* 清理旧日志：不可恢复，天数与后果都要问清楚。范围与服务端保持一致（7–3650），
      否则服务端静默截断、弹窗里却还是用户输入的值 */
@@ -420,7 +428,7 @@ export default function AdminView({ user }) {
       {/* ===== 日志（审计流水） ===== */}
       {tab === 'logs' && (
         <>
-          <form className="log-filter" onSubmit={(e) => { e.preventDefault(); loadLogs() }}>
+          <form className="log-filter" onSubmit={submitSearch}>
             <select
               value={logLevel}
               onChange={(e) => { setLogLevel(e.target.value); loadLogs({ filters: { level: e.target.value } }) }}

@@ -5,18 +5,20 @@
    约束：
    - 每 10 分钟最多 8 条，按 message 去重 —— 渲染循环里的同一个错会反复触发，
      不去重会把接口刷满。用时间窗而不是「整页 8 条」，否则长会话后段真正的错误发不出去。
-   - 节奏必须低于服务端阈值（120 次/小时），被 429 后整页闭嘴：
+   - 节奏必须低于服务端阈值（120 次/小时），被 429 后停发：
      否则一个持续报错的页面会把自己这个出口（可能是共享 NAT）封掉。
+     停发不是永久的——10 分钟后放一次探测，避免"别人的流量导致本页永久静默"。
    - 用 keepalive：页面正在卸载时也能把最后一条发出去。
    - 上报失败必须静默：日志系统不能把页面再搞崩一次。
    ========================================================== */
 
 const WINDOW_MS = 10 * 60 * 1000
 const MAX_PER_WINDOW = 8
+const PROBE_AFTER_MS = 10 * 60 * 1000
 
 let windowStart = 0
 let sent = 0
-let disabled = false
+let disabledUntil = 0
 const seen = new Set()
 
 function resetIfNeeded(now) {
@@ -28,8 +30,8 @@ function resetIfNeeded(now) {
 
 export function reportError(err, extra = {}) {
   try {
-    if (disabled) return
     const now = Date.now()
+    if (now < disabledUntil) return
     resetIfNeeded(now)
     if (sent >= MAX_PER_WINDOW) return
 
@@ -56,8 +58,9 @@ export function reportError(err, extra = {}) {
       credentials: 'same-origin',
       keepalive: true,
     }).then((r) => {
-      // 被限流就整页停用：继续重试会把封禁阶梯一路刷上去
-      if (r && (r.status === 429 || r.status === 413)) disabled = true
+      // 被限流就停发一轮窗口：继续重试会把封禁阶梯一路刷上去。
+      // 用时间戳而不是布尔，10 分钟后允许一次探测，防止共享出口上别人的流量把本页永久静音。
+      if (r && (r.status === 429 || r.status === 413)) disabledUntil = Date.now() + PROBE_AFTER_MS
     }).catch(() => {})
   } catch {
     /* 上报失败就放弃 */

@@ -197,13 +197,20 @@ export function bootstrapAuditSchema(env) {
 // 写入预算（每个 isolate、每分钟）：
 //   非关键事件 120 条；关键事件 600 条 —— **有上限，不是"不限"**：
 //   request.error 可以由外部请求触发，完全放行就等于留了一条不限速的 D1 写通道。
-// 丢弃必须留痕：每分钟第一条丢弃放行一行 audit.dropped 落库。
-// 只打 console 等于回到静默——console 有采样与保留期，事后查不到"那个窗口丢了多少"。
+//
+// 丢弃必须留痕，且要能回答两个问题：
+//   「丢了没有」→ 每分钟每种 kind 的第一条丢弃立刻写一行 audit.dropped（带请求上下文）；
+//   「丢了多少」→ 分钟翻页时补一行汇总（上一分钟的总数），否则计数只活在 isolate 内存里。
+// 只打 console 等于回到静默：console 有采样与保留期，事后查不到那个窗口丢了多少。
 const CRITICAL_EVENT = /^(admin\.|auth\.password\.|request\.error|cron\.)/
 const DROPPED_EVENT = 'audit.dropped'
 const AUDIT_CRITICAL_PER_MIN = 600
 
-let auditBudget = { minute: -1, n: 0, crit: 0, dropped: 0 }
+let auditBudget = {
+  minute: -1,
+  n: 0, crit: 0,
+  dropped: 0, droppedNormal: 0, droppedCritical: 0
+}
 
 export function auditBudgetSnapshot() {
   return { ...auditBudget }
@@ -303,7 +310,23 @@ export function audit(env, ctx, rec) {
 
     const event = clampStr(rec.event || 'unknown', 64)
     const minute = Math.floor(Date.now() / 60000)
-    if (auditBudget.minute !== minute) auditBudget = { minute, n: 0, crit: 0, dropped: 0 }
+
+    if (auditBudget.minute !== minute) {
+      const prev = auditBudget
+      auditBudget = { minute, n: 0, crit: 0, dropped: 0, droppedNormal: 0, droppedCritical: 0 }
+      // 分钟翻页时补写上一分钟的汇总：单个 isolate 在翻页前崩掉会丢这条，
+      // 但比"只在内存里"强——至少常态下能回答"那个窗口丢了多少"
+      if (prev.minute >= 0 && prev.dropped > 0) {
+        await writeRow(env, {
+          level: 'warn',
+          meta: {
+            minute: prev.minute, kind: 'summary', dropped: prev.dropped,
+            droppedNormal: prev.droppedNormal, droppedCritical: prev.droppedCritical,
+            budgetPerMin: AUDIT_BUDGET_PER_MIN, criticalPerMin: AUDIT_CRITICAL_PER_MIN
+          }
+        }, DROPPED_EVENT, 'warn')
+      }
+    }
 
     const level = ['debug', 'info', 'warn', 'error'].includes(rec.level) ? rec.level : 'info'
 
@@ -314,16 +337,23 @@ export function audit(env, ctx, rec) {
       const used = critical ? auditBudget.crit : auditBudget.n
       if (used >= cap) {
         auditBudget.dropped += 1
-        if (auditBudget.dropped === 1) {
+        const firstOfKind = critical
+          ? (auditBudget.droppedCritical += 1) === 1
+          : (auditBudget.droppedNormal += 1) === 1
+        // 普通与关键各自放行第一条：同分钟里"普通先打满"不该掩盖"关键也被丢"
+        if (firstOfKind) {
           try {
             console.warn(safeStringify({
               ts: new Date().toISOString(), level: 'warn', event: DROPPED_EVENT,
+              kind: critical ? 'critical' : 'normal', path: rec.path || '',
               budgetPerMin: AUDIT_BUDGET_PER_MIN, criticalPerMin: AUDIT_CRITICAL_PER_MIN, minute
             }))
           } catch { /* 彻底放弃 */ }
-          // 每分钟放行一条：让"丢了多少"在 D1 里查得到
           await writeRow(env, {
             level: 'warn',
+            // 带上触发丢弃的这次请求上下文：洪水最该回答的是"哪条路径、哪个出口打满的"
+            ip: rec.ip, method: rec.method, path: rec.path, rid: rec.rid,
+            actor_id: rec.actor_id, actor_name: rec.actor_name,
             meta: {
               minute, kind: critical ? 'critical' : 'normal',
               budgetPerMin: AUDIT_BUDGET_PER_MIN, criticalPerMin: AUDIT_CRITICAL_PER_MIN

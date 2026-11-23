@@ -357,7 +357,7 @@ section[id] { scroll-margin-top: 96px; }
   position: relative; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex: 0 0 auto;
   font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--yellow); letter-spacing: .04em;
 }
-.join-foot::after { content: ''; flex: 1; height: 3px; background: var(--yellow); }
+.join-foot::after { content: ''; flex: 1; height: 3px; background: var(--yellow); order: 2; }
 
 /* 首页整屏：终章按整屏铺满，留白随窗口高度伸缩 */
 .home-pages .colophon { justify-content: flex-start; gap: 14px; overflow: hidden; }
@@ -964,13 +964,16 @@ section[id] { scroll-margin-top: 96px; }
 /* 超管标记：与管理员（黑底黄字）区分 */
 .role-tag--super { background: #fff; color: #000; border-color: #000; box-shadow: inset 0 0 0 3px var(--yellow); }
 
-/* 页脚隐私说明：默认只占一行小字，展开后向上浮出，不挤压版式 */
-.privacy { position: relative; font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
+/* 页脚隐私说明：默认只占一行小字，展开后浮出，不挤压版式。
+   用 fixed 而不是 absolute：.colophon 有 overflow:hidden，absolute 浮层一旦高过容器
+   就会被裁掉，而"不超容器"这件事只能靠文案长度侥幸成立。order 让它排在横线右侧。 */
+.privacy { position: relative; order: 3; font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
 .privacy summary { cursor: pointer; color: var(--yellow); opacity: .7; list-style: none; white-space: nowrap; }
 .privacy summary::-webkit-details-marker { display: none; }
 .privacy summary:hover { opacity: 1; text-decoration: underline; text-underline-offset: 2px; }
 .privacy p {
-  position: absolute; right: 0; bottom: calc(100% + 10px); width: min(340px, 78vw);
+  position: fixed; right: clamp(12px, 3vw, 32px); bottom: 88px; width: min(340px, 84vw);
+  max-height: 60vh; overflow: auto;
   padding: 12px 14px; background: #000; color: #fff; border: 3px solid var(--yellow); z-index: 5;
   font-family: var(--font); font-size: 12px; font-weight: 500; line-height: 1.7;
   letter-spacing: 0; text-align: left; }
