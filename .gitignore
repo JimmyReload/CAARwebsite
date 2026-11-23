@@ -9,6 +9,9 @@ _bak-*/
 # 本地工作区数据：含 QQ 群聊天导出（第三方个人信息）、会话记忆，禁止入库
 .workbuddy-ai/
 
+# 会话/项目记忆与本地产物（自动生成，不入库）
+.workbuddy/
+
 # 环境变量与密钥（Cloudflare / 第三方 API）
 .env
 .env.*

@@ -33,7 +33,7 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0006_add_email_verification.sql` | `email_codes` + `users.email` | 已应用 |
 | `0007_superadmin.sql` | 把 `admin` 升为 `superadmin` | 已应用 |
 | `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 已应用 |
-| `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 待应用 |
+| `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 列已由 `cdcfb83` 部署时的 runtime 补上；文件改为版本登记，可安全执行 |
 | `0010_add_audit_logs.sql` | `audit_logs`（审计流水，默认保留 90 天） | 待应用 |
 
 > `0010` 只依赖 `0008` 建好的 `schema_migrations`，与 `0009` 互不依赖，应用顺序不分先后。
@@ -44,3 +44,23 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 > INSERT OR REPLACE INTO schema_migrations (version) VALUES ('0009_xxx');
 > ```
 > 0002–0007 是手工执行的，没有写入记录；上表状态以 2026-11-23 的实际库结构为准（逐表/逐列核对）。
+
+## 运维：登录返回 503 怎么办
+
+登录或改密返回 **`503 登录服务暂时不可用`** 时，不是前端问题，也不是限流误伤，而是
+`login_fails` 缺 `blocks` 列：代码检测到结构不一致会**拒绝接收口令**，不再降级放行
+（旧版会静默跳过限流，等于在无保护状态下收密码）。Worker 日志里同时有一条
+`[login] login_fails 缺 blocks 列…`。
+
+这种状态**无法从界面自救**（所有人都会被挡住），只能走 CLI：
+
+```bash
+# 1) 补列
+npx wrangler d1 execute caar-db --remote --command \
+  "ALTER TABLE login_fails ADD COLUMN blocks INTEGER NOT NULL DEFAULT 0;"
+# 2) 登记版本（0009 现在只做版本登记，不含 ALTER，可安全重复执行）
+npx wrangler d1 execute caar-db --remote --file=migrations/0009_add_login_fails_blocks.sql
+```
+
+全新环境用 `schema.sql` 建库则不需要这两步：结构直接到位，并且会一并登记 0002–0009
+的版本记录，不会出现"新库结构全、版本表空"的不一致。
