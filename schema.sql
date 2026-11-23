@@ -107,3 +107,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
   applied_at TEXT DEFAULT (datetime('now'))
 );
+
+-- 登录/改密尝试计数：D1 单条 UPSERT 原子自增（KV 没有原子自增，并发会丢计数）
+CREATE TABLE IF NOT EXISTS login_fails (
+  key TEXT PRIMARY KEY,
+  n INTEGER NOT NULL DEFAULT 0,
+  until INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);

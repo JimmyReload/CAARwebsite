@@ -137,6 +137,7 @@ export default function HuntsView({ user, onNotifRead }) {
   const [busy, setBusy] = useState(false)
   const [notifs, setNotifs] = useState([])
   const [notifUnread, setNotifUnread] = useState(0)
+  const [feedSource, setFeedSource] = useState('')
   const dataRef = useRef(data)
 
   const myName = (user && (user.nickname || user.username)) || t('hunts.me')
@@ -153,6 +154,7 @@ export default function HuntsView({ user, onNotifRead }) {
     try {
       const d = await fetchHunts(userId, force)
       commit({ list: d.list || [], mineCount: d.mineCount || 0, updatedAt: d.updatedAt || 0, total: d.total || 0 })
+      setFeedSource(d.source || '')
     } catch (err) {
       setError(err.message || t('hunts.loadFailed'))
     } finally {
@@ -257,6 +259,7 @@ export default function HuntsView({ user, onNotifRead }) {
         <p className="hunt-summary-line">
           {t('hunts.summary', { total: data.total, mine: data.mineCount, people: peopleCount })}
           {data.updatedAt > 0 && <span className="hunt-updated">{t('hunts.updatedAt', { time: clockOf(data.updatedAt) })}</span>}
+          {feedSource === 'stale-timeout' && <span className="hunt-slow">{t('hunts.refreshSlow')}</span>}
         </p>
 
         {notifs.length > 0 && (

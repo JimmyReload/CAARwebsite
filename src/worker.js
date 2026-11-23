@@ -48,9 +48,17 @@ function harden(res) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
+// 429 同时给出 Retry-After，便于网关与自动化客户端遵循
+function jsonRetry(data, status, retry) {
+  const res = json(data, status);
+  res.headers.set('retry-after', String(Math.max(1, Number(retry) || 1)));
+  return res;
+}
+
 async function readBody(req) {
   try { return await req.json(); } catch { return {}; }
 }
+const MAX_BODY_BYTES = 64 * 1024;
 
 // ---------- 密码 ----------
 async function hashPassword(pw, saltHex) {
@@ -72,49 +80,83 @@ async function verifyPassword(pw, saltHex, hashHex) {
 
 // ---------- 口令强度 ----------
 const PASSWORD_MIN = 8;
+const PASSWORD_MAX = 200;
 const WEAK_PASSWORDS = new Set([
   '12345678', '123456789', '1234567890', 'password', 'password1', 'passw0rd',
   'qwertyui', 'qwerty123', 'abc12345', 'iloveyou', 'admin123', 'caar1234'
 ]);
 // 返回错误文案 key，合法时返回 null
 function passwordProblem(pw, username) {
-  if (String(pw).length < PASSWORD_MIN) return 'errors.passwordLength';
-  const low = String(pw).toLowerCase();
+  const s = String(pw);
+  if (s.length < PASSWORD_MIN) return 'errors.passwordLength';
+  // 上限防止超长输入拖慢 PBKDF2（CPU 放大）
+  if (s.length > PASSWORD_MAX) return 'errors.passwordTooLong';
+  const low = s.toLowerCase();
   if (WEAK_PASSWORDS.has(low)) return 'errors.passwordWeak';
   if (username && low === String(username).toLowerCase()) return 'errors.passwordWeak';
   return null;
 }
 
-// ---------- 登录节流 ----------
-// IP 5 次失败后按 60s 起指数退避（上限 15 分钟）；用户名阈值更高，避免被轻易锁号。
-const LOGIN_IP_MAX = 5;
-const LOGIN_USER_MAX = 20;
+// ---------- 登录节流（D1 原子计数） ----------
+// KV 没有原子自增：并发请求会读到同一个旧值，20 并发只记 1 次。
+// 这里改用 D1 单条 UPSERT 自增（SQLite 语句级原子），并发下每次尝试都会被计入。
+const LOGIN_IP_MAX = 5;        // 同一 IP 允许的尝试次数
+const LOGIN_USER_MAX = 20;     // 同一用户名（非 staff）允许的尝试次数
 const LOGIN_BLOCK_BASE_MS = 60 * 1000;
 const LOGIN_BLOCK_MAX_MS = 15 * 60 * 1000;
-const LOGIN_FAIL_TTL = 60 * 60;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;  // 计数窗口，超过则重新计数
+
+let loginSchemaReady = null;
+function ensureLoginSchema(env) {
+  if (!loginSchemaReady) {
+    loginSchemaReady = env.DB.prepare(`CREATE TABLE IF NOT EXISTS login_fails (
+      key TEXT PRIMARY KEY,
+      n INTEGER NOT NULL DEFAULT 0,
+      until INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    )`).run().catch((err) => { loginSchemaReady = null; throw err; });
+  }
+  return loginSchemaReady;
+}
 
 function clientIp(request) {
-  return request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
+  return request.headers.get('cf-connecting-ip') || 'unknown';
 }
 
-async function readFail(env, key) {
-  try { return await env.SESSIONS.get(key, 'json'); } catch { return null; }
+/**
+ * 记录一次尝试并判断是否超限。返回 { blocked, retry }（retry 为秒）。
+ * 先自增再判定：并发请求各自原子自增，超出预算的直接拒绝，不会都挤过闸门。
+ */
+async function hitLimit(env, key, max) {
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    `INSERT INTO login_fails (key, n, until, updated_at) VALUES (?, 1, 0, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       n = CASE WHEN ? - login_fails.updated_at > ? THEN 1 ELSE login_fails.n + 1 END,
+       until = CASE WHEN ? - login_fails.updated_at > ? THEN 0 ELSE login_fails.until END,
+       updated_at = ?
+     RETURNING n, until`
+  ).bind(key, now, now, LOGIN_WINDOW_MS, now, LOGIN_WINDOW_MS, now).first();
+
+  const n = Number(row && row.n) || 0;
+  const until = Number(row && row.until) || 0;
+  if (until > now) return { blocked: true, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
+  if (n > max) {
+    const step = Math.min(n - max - 1, 10);
+    const wait = Math.min(LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS * Math.pow(2, step));
+    await env.DB.prepare('UPDATE login_fails SET until = ? WHERE key = ?').bind(now + wait, key).run();
+    return { blocked: true, retry: Math.ceil(wait / 1000) };
+  }
+  return { blocked: false, retry: 0 };
 }
 
-function failBlocked(rec, threshold) {
-  const n = Number(rec && rec.n) || 0;
-  if (n < threshold) return 0;
-  const until = Number(rec && rec.until) || 0;
-  return until > Date.now() ? until : 0;
-}
-
-async function bumpFail(env, key, rec, threshold) {
-  const n = (Number(rec && rec.n) || 0) + 1;
-  const step = n - threshold;
-  const wait = n >= threshold ? Math.min(LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS * Math.pow(2, step)) : 0;
+async function clearLimit(env, keys) {
+  const list = keys.filter(Boolean);
+  if (!list.length) return;
+  const marks = list.map(() => '?').join(',');
   try {
-    await env.SESSIONS.put(key, JSON.stringify({ n, until: wait ? Date.now() + wait : 0 }), { expirationTtl: LOGIN_FAIL_TTL });
-  } catch { /* 计数失败不阻断登录流程 */ }
+    await env.DB.prepare(`DELETE FROM login_fails WHERE key IN (${marks})`).bind(...list).run();
+  } catch { /* 清理失败不影响主流程 */ }
 }
 
 // ---------- 邮箱验证码 ----------
@@ -424,6 +466,11 @@ export default {
 
     const path = url.pathname.slice(5); // 去掉 /api/
     const method = request.method;
+    // 请求体上限：未认证即可触发的 CPU 放大（超长口令喂给 PBKDF2）
+    if (method !== 'GET' && method !== 'HEAD') {
+      const len = Number(request.headers.get('content-length') || 0);
+      if (len > MAX_BODY_BYTES) return json({ error: t('errors.bodyTooLarge') }, 413);
+    }
     const user = await getSessionUser(env, getCookie(request));
 
     // ---------- 公开 ----------
@@ -513,36 +560,38 @@ export default {
     if (path === 'login' && method === 'POST') {
       const b = await readBody(request);
       const username = String(b.username || '').trim();
-      // 登录节流：IP 与用户名两路计数，命中任一即 429（不透露账号是否存在）
-      const ipKey = 'lf:ip:' + clientIp(request);
-      const userKey = 'lf:u:' + username.toLowerCase();
-      const [ipRec, userRec] = await Promise.all([readFail(env, ipKey), readFail(env, userKey)]);
-      const blockedUntil = Math.max(failBlocked(ipRec, LOGIN_IP_MAX), failBlocked(userRec, LOGIN_USER_MAX));
-      if (blockedUntil > Date.now()) {
-        const retry = Math.ceil((blockedUntil - Date.now()) / 1000);
-        return json({ error: t('errors.tooManyAttempts', { n: retry }) }, 429);
+      const password = String(b.password || '');
+      // 超长输入直接拒绝：既防 KV/DB 键异常，也防超长口令拖慢 PBKDF2
+      if (username.length > 64 || password.length > PASSWORD_MAX) return json({ error: t('errors.badParams') }, 400);
+      try {
+        await ensureLoginSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
       }
+
+      // 先自增再判定：并发请求各自原子计数，超预算的直接 429
+      const ipKey = 'lf:ip:' + clientIp(request);
+      const ipHit = await hitLimit(env, ipKey, LOGIN_IP_MAX);
+      if (ipHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
+
       const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
+      const userKey = 'lf:u:' + username.toLowerCase();
+      // 管理账号不做用户名维度锁定：否则 20 次错误请求就能瘫痪管理台
+      if (!row || !isStaff(row)) {
+        const uHit = await hitLimit(env, userKey, LOGIN_USER_MAX);
+        if (uHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
+      }
+
       if (!row) {
         // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致
-        await hashPassword(String(b.password || ''), DUMMY_SALT);
-        await Promise.all([
-          bumpFail(env, ipKey, ipRec, LOGIN_IP_MAX),
-          bumpFail(env, userKey, userRec, LOGIN_USER_MAX)
-        ]);
+        await hashPassword(password, DUMMY_SALT);
         return json({ error: t('errors.badCredentials') }, 401);
       }
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.password || ''), salt, hash))) {
-        await Promise.all([
-          bumpFail(env, ipKey, ipRec, LOGIN_IP_MAX),
-          bumpFail(env, userKey, userRec, LOGIN_USER_MAX)
-        ]);
-        return json({ error: t('errors.badCredentials') }, 401);
-      }
+      if (!(await verifyPassword(password, salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
       if (row.banned) return json({ error: t('errors.banned') }, 403);
       // 登录成功清零计数
-      await Promise.all([env.SESSIONS.delete(ipKey), env.SESSIONS.delete(userKey)]);
+      await clearLimit(env, [ipKey, userKey]);
       const token = await createSession(env, row.id, row.session_version);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at, email: row.email || null } }, token);
     }
@@ -576,6 +625,16 @@ export default {
 
     if (path === 'change-password' && method === 'POST') {
       const b = await readBody(request);
+      try {
+        await ensureLoginSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      // 改密也校验旧密码：不节流就是一条绕过登录限流的口令猜测通道
+      const cpKey = 'cp:u:' + user.id;
+      const cpHit = await hitLimit(env, cpKey, LOGIN_IP_MAX);
+      if (cpHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: cpHit.retry }) }, 429, cpHit.retry);
+
       const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
       if (!row) return json({ error: t('errors.unauthorized') }, 401);
       const [salt, hash] = String(row.password).split(':');
@@ -584,8 +643,12 @@ export default {
       const pwErr = passwordProblem(np, user.username);
       if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
       const { salt: s2, hash: h2 } = await hashPassword(np);
-      await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, user.id).run();
-      return json({ ok: true });
+      // 顺手签发新会话：其他设备被踢，当前设备不掉线（避免"界面显示已登录、点什么都 401"）
+      const upd = await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ? RETURNING session_version')
+        .bind(s2 + ':' + h2, user.id).first();
+      await clearLimit(env, [cpKey]);
+      const token = await createSession(env, user.id, upd ? upd.session_version : Number(row.session_version) + 1);
+      return okWithCookie({ ok: true }, token);
     }
 
     // 修改自己的昵称（管理员改他人昵称走 admin/users/:id）
@@ -744,7 +807,9 @@ export default {
         updatedAt: feed.at,
         list,
         total: list.length,
-        mineCount: list.filter((h) => h.mine).length
+        mineCount: list.filter((h) => h.mine).length,
+        // 前端据此提示「刷新没生效」：stale-timeout 表示上游慢、已转后台更新
+        source: feed.source || 'unknown'
       });
       // 便于线上排查：快照来源与读库耗时
       res.headers.set('x-feed-source', feed.source || 'unknown');
@@ -975,7 +1040,7 @@ export default {
       if (b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         const np = String(b.new_password);
-        const pwErr = passwordProblem(np, null);
+        const pwErr = passwordProblem(np, target.username);
         if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
         await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, id).run();

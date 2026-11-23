@@ -369,6 +369,7 @@ export default {
     empty: '没有符合条件的赛事',
     emptyMine: '你还没有标记任何赛事。点卡片下方的「我想参加」开始。',
     loadFailed: '赛事列表读取失败，请稍后重试',
+    refreshSlow: '上游响应较慢，已在后台继续更新',
     status: { running: '进行中', ended: '已结束', upcoming: '未开始' },
     notif: {
       title: '新动态',
@@ -465,6 +466,8 @@ export default {
     usernameCharset: '用户名只能含中文/字母/数字/下划线',
     passwordLength: '密码至少 8 位',
     passwordWeak: '密码过于简单，请换一个（不要用常见口令或与用户名相同）',
+    passwordTooLong: '密码过长，请控制在 200 字符以内',
+    bodyTooLarge: '请求内容过大',
     tooManyAttempts: '尝试次数过多，请 {n} 秒后再试',
     usernameTaken: '该用户名已被注册',
     badCredentials: '用户名或密码错误',

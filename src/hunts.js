@@ -13,6 +13,7 @@ const UPSTREAM = 'https://puzzle.cat/api/hunts';
 export const TTL_MS = 10 * 60 * 1000; // 快照视为新鲜的时间
 const MIN_REFRESH_MS = 60 * 1000; // 两次抓取的最小间隔，避免刷新按钮打穿上游
 const FETCH_TIMEOUT_MS = 6000;
+const TOTAL_BUDGET_MS = 12000; // 整轮抓取上限，必须小于前端 15s 超时
 const MAX_PAGES = 4;
 const PAGE_SIZE = 48; // 上游上限
 
@@ -67,14 +68,18 @@ function normalize(h) {
 export async function fetchHuntList() {
   const items = [];
   let total = Infinity;
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
   for (let page = 1; page <= MAX_PAGES && items.length < total; page++) {
+    const remain = deadline - Date.now();
+    // 分页串行抓取时最容易超时，给整轮一个总预算
+    if (remain < 1000) throw new Error('upstream_budget');
     const url = UPSTREAM + '?sortBy=newest&page=' + page + '&pageSize=' + PAGE_SIZE;
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
         'user-agent': 'CAAR-Site/1.0 (+https://caar.fun; member hunt board)'
       },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Math.min(FETCH_TIMEOUT_MS, remain)),
       cf: { cacheTtl: 120, cacheEverything: true }
     });
     if (!res.ok) throw new Error('upstream_http_' + res.status);

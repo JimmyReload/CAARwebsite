@@ -28,10 +28,11 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0005_add_hunt_notifications.sql` | 赛事动态通知表 | 已应用 |
 | `0006_add_email_verification.sql` | `email_codes` + `users.email` | 已应用 |
 | `0007_superadmin.sql` | 把 `admin` 升为 `superadmin` | 已应用 |
+| `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 待应用（执行后补记） |
 
-> `schema_migrations` 表已随 `schema.sql` 建立，但历史迁移是手工执行的，没有写入记录。
-> 上表的「已应用」以 2026-11-23 的实际库结构为准（逐表/逐列核对）。
-> 之后新增的迁移请同时插入一条记录：
+> `schema_migrations` 由 **0008** 建立（`schema.sql` 里也有，但那是全新环境用的）。
+> 生产库请先执行 0008，再往里写版本记录：
 > ```sql
-> INSERT OR REPLACE INTO schema_migrations (version) VALUES ('0008_xxx');
+> INSERT OR REPLACE INTO schema_migrations (version) VALUES ('0009_xxx');
 > ```
+> 0002–0007 是手工执行的，没有写入记录；上表状态以 2026-11-23 的实际库结构为准（逐表/逐列核对）。

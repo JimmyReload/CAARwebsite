@@ -520,6 +520,7 @@ section[id] { scroll-margin-top: 96px; }
   font-family: var(--mono); font-size: 12px; font-weight: 700;
 }
 .hunt-updated { background: var(--yellow); border: 2px solid #000; padding: 2px 8px; }
+.hunt-slow { background: #fff; border: 2px solid var(--red); padding: 2px 8px; }
 .hunt-bar { margin: 18px 0 4px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .hunt-search {
   flex: 1 1 220px; min-width: 0; font: inherit; font-size: 15px; font-weight: 500;
