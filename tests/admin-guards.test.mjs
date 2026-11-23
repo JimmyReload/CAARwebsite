@@ -30,6 +30,39 @@ async function seed(env) {
 const version = async (env, id) =>
   Number((await env.DB.prepare('SELECT session_version FROM users WHERE id = ?').bind(id).first()).session_version)
 
+test('M-1 同族：管理员不能封禁同级管理员（拒绝服务）', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+
+  const r = await api(worker, env, 'admin/users/3', { method: 'PATCH', token: ADMIN, body: { banned: 1 } })
+  assert.equal(r.status, 403, '封禁同级 admin 等于把对方踢下线且需他人解封，只能由超管做')
+
+  const row = await env.DB.prepare('SELECT banned FROM users WHERE id = 3').first()
+  assert.equal(Number(row.banned), 0, '被拒的请求不能改库')
+})
+
+test('M-1 同族：管理员不能改同级管理员的昵称', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+
+  const r = await api(worker, env, 'admin/users/3', { method: 'PATCH', token: ADMIN, body: { nickname: '被改名' } })
+  assert.equal(r.status, 403)
+
+  const row = await env.DB.prepare('SELECT nickname FROM users WHERE id = 3').first()
+  assert.equal(row.nickname, 'admin2', '昵称不应被同级改写')
+})
+
+test('同族边界的另一侧：管理员可封禁普通成员，超管可封禁管理员', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+
+  const banMember = await api(worker, env, 'admin/users/4', { method: 'PATCH', token: ADMIN, body: { banned: 1 } })
+  assert.equal(banMember.status, 200, '封禁普通成员属于正常管理操作')
+
+  const banAdmin = await api(worker, env, 'admin/users/3', { method: 'PATCH', token: SUPER, body: { banned: 1 } })
+  assert.equal(banAdmin.status, 200, '超管可以封禁管理员')
+})
+
 test('M-1：管理员不能重置同级管理员的口令', async () => {
   const env = makeEnv({ fullSchema: true })
   await seed(env)

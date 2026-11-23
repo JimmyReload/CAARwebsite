@@ -1330,6 +1330,10 @@ const app = {
       const target = await env.DB.prepare('SELECT id, username, role FROM users WHERE id = ?').bind(id).first();
       if (!target) return json({ error: t('errors.userNotFound') }, 404);
       const targetIsSuper = target.role === 'superadmin';
+      // 同族收口：对"另一个管理员"的任何改动都要求超管。
+      // 否则平权的 admin 之间可以互相压制——改密（接管）、封禁（拒服）、改昵称（篡改他人展示）。
+      // 三处分支共用这一个判定，避免只堵了一条路径又从前门进来。
+      const peerAdmin = target.role === 'admin' && !isSuper(user) && id !== user.id;
       const b = await readBody(request);
 
       // 授权（设为/撤销管理员）只给超管
@@ -1347,6 +1351,7 @@ const app = {
       const guarded = targetIsSuper && id !== user.id;
       if (b.nickname !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
+        if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
         // 与 /api/profile 同一口径：非空、≤20 码点、无控制字符。
         // 昵称会进入所有人的赛事列表与工单，这里漏了上限就能被拿来放大响应体。
         const nick = normalizeNickname(b.nickname);
@@ -1360,6 +1365,8 @@ const app = {
       if (b.banned !== undefined) {
         if (id === user.id) return json({ error: t('errors.cannotBanSelf') }, 400);
         if (targetIsSuper) return json({ error: t('errors.cannotEditSuper') }, 400);
+        // 封禁同级 admin = 拒绝服务攻击（对方被踢下线、需他人解封），只能由超管做
+        if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
         await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
         io.audit(b.banned ? 'admin.user.ban' : 'admin.user.unban', {
           level: 'warn', status: 200, target_type: 'user', target_id: id,
@@ -1368,11 +1375,8 @@ const app = {
       }
       if (b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
-        // 管理员之间平权：admin 不得重置同级的口令，否则可横向接管对方账号。
-        // 超管账号已在 guarded 拦掉；这里拦 admin→admin（自己改自己除外），要动管理员口令只能走超管。
-        if (target.role === 'admin' && !isSuper(user) && id !== user.id) {
-          return json({ error: t('errors.superOnly') }, 403);
-        }
+        // 管理员之间平权：admin 不得重置同级的口令，否则可横向接管对方账号
+        if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
         const np = String(b.new_password);
         const pwErr = passwordProblem(np, target.username);
         if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
