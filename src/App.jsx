@@ -5,6 +5,8 @@ import MemberView from './views/MemberView'
 import AdminView from './views/AdminView'
 import HuntsView from './views/HuntsView'
 import AccountView from './views/AccountView'
+import NewsView from './views/NewsView'
+import MemberNewsView from './views/MemberNewsView'
 import { t } from './i18n'
 import api from './api'
 import { prefetchHunts, clearHuntsCache } from './huntsCache'
@@ -353,6 +355,7 @@ function Shell({ user, setUser, ready, notifUnread }) {
           <Anchor to="/" id="projects" className="mast-anchor">{t('nav.projects')}</Anchor>
           <Anchor to="/" id="members" className="mast-anchor">{t('nav.members')}</Anchor>
           <Anchor to="/" id="faq" className="mast-anchor">{t('nav.faq')}</Anchor>
+          <Link to="/news" className="mast-anchor">{t('nav.news')}</Link>
           {ready && !user && <Link className="mast-cta" to="/login">{t('nav.login')}</Link>}
           {ready && user && (
             <>
@@ -422,8 +425,11 @@ export default function App() {
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<AuthView mode="login" onLogin={setUser} />} />
           <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
+          <Route path="/news" element={<NewsView />} />
+          <Route path="/news/:id" element={<NewsView />} />
           <Route path="/hunts" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <HuntsView user={user} onNotifRead={() => setNotifUnread(0)} />} />
           <Route path="/member" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <MemberView user={user} />} />
+          <Route path="/member/news" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <MemberNewsView />} />
           <Route path="/admin" element={!ready ? null : !isStaff(user) ? <Navigate to="/login" replace /> : <AdminView user={user} />} />
           <Route path="/account" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <AccountView user={user} setUser={setUser} />} />
           <Route path="*" element={<Navigate to="/" replace />} />

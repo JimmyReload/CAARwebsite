@@ -7,7 +7,7 @@
    ```bash
    npx wrangler d1 export caar-db --remote --output=backup-$(date +%F-%H%M).sql
    ```
-3. 文件按序号执行，**不要跳号、不要重跑已应用的迁移**。
+3. 文件按序号执行，**不要重跑已应用的迁移**。部署时请从当前环境实际已应用的版本继续执行；若版本缺口或记录与数据库结构不一致，先核对再部署，不要盲目跳号。
 4. 新增迁移时，在本文件的「执行记录」里补一行，并同步更新 `schema.sql`（让全新环境一次建好）。
 
 ## 为什么不能重跑
@@ -35,6 +35,7 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 已应用 |
 | `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 列已由 `cdcfb83` 部署时的 runtime 补上；文件改为版本登记，可安全执行 |
 | `0010_add_audit_logs.sql` | `audit_logs`（审计流水，默认保留 90 天） | 待应用 |
+| `0011_news_articles.sql` | 会员新闻投稿、富文本稿件与管理员审核状态 | 待应用 |
 
 > `0010` 只依赖 `0008` 建好的 `schema_migrations`，与 `0009` 互不依赖，应用顺序不分先后。
 
