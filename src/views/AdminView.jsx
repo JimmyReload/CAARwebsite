@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../api'
-import { t } from '../i18n'
+import { t, eventLabel } from '../i18n'
 import { fmtDate, fmtDateTime } from '../time'
 import { readOverviewCache, writeOverviewCache, fetchOverview } from '../panelCache'
 
@@ -451,7 +451,7 @@ export default function AdminView({ user }) {
             >
               <option value="">{t('admin.logs.allEvents')}</option>
               {logEvents.map((ev) => (
-                <option key={ev.event} value={ev.event}>{ev.event}（{ev.n}）</option>
+                <option key={ev.event} value={ev.event} title={ev.event}>{eventLabel(ev.event)}（{ev.n}）</option>
               ))}
             </select>
             <input
@@ -507,7 +507,7 @@ export default function AdminView({ user }) {
                   <span className={'log-badge log-badge--' + row.level}>{row.level}</span>
                   <div className="log-main">
                     <div className="log-head">
-                      <strong className="log-event">{row.event}</strong>
+                      <strong className="log-event" title={row.event}>{eventLabel(row.event)}</strong>
                       {isClient ? <span className="log-src">{t('admin.logs.clientTag')}</span> : null}
                       <span className="log-when">{row.ts ? fmtDateTime(new Date(row.ts).toISOString()) : ''}</span>
                     </div>

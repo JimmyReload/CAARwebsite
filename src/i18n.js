@@ -41,3 +41,16 @@ export function t(path, vars) {
 }
 
 export default t
+
+// 审计事件名 → 中文名
+// 事件 id 是点分字符串（auth.login.fail），走 t() 会被当成嵌套路径拆开，
+// 所以这里在 locale 的 logEventLabels 表里做整串精确匹配。
+// 查不到就返回原始 id：新增事件忘配文案时，界面上仍能认出来，而不是空白。
+export function eventLabel(name) {
+  const id = String(name == null ? '' : name)
+  if (!id) return ''
+  const dict = locales[current] || locales[DEFAULT_LOCALE]
+  const map = dict && dict.logEventLabels
+  if (map && typeof map[id] === 'string') return map[id]
+  return id
+}

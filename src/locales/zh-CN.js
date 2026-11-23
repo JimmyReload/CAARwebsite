@@ -544,4 +544,51 @@ export default {
     huntNotFound: '该赛事不在当前列表中，请刷新后重试',
     serverError: '服务异常，请稍后重试',
   },
+
+  // 审计事件的中文名。事件 id 是点分字符串（auth.login.fail），当不了嵌套路径，
+  // 所以单独放一张扁平表，由 i18n.js 的 eventLabel() 整串精确匹配；
+  // 查不到就原样显示 id —— 宁可看到原始 event，也不要空标签。
+  logEventLabels: {
+    // 登录与账号
+    'auth.login.ok': '登录成功',
+    'auth.login.fail': '登录失败',
+    'auth.login.blocked': '登录被限流拦截',
+    'auth.login.schema_mismatch': '登录表结构不匹配',
+    'auth.logout': '退出登录',
+    'auth.register': '注册',
+    'auth.password.change': '修改口令',
+    'auth.password.change.fail': '修改口令失败',
+    'auth.profile.update': '修改个人资料',
+    'auth.email.bind': '绑定邮箱',
+    'verify.code.fail': '验证码校验失败',
+    // 管理操作
+    'admin.user.ban': '封禁用户',
+    'admin.user.unban': '解封用户',
+    'admin.user.delete': '删除用户',
+    'admin.user.nickname': '修改用户昵称',
+    'admin.user.role': '变更用户角色',
+    'admin.user.password_reset': '重置用户口令',
+    'announcement.create': '发布公告',
+    'announcement.update': '修改公告',
+    'announcement.delete': '删除公告',
+    'support.reply': '客服回复',
+    'admin.logs.read': '查看审计日志',
+    'admin.logs.purge': '清理审计日志',
+    'admin.logs.purge.fail': '清理审计日志失败',
+    'admin.logs.fail': '审计日志查询失败',
+    // 异常与来源
+    'client.error': '客户端报错',
+    'request.error': '请求异常',
+    'http.request': 'HTTP 请求',
+    'http.unhandled': '未捕获异常',
+    // 审计自身
+    'audit.dropped': '审计超出预算丢弃',
+    'audit.prune': '清理过期日志',
+    'audit.prune.fail': '清理过期日志失败',
+    'audit.table.missing': '审计表缺失',
+    'audit.write.fail': '审计写入失败',
+    // 外部依赖
+    'mail.send.fail': '邮件发送失败',
+    'cron.feed.fail': '赛事快照刷新失败',
+  },
 }
