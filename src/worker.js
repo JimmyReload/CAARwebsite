@@ -13,6 +13,12 @@ import {
   createLogger, describeError, requestMeta, maskEmail,
   audit, auditBudgetSnapshot, pruneAuditLogs, auditKeepDays, escapeLike
 } from './log.js'
+// PuzzleCat OAuth2.0：协议细节单独成模块（只用 fetch + Web Crypto，便于测试直接驱动）
+import {
+  PROVIDER as OAUTH_PROVIDER, oauthConfigured, redirectUri, authorizeUrl, randomState,
+  exchangeCode, fetchUserinfo, revokeToken, makeOauthOnlyPassword, usernameSeed, usernameCandidate,
+  isOauthOnly, safeNext
+} from './oauth.js'
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -279,6 +285,110 @@ async function allAdmins(env) {
 // user < admin < superadmin。superadmin 只有一个，负责授权与删号
 const isStaff = (u) => !!u && (u.role === 'admin' || u.role === 'superadmin');
 const isSuper = (u) => !!u && u.role === 'superadmin';
+
+// ---------- PuzzleCat OAuth ----------
+// state 放 HttpOnly Cookie（SameSite=Lax，回跳是同站顶层导航，Lax 会带上）：
+// 不放 KV —— 未登录端点不该有写放大，而 state 只需活过"跳出去再回来"这一分钟。
+const OAUTH_STATE_COOKIE = 'caar_oauth_state';
+const OAUTH_STATE_TTL = 10 * 60;
+const OAUTH_NEXT_COOKIE = 'caar_oauth_next';
+
+function oauthStateCookie(state) {
+  return OAUTH_STATE_COOKIE + '=' + state + '; Path=/api/oauth; HttpOnly; SameSite=Lax; Secure; Max-Age=' + OAUTH_STATE_TTL;
+}
+function oauthNextCookie(next) {
+  return OAUTH_NEXT_COOKIE + '=' + encodeURIComponent(next) + '; Path=/api/oauth; HttpOnly; SameSite=Lax; Secure; Max-Age=' + OAUTH_STATE_TTL;
+}
+function oauthClearCookies() {
+  const kill = '; Path=/api/oauth; HttpOnly; SameSite=Lax; Secure; Max-Age=0';
+  return [OAUTH_STATE_COOKIE + '=' + kill, OAUTH_NEXT_COOKIE + '=' + kill];
+}
+function readCookie(req, name) {
+  const m = (getCookie(req) || '').split(';').map((s) => s.trim()).find((s) => s.startsWith(name + '='));
+  return m ? m.slice(name.length + 1) : '';
+}
+// cookie 值来自客户端，畸形百分号编码会让 decodeURIComponent 抛 URIError；
+// 解不开就当没带，回落到默认路径，不要让整个回调 500
+function decodeCookieValue(raw) {
+  try { return decodeURIComponent(String(raw || '')); } catch { return ''; }
+}
+
+// 用户名冲突时按 _2/_3… 顺延；上限 20 码点（与注册口径一致）
+async function uniqueUsername(env, base) {
+  for (let i = 1; i <= 50; i++) {
+    const candidate = usernameCandidate(base, i);
+    const hit = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(candidate).first();
+    if (!hit) return candidate;
+  }
+  // 极端情况：同名太多，退回带随机后缀的兜底名
+  return usernameCandidate('pc' + crypto.randomUUID().slice(0, 8).replace(/-/g, ''), 1);
+}
+
+/**
+ * 按 PuzzleCat 身份找账号，没有就建一个。
+ *
+ * 身份绑定用 users.email —— 本站邮箱列已有 UNIQUE 索引（0006 迁移），
+ * 且 PuzzleCat 的 userinfo 必带 email，因此不新增表、不新增列就能把
+ * 「同一邮箱 = 同一个人」这件事落到库约束上。
+ *
+ * 两种情况要分开：
+ *   1) 邮箱已存在 → 直接登录该账号（PuzzleCat 已验证过这个邮箱，等价于邮箱持有证明）
+ *   2) 邮箱不存在 → 建号，password 写 oauth$ 前缀的随机占位值（见 oauth.js 注释）
+ *
+ * 邮箱缺失时不建号：没有稳定标识，重复登录会无限建号。
+ */
+async function findOrCreateOauthUser(env, profile) {
+  const email = String(profile.email || '').trim().toLowerCase();
+  if (!email) return { error: 'errors.oauthNoEmail' };
+  try {
+    await ensureEmailSchema(env);
+  } catch {
+    return { error: 'errors.serverError' };
+  }
+
+  const existing = await env.DB.prepare(
+    'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE email = ?'
+  ).bind(email).first();
+  if (existing) return { user: existing, created: false };
+
+  // 昵称：上游昵称合规就用，否则沿用用户名（注册路径同样允许不填昵称）
+  const nick = normalizeNickname(profile.nickname);
+  const username = await uniqueUsername(env, usernameSeed(profile));
+  const nickname = nick.error ? username : nick.value;
+  try {
+    const ins = await env.DB.prepare(
+      'INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)'
+    ).bind(username, makeOauthOnlyPassword(), nickname, 'user', email).run();
+    const id = ins.meta && ins.meta.last_row_id;
+    const row = await env.DB.prepare(
+      'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE id = ?'
+    ).bind(id).first();
+    return { user: row, created: true };
+  } catch (err) {
+    // 并发首登：两个请求同时看到"邮箱不存在"，其中一个会撞 UNIQUE 索引。
+    // 这不是错误，重查一次即可拿到对方刚建的那一行。
+    const again = await env.DB.prepare(
+      'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE email = ?'
+    ).bind(email).first();
+    if (again) return { user: again, created: false };
+    throw err;
+  }
+}
+
+// 回跳页：302 回前端路由，把结果放在查询串里（?oauth=ok#/account）。
+//
+// 不用内联 <script> 跳转：站点 CSP 是 script-src 'self'，内联脚本会被浏览器拦掉，
+// 页面会停在白屏。302 之后由前端读 location.search 决定提示文案并清掉参数，
+// 这样授权码/令牌从不进地址栏历史，回跳目标也只能是站内路径。
+function oauthLanding(next, code) {
+  const target = '/' + (code ? '?oauth=' + encodeURIComponent(code) : '') + '#' + safeNext(next);
+  const res = new Response(null, {
+    status: 302,
+    headers: { location: target, 'cache-control': 'no-store' }
+  });
+  for (const c of oauthClearCookies()) res.headers.append('set-cookie', c);
+  return harden(res);
+}
 
 // ---------- 公告 ----------
 // 公告列表与管理端列表共用同一查询，避免两处排序口径不一致
@@ -582,6 +692,119 @@ const app = {
       return json({ ok: true });
     }
 
+    // ---------- PuzzleCat OAuth 登录（公开） ----------
+    // 0) 前端据此决定要不要显示「用 PuzzleCat 登录」：未配置时直接不出现，
+    //    而不是点了才报错。只回布尔值，不泄露任何凭据。
+    if (path === 'oauth/config' && method === 'GET') {
+      return json({ puzzlecat: oauthConfigured(env) });
+    }
+
+    // 1) 跳去 PuzzleCat 授权页。state 落 HttpOnly Cookie，回跳时逐字比对。
+    if (path === 'oauth/' + OAUTH_PROVIDER + '/start' && method === 'GET') {
+      if (!oauthConfigured(env)) return json({ error: t('errors.oauthNotConfigured') }, 503);
+      const redirect = redirectUri(env, url.href);
+      const next = safeNext(url.searchParams.get('next'), '/account');
+      const state = randomState();
+      const res = new Response(null, {
+        status: 302,
+        headers: { location: authorizeUrl(env, { redirect, state }), 'cache-control': 'no-store' }
+      });
+      res.headers.append('set-cookie', oauthStateCookie(state));
+      res.headers.append('set-cookie', oauthNextCookie(next));
+      return harden(res);
+    }
+
+    // 2) 回调：校验 state → 换令牌 → 取用户信息 → 建/找账号 → 建会话 → 撤销令牌
+    if (path === 'oauth/' + OAUTH_PROVIDER + '/callback' && method === 'GET') {
+      const next = safeNext(decodeCookieValue(readCookie(request, OAUTH_NEXT_COOKIE)), '/account');
+      const expected = readCookie(request, OAUTH_STATE_COOKIE);
+      const gotState = url.searchParams.get('state') || '';
+      const denied = url.searchParams.get('error') || '';
+      const code = url.searchParams.get('code') || '';
+
+      // state 必须非空且逐字一致：挡 CSRF 与"把别人的授权码塞给我"的登录 CSRF
+      if (!expected || !gotState || expected !== gotState) {
+        io.audit('auth.oauth.fail', { level: 'warn', status: 400, meta: { reason: 'state_mismatch' } });
+        return oauthLanding(next, 'state');
+      }
+      if (denied) {
+        // 用户在授权页点了拒绝（或上游判定账号被禁用）
+        io.audit('auth.oauth.fail', { level: 'warn', status: 403, meta: { reason: 'denied' } });
+        return oauthLanding(next, 'denied');
+      }
+      if (!code) {
+        io.audit('auth.oauth.fail', { level: 'warn', status: 400, meta: { reason: 'no_code' } });
+        return oauthLanding(next, 'failed');
+      }
+      if (!oauthConfigured(env)) {
+        log.error('auth.oauth.not_configured', {});
+        return oauthLanding(next, 'unconfigured');
+      }
+
+      const redirect = redirectUri(env, url.href);
+      let tokens = null;
+      try {
+        tokens = await exchangeCode(env, { code, redirect });
+      } catch (err) {
+        log.warn('auth.oauth.token_fail', { code: err && err.code, status: err && err.status });
+        io.audit('auth.oauth.fail', {
+          level: 'warn', status: 400, meta: { reason: 'token', code: err && err.code }
+        });
+        return oauthLanding(next, 'failed');
+      }
+
+      let profile = null;
+      try {
+        profile = await fetchUserinfo(env, tokens.access_token);
+      } catch (err) {
+        log.warn('auth.oauth.userinfo_fail', { code: err && err.code, status: err && err.status });
+        io.audit('auth.oauth.fail', {
+          level: 'warn', status: 400, meta: { reason: 'userinfo', code: err && err.code }
+        });
+        return oauthLanding(next, 'failed');
+      } finally {
+        // 本站只用它做一次登录：不保存 PuzzleCat 的令牌，用完即撤销
+        if (tokens && tokens.access_token) revokeToken(env, tokens.access_token).catch(() => {});
+      }
+
+      const found = await findOrCreateOauthUser(env, profile);
+      if (found.error) {
+        io.audit('auth.oauth.fail', {
+          level: 'warn', status: 400, meta: { reason: 'account', code: found.error }
+        });
+        return oauthLanding(next, found.error === 'errors.oauthNoEmail' ? 'noemail' : 'failed');
+      }
+      const row = found.user;
+      if (!row) {
+        io.audit('auth.oauth.fail', { level: 'warn', status: 500, meta: { reason: 'account_missing' } });
+        return oauthLanding(next, 'failed');
+      }
+      if (row.banned) {
+        // 被封禁的站内账号不能借 OAuth 绕过封禁
+        io.audit('auth.oauth.fail', { level: 'warn', status: 403, meta: { reason: 'banned' }, target_type: 'user', target_id: row.id });
+        return oauthLanding(next, 'banned');
+      }
+
+      const token = await createSession(env, row.id, row.session_version);
+      io.audit(found.created ? 'auth.oauth.register' : 'auth.oauth.login', {
+        actor: row,
+        status: 200,
+        target_type: 'user',
+        target_id: row.id,
+        meta: { provider: OAUTH_PROVIDER, created: found.created, email: maskEmail(profile.email) }
+      });
+      const res = new Response(null, {
+        status: 302,
+        headers: {
+          location: '/' + '?oauth=ok#' + next,
+          'cache-control': 'no-store',
+          'set-cookie': sessionCookie(token)
+        }
+      });
+      for (const c of oauthClearCookies()) res.headers.append('set-cookie', c);
+      return harden(res);
+    }
+
     // 发送邮箱验证码（注册 / 绑定邮箱共用）
     if (path === 'email-code' && method === 'POST') {
       const b = await readBody(request);
@@ -781,6 +1004,8 @@ const app = {
       // 顺带带回未读动态数，导航角标首屏就能显示，省一次请求
       let notifUnread = 0;
       let email = null;
+      // 有没有本地口令：PuzzleCat 首登建出来的账号没有，前端据此显示「设置密码」而不是「修改密码」
+      let hasPassword = true;
       if (user) {
         try {
           const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM hunt_notifications WHERE user_id = ? AND read_at IS NULL').bind(user.id).first();
@@ -788,15 +1013,41 @@ const app = {
         } catch { notifUnread = 0; }
         // email 列由迁移补，未迁移时也不能让 /me 500
         try {
-          const row = await env.DB.prepare('SELECT email FROM users WHERE id = ?').bind(user.id).first();
+          const row = await env.DB.prepare('SELECT email, password FROM users WHERE id = ?').bind(user.id).first();
           email = row ? (row.email || null) : null;
+          hasPassword = !(row && isOauthOnly(row.password));
         } catch { /* 列不存在 */ }
       }
-      return json({ user: user ? { ...user, email } : null, notifUnread });
+      return json({ user: user ? { ...user, email, hasPassword } : null, notifUnread });
     }
 
     // ---------- 以下需要登录 ----------
     if (!user) return json({ error: t('errors.unauthorized') }, 401);
+
+    // 给「只走过 PuzzleCat 登录」的账号补设口令。
+    //
+    // 这类账号的 password 是 oauth$ 前缀的随机占位值，没有旧口令可验，
+    // 所以不能走 change-password。两道闸门：
+    //   · 只允许占位值账号调用 —— 已有真口令的账号必须走 change-password 验旧口令，
+    //     否则任何拿到会话的人都能静默改密、把真正的账号主人踢下线
+    //   · 设完口令立刻递增 session_version，其他设备上的旧会话随之失效
+    // 这里不节流：它不校验任何秘密（没有可比对的口令），节流只会让正常用户被挡。
+    if (path === 'password/set' && method === 'POST') {
+      const row = await env.DB.prepare('SELECT password FROM users WHERE id = ?').bind(user.id).first();
+      if (!row) return json({ error: t('errors.unauthorized') }, 401);
+      if (!isOauthOnly(row.password)) return json({ error: t('errors.passwordSetNotNeeded') }, 400);
+      const b = await readBody(request);
+      const np = String(b.new_password || '');
+      const pwErr = passwordProblem(np, user.username);
+      if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
+      const { salt: s2, hash: h2 } = await hashPassword(np);
+      // 签发新会话：设完口令后当前设备不掉线，其他设备（若有）被踢
+      const upd = await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ? RETURNING session_version')
+        .bind(s2 + ':' + h2, user.id).first();
+      const token = await createSession(env, user.id, upd ? upd.session_version : Number(row.session_version) + 1);
+      io.audit('auth.password.set', { status: 200, target_type: 'user', target_id: user.id });
+      return okWithCookie({ ok: true }, token);
+    }
 
     if (path === 'change-password' && method === 'POST') {
       const b = await readBody(request);

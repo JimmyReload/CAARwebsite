@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { HashRouter, Routes, Route, Link, useNavigate, useLocation, Navigate } from 'react-router-dom'
-import AuthView from './views/AuthView'
+import AuthView, { OAUTH_ERROR_KEY } from './views/AuthView'
 import MemberView from './views/MemberView'
 import AdminView from './views/AdminView'
 import HuntsView from './views/HuntsView'
@@ -19,20 +19,20 @@ function useUser() {
   const [user, setUserState] = useState(() => readUserCache())
   const [notifUnread, setNotifUnread] = useState(0)
   const [ready, setReady] = useState(() => !!readUserCache())
-  useEffect(() => {
-    api('/me')
-      .then((d) => {
-        const u = d.user || null
-        writeUserCache(u)
-        setUserState(u)
-        setNotifUnread(d.notifUnread || 0)
-      })
-      .catch(() => {})
-      .finally(() => setReady(true))
-  }, [])
+  // 拉一次 /me 并把结果写回状态；OAuth 回跳后需要重跑一次（Cookie 刚种下）
+  const refresh = useCallback(() => api('/me')
+    .then((d) => {
+      const u = d.user || null
+      writeUserCache(u)
+      setUserState(u)
+      setNotifUnread(d.notifUnread || 0)
+      return u
+    })
+    .catch(() => null), [])
+  useEffect(() => { refresh().finally(() => setReady(true)) }, [refresh])
   // 所有改用户态的地方（登录、改昵称、退出）都同步写快照
   const setUser = (u) => { writeUserCache(u); setUserState(u) }
-  return { user, setUser, notifUnread, setNotifUnread, ready }
+  return { user, setUser, notifUnread, setNotifUnread, ready, refresh }
 }
 
 /* 首页锚点链接（兼容 HashRouter） */
@@ -372,9 +372,23 @@ function Shell({ user, setUser, ready, notifUnread }) {
 }
 
 export default function App() {
-  const { user, setUser, notifUnread, setNotifUnread, ready } = useUser()
+  const { user, setUser, notifUnread, setNotifUnread, ready, refresh } = useUser()
   // 冷启动先并行抓一次收件箱：不必等 /me 回来才知道用户是谁
   useEffect(() => { startInboxPrefetch() }, [])
+  // OAuth 回跳：后端已经种好会话 Cookie，这里把用户态补上并清掉查询串
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const result = params.get('oauth')
+    if (!result) return
+    // 清掉 ?oauth=：结果只该被处理一次，刷新不应重复提示
+    window.history.replaceState(null, '', window.location.pathname + window.location.hash)
+    if (result === 'ok') {
+      refresh()
+    } else {
+      try { sessionStorage.setItem(OAUTH_ERROR_KEY, result) } catch { /* 隐私模式忽略 */ }
+      window.location.hash = '#/login'
+    }
+  }, [])
   // 登录后立刻在后台预取赛事列表与面板数据：点开「赛事总览 / 成员面板 / 管理后台」时直接出内容
   // 注意：必须等 /me 回来（ready）再决定清不清缓存。首屏 user 还是 null 时清缓存，
   // 会把上一次访问写进 sessionStorage 的数据抹掉，刷新就永远命中不了缓存。

@@ -29,6 +29,12 @@
   // 日志开关（改这里或控制台变量都行，不用重新构建）
   // LOG_LEVEL：debug | info | warn | error | silent。线上用 info；排障时临时调 debug
   // AUDIT_KEEP_DAYS：审计表保留天数（Cron 定期清理，最小按 7 天算）
+  //
+  // PuzzleCat OAuth（见 docs/puzzlecat-oauth.md）：
+  //   PUZZLECAT_CLIENT_ID      App ID，非机密，可写在这里
+  //   PUZZLECAT_CLIENT_SECRET  App Secret，必须用 `wrangler secret put`，不要写进本文件
+  //   PUZZLECAT_REDIRECT_URI   可选，缺省按站点推导为 <origin>/api/oauth/puzzlecat/callback
+  // 两者缺任意一个时，登录页不显示 PuzzleCat 按钮，/api/oauth/puzzlecat/start 直接 503。
   "vars": {
     "LOG_LEVEL": "info",
     "AUDIT_KEEP_DAYS": "90"

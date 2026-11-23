@@ -22,3 +22,6 @@ _bak-*/
 *.sql.bak
 backup-*.sql
 d1-export-*.sql
+
+# 本地验证截图（临时证据，不入库）
+_shots/

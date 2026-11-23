@@ -3,6 +3,18 @@ import { useNavigate, Link } from 'react-router-dom'
 import api from '../api'
 import { t } from '../i18n'
 
+/* PuzzleCat OAuth 失败码 → 文案 key（后端只回码，文案留在前端） */
+const OAUTH_ERRORS = {
+  state: 'auth.oauthState',
+  denied: 'auth.oauthDenied',
+  banned: 'auth.oauthBanned',
+  noemail: 'auth.oauthNoEmail',
+  unconfigured: 'auth.oauthUnconfigured',
+}
+
+/* App 与 AuthView 之间传错误码的键：App 处理完 ?oauth= 后写进来，AuthView 取一次即清 */
+export const OAUTH_ERROR_KEY = 'caar:oauth-error:v1'
+
 export default function AuthView({ mode, onLogin }) {
   const isLogin = mode === 'login'
   const [username, setUsername] = useState('')
@@ -16,7 +28,32 @@ export default function AuthView({ mode, onLogin }) {
   const [cooldown, setCooldown] = useState(0)
   const [sendingCode, setSendingCode] = useState(false)
   const [busy, setBusy] = useState(false)
+  // null = 还没问出来（先不显示按钮，避免"点了才知道没配"）
+  const [oauthReady, setOauthReady] = useState(null)
   const nav = useNavigate()
+
+  /* OAuth 失败时 App 把错误码放进 sessionStorage 再跳到这里：取一次即清，
+     刷新页面不会重复弹同一个错误 */
+  useEffect(() => {
+    let code = ''
+    try {
+      code = sessionStorage.getItem(OAUTH_ERROR_KEY) || ''
+      if (code) sessionStorage.removeItem(OAUTH_ERROR_KEY)
+    } catch { /* 隐私模式下忽略 */ }
+    if (code) setMsg(t(OAUTH_ERRORS[code] || 'auth.oauthFailed'))
+  }, [])
+
+  /* 是否显示 PuzzleCat 登录入口 */
+  useEffect(() => {
+    api('/oauth/config')
+      .then((d) => setOauthReady(!!d.puzzlecat))
+      .catch(() => setOauthReady(false))
+  }, [])
+
+  const startOauth = () => {
+    // 整页跳转（不是 fetch）：授权页在别的域，必须让浏览器自己过去
+    window.location.href = '/api/oauth/puzzlecat/start?next=' + encodeURIComponent('/account')
+  }
 
   /* 验证码重发倒计时 */
   useEffect(() => {
@@ -61,6 +98,16 @@ export default function AuthView({ mode, onLogin }) {
         <p className="auth-kicker">{isLogin ? t('auth.loginKicker') : t('auth.registerKicker')}</p>
         <h1 className="auth-title">{isLogin ? t('auth.loginTitle') : t('auth.registerTitle')}</h1>
         <p className="auth-sub">{isLogin ? t('auth.loginSub') : t('auth.registerSub')}</p>
+        {oauthReady && (
+          <>
+            <button type="button" className="auth-oauth" onClick={startOauth}>
+              <span className="auth-oauth-mark" aria-hidden="true">PC</span>
+              {t('auth.oauthTitle')}
+            </button>
+            <p className="auth-note">{t('auth.oauthHint')}</p>
+            <div className="auth-divider"><span>{t('auth.oauthDivider')}</span></div>
+          </>
+        )}
         <form onSubmit={submit} className="auth-form">
           {!isLogin && (
             <label>{t('auth.nicknameLabel')}
@@ -102,6 +149,7 @@ export default function AuthView({ mode, onLogin }) {
           )}
           <Link to="/">{t('common.backHome')}</Link>
         </p>
+        {oauthReady && <p className="auth-note auth-note--foot">{t('auth.oauthNoAccountNote')}</p>}
       </div>
     </div>
   )

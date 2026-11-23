@@ -401,6 +401,30 @@ section[id] { scroll-margin-top: 96px; }
 .auth-alt a { text-decoration: underline; }
 .auth-alt a:hover { background: var(--yellow); }
 
+/* PuzzleCat OAuth 入口：与密码表单并列，视觉上区分「第三方」与「本站凭据」 */
+.auth-oauth {
+  margin-top: 20px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 14px 18px; border: 3px solid #000; background: var(--yellow); color: #000;
+  font: inherit; font-weight: 900; font-size: 15px; letter-spacing: .02em;
+  box-shadow: var(--hard-sm); transition: none; white-space: nowrap;
+}
+.auth-oauth:hover { background: #000; color: var(--yellow); transform: translate(-3px, -3px); box-shadow: var(--hard); }
+.auth-oauth:active { transform: translate(2px, 2px); box-shadow: 0 0 0 #000; }
+.auth-oauth:focus-visible { outline: 3px solid var(--red); outline-offset: 2px; }
+.auth-oauth-mark {
+  font-family: var(--mono); font-size: 11px; font-weight: 700; line-height: 1;
+  border: 2px solid currentColor; padding: 3px 5px;
+}
+/* 按钮下方的说明与分隔线要留出呼吸位，否则提示文字会被分隔线压住 */
+.auth-oauth + .auth-note { margin-top: 10px; }
+.auth-divider { margin: 20px 0 2px; display: flex; align-items: center; gap: 12px; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; border-top: 2px solid #000; }
+.auth-divider span { font-family: var(--mono); font-size: 11px; font-weight: 700; color: #555; letter-spacing: .1em; }
+.auth-note--foot { margin-top: 14px; border-top: 2px dashed #000; padding-top: 12px; }
+@media (hover: none) {
+  .auth-oauth:hover { background: var(--yellow); color: #000; transform: none; box-shadow: var(--hard-sm); }
+}
+
 /* ============ 面板 ============ */
 .panel-page { min-height: 100vh; min-height: 100dvh; padding: 112px clamp(16px, 4vw, 48px) 80px; max-width: 1040px; margin: 0 auto; }
 .panel-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 24px; border-bottom: 4px solid #000; padding-bottom: 16px; }

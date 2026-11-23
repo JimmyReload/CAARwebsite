@@ -92,9 +92,16 @@ export default function AccountView({ user, setUser }) {
     setPwMsg('')
     setSaving(true)
     try {
-      await api('/change-password', { method: 'POST', body: { old_password: op, new_password: np } })
+      // 只走过 PuzzleCat 登录的账号没有旧口令可验，走「首次设置口令」这条路径
+      const needOld = user.hasPassword !== false
+      const r = await api(needOld ? '/change-password' : '/password/set', {
+        method: 'POST',
+        body: needOld ? { old_password: op, new_password: np } : { new_password: np }
+      })
       setOp(''); setNp('')
+      if (!needOld) setUser({ ...user, hasPassword: true })
       setPwMsg(t('password.ok'))
+      return r
     } catch (err) {
       setPwMsg(err.message)
     } finally {
@@ -186,14 +193,16 @@ export default function AccountView({ user, setUser }) {
       <section className="panel-sec acct-form">
         <h2 className="panel-sec-title">{t('account.password')}</h2>
         <form onSubmit={changePw} className="msg-form">
-          <label>{t('password.old')} <input type="password" value={op} onChange={(e) => setOp(e.target.value)} autoComplete="current-password" required /></label>
+          {/* 首登建号（PuzzleCat）的账号没有旧口令：只显示新口令一栏 */}
+          {user.hasPassword !== false && (
+            <label>{t('password.old')} <input type="password" value={op} onChange={(e) => setOp(e.target.value)} autoComplete="current-password" required /></label>
+          )}
           <label>{t('password.next')} <input type="password" value={np} onChange={(e) => setNp(e.target.value)} minLength="6" autoComplete="new-password" placeholder={t('password.placeholder')} required /></label>
           {pwMsg && <p className={"auth-msg " + (pwMsg.indexOf('✓') === 0 ? 'auth-msg--ok' : '')}>{pwMsg}</p>}
-          <button className="auth-btn" disabled={saving}>{saving ? t('password.saving') : t('password.save')}</button>
+          <button className="auth-btn" disabled={saving}>{saving ? t('password.saving') : (user.hasPassword === false ? t('password.setFirst') : t('password.save'))}</button>
         </form>
-        <p className="acct-note">{t('account.passwordNote')}</p>
+        <p className="acct-note">{user.hasPassword === false ? t('account.passwordSetNote') : t('account.passwordNote')}</p>
       </section>
-
       <section className="panel-sec">
         <h2 className="panel-sec-title">{t('account.session')}</h2>
         <div className="acct-logout">
