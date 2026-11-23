@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../api'
 import { t } from '../i18n'
-import { readHuntsCache, writeHuntsCache, fetchHunts } from '../huntsCache'
+import { readHuntsCache, writeHuntsCache, fetchHunts, currentHuntsEpoch } from '../huntsCache'
 
 /* 上游时间是带时区的本地时间（默认 Asia/Shanghai），按墙上时间展示，不做时区换算 */
 function fmtDay(iso) {
@@ -139,6 +139,11 @@ export default function HuntsView({ user, onNotifRead }) {
   const [notifUnread, setNotifUnread] = useState(0)
   const [feedSource, setFeedSource] = useState('')
   const dataRef = useRef(data)
+  /* 账号代次 + 请求序号：换账号或连点「刷新」时，只有最新一次请求的响应能落地。
+     否则慢的旧响应/上一个账号的响应会覆盖更新后的列表（审计「赛事请求旧响应覆盖新数据」）。 */
+  const genRef = useRef(0)
+  const seqRef = useRef(0)
+  const userIdRef = useRef(userId)
 
   const myName = (user && (user.nickname || user.username)) || t('hunts.me')
 
@@ -148,18 +153,42 @@ export default function HuntsView({ user, onNotifRead }) {
     writeHuntsCache(userId, next)
   }
 
+  /* 换账号：先把上一个账号的列表与动态清掉，再用当前账号自己的缓存占位 */
+  useEffect(() => {
+    genRef.current += 1
+    seqRef.current += 1
+    userIdRef.current = userId
+    const cached = userId ? readHuntsCache(userId) : null
+    const next = cached || EMPTY
+    dataRef.current = next
+    setData(next)
+    setLoading(!cached)
+    setBusy(false)
+    setError('')
+    setNotifs([])
+    setNotifUnread(0)
+  }, [userId])
+
   const load = useCallback(async (force) => {
+    if (!userId) return
+    const seq = ++seqRef.current
+    const gen = genRef.current
+    const ep = currentHuntsEpoch()
     if (force || !dataRef.current.list.length) setBusy(true)
     setError('')
     try {
       const d = await fetchHunts(userId, force)
+      // null = 身份已切换/登出；seq 落后 = 已被更新的一次请求取代：都不许覆盖当前数据
+      if (!d || seq !== seqRef.current || gen !== genRef.current || ep !== currentHuntsEpoch() || userId !== userIdRef.current) return
       commit({ list: d.list || [], mineCount: d.mineCount || 0, updatedAt: d.updatedAt || 0, total: d.total || 0 })
       setFeedSource(d.source || '')
     } catch (err) {
-      setError(err.message || t('hunts.loadFailed'))
+      if (seq === seqRef.current && gen === genRef.current) setError(err.message || t('hunts.loadFailed'))
     } finally {
-      setLoading(false)
-      setBusy(false)
+      if (seq === seqRef.current && gen === genRef.current) {
+        setLoading(false)
+        setBusy(false)
+      }
     }
   }, [userId])
 
@@ -167,16 +196,18 @@ export default function HuntsView({ user, onNotifRead }) {
 
   // 动态：别人标记了我已标记的 hunt
   useEffect(() => {
+    if (!userId) return
+    const gen = genRef.current
     let alive = true
     api('/notifications')
       .then((d) => {
-        if (!alive) return
+        if (!alive || gen !== genRef.current || userId !== userIdRef.current) return
         setNotifs(d.list || [])
         setNotifUnread(d.unread || 0)
       })
       .catch(() => {})
     return () => { alive = false }
-  }, [])
+  }, [userId])
 
   const markAllRead = async () => {
     try {
@@ -204,6 +235,8 @@ export default function HuntsView({ user, onNotifRead }) {
 
   const toggle = async (hunt) => {
     if (pending.has(hunt.id)) return
+    const gen = genRef.current
+    const uid = userId
     const next = !hunt.mine
     setPending((old) => new Set(old).add(hunt.id))
     setError('')
@@ -212,10 +245,14 @@ export default function HuntsView({ user, onNotifRead }) {
     try {
       await api('/hunts/interest', { method: 'POST', body: { hunt_id: hunt.id, interested: next } })
     } catch (err) {
+      // 期间换了账号：不回滚、不报错，那个卡片的本地状态已经不属于当前列表
+      if (gen !== genRef.current || uid !== userIdRef.current) return
       commit(withMine(dataRef.current, hunt.id, !next, myName))
       setError(err.message)
     } finally {
-      setPending((old) => { const s = new Set(old); s.delete(hunt.id); return s })
+      if (gen === genRef.current) {
+        setPending((old) => { const s = new Set(old); s.delete(hunt.id); return s })
+      }
     }
   }
 

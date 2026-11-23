@@ -7,32 +7,91 @@ import HuntsView from './views/HuntsView'
 import AccountView from './views/AccountView'
 import { t } from './i18n'
 import api from './api'
-import { prefetchHunts, clearHuntsCache } from './huntsCache'
-import { prefetchPanel, clearPanelCache, startInboxPrefetch, readUserCache, writeUserCache } from './panelCache'
+import { prefetchHunts, clearHuntsCache, syncHuntsAuth, adoptHuntsIdentity } from './huntsCache'
+import {
+  prefetchPanel, clearPanelCache, readUserCache, writeUserCache,
+  syncPanelAuth, adoptPanelIdentity, markPanelAuthUnverified
+} from './panelCache'
 
 /* 角色：admin 与 superadmin 都算职员 */
 const isStaff = (u) => !!u && (u.role === 'admin' || u.role === 'superadmin')
 
-/* 用户态 */
+/* 认证代次守卫（auth epoch）
+   · 每次身份落定（登录、退出、/me 确认）都会 bump：任何更早发出的 /me 随即过期。
+   · refresh 发起时 bump() 取号，回调里用 commit(snap, fn) 提交：
+     代次变了就整份忽略 —— mount 时发出的 /me 不会在用户随后登录后才返回、
+     把新登录的身份覆盖回旧值；两个并发 /me 也只有最后发起的那一个能落地。
+   · 导出仅用于回归测试；页面里由 useUser 的 ref 持有。 */
+export function createAuthGate() {
+  let seq = 0
+  return {
+    snapshot: () => seq,
+    bump: () => { seq += 1; return seq },
+    commit: (snap, fn) => (snap === seq ? fn() : null)
+  }
+}
+
+/* 用户态
+   · 先用上次的登录态快照渲染外壳，但 verified 保持 false：私信/管理这类敏感内容
+     必须等 /me 确认身份后才渲染（审计 F-03）。
+   · /me 网络失败或服务端错误 → 身份未确认：保留快照供外壳使用，隐藏敏感内容并提供重试；
+     只有正常的 200 {user:null} 才算「未登录」，此时清掉缓存身份与数据。
+   · 身份一变就同步给缓存层（syncPanelAuth/syncHuntsAuth），旧在途请求随之作废。 */
 function useUser() {
-  // 先用上次的登录态快照渲染，避免刷新时先干等一次 /me；随后再用 /me 校验
-  const [user, setUserState] = useState(() => readUserCache())
+  // 快照只用来占位；顺手登记「这些缓存属于谁」，但不作废它（刚打开页面，缓存本就是这人的）
+  const [initial] = useState(() => {
+    const u = readUserCache()
+    if (u && u.id) {
+      adoptPanelIdentity(u.id)
+      adoptHuntsIdentity(u.id)
+    }
+    return u
+  })
+  const [user, setUserState] = useState(() => initial)
   const [notifUnread, setNotifUnread] = useState(0)
-  const [ready, setReady] = useState(() => !!readUserCache())
+  const [ready, setReady] = useState(false)      // /me 的这一次尝试是否结束
+  const [verified, setVerified] = useState(false) // 当前身份是否已被服务端确认
+  const [authError, setAuthError] = useState('')
+  /* 认证代次：ref 跨渲染稳定；每次身份落定都 bump，旧 /me 响应随之过期 */
+  const authGate = useRef(createAuthGate())
+
+  /* 把「已确认的身份」落进 React 状态与缓存层；身份变化会作废旧缓存与旧请求 */
+  const adopt = useCallback((u, isVerified) => {
+    // 先推进代次：从这一刻起，期间在途的 /me 响应（成功或失败）全部过期
+    authGate.current.bump()
+    const id = u && u.id ? u.id : null
+    syncPanelAuth(id, isVerified)
+    syncHuntsAuth(id)
+    writeUserCache(u || null)
+    setUserState(u || null)
+    setVerified(isVerified)
+  }, [])
+
   // 拉一次 /me 并把结果写回状态；OAuth 回跳后需要重跑一次（Cookie 刚种下）
-  const refresh = useCallback(() => api('/me')
-    .then((d) => {
-      const u = d.user || null
-      writeUserCache(u)
-      setUserState(u)
-      setNotifUnread(d.notifUnread || 0)
-      return u
-    })
-    .catch(() => null), [])
+  const refresh = useCallback(() => {
+    // 发起时就推进代次：并发的两个 /me 里，先发起的那一个立刻过期；
+    // 回调只认自己这一代，且期间发生登录/退出也会让它整份失效
+    const snap = authGate.current.bump()
+    return api('/me')
+      .then((d) => authGate.current.commit(snap, () => {
+        adopt(d.user || null, true)
+        setNotifUnread(d.notifUnread || 0)
+        setAuthError('')
+        return d.user || null
+      }))
+      .catch((err) => authGate.current.commit(snap, () => {
+        // 身份没有被确认：不清缓存（可能只是断网），但绝不能把它当已认证状态
+        markPanelAuthUnverified()
+        setVerified(false)
+        setAuthError((err && err.message) || t('api.failed'))
+        return null
+      }))
+  }, [adopt])
+
   useEffect(() => { refresh().finally(() => setReady(true)) }, [refresh])
   // 所有改用户态的地方（登录、改昵称、退出）都同步写快照
-  const setUser = (u) => { writeUserCache(u); setUserState(u) }
-  return { user, setUser, notifUnread, setNotifUnread, ready, refresh }
+  const setUser = (u) => adopt(u, true)
+  return { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh }
 }
 
 /* 首页锚点链接（兼容 HashRouter） */
@@ -334,6 +393,52 @@ function Home() {
   )
 }
 
+/* ============ 身份确认闸门 ============ */
+
+/* /me 还没回来：不渲染任何会话内容（此前这里是 null，直接空白，行为保持一致） */
+function IdentityPending() {
+  return (
+    <div className="panel-page">
+      <p className="panel-empty">{t('common.loading')}</p>
+    </div>
+  )
+}
+
+/* /me 网络失败 / 服务端错误：身份未确认。
+   旧快照还在，但这不等于「已登录」——不渲染私信、管理数据，只给重试。
+   文案直接写在这里：src/locales 不在本次修复允许改动的范围内。 */
+function IdentityUnverified({ error, onRetry }) {
+  const [retrying, setRetrying] = useState(false)
+  const retry = () => {
+    setRetrying(true)
+    Promise.resolve(onRetry()).finally(() => setRetrying(false))
+  }
+  return (
+    <div className="panel-page">
+      <div className="panel-head">
+        <p className="auth-kicker">{t('site.name')}</p>
+        <h1 className="panel-title">身份尚未确认</h1>
+      </div>
+      <p className="auth-msg" role="alert">{error || t('api.failed')}</p>
+      <p className="acct-note">当前登录状态还没得到服务器确认，为免在共享设备上显示他人数据，私信与管理内容暂时隐藏。</p>
+      <div className="btn-row">
+        <button type="button" className="mini-btn" onClick={retry} disabled={retrying}>
+          {retrying ? t('common.loading') : '重试'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/* 受保护页面统一入口：未就绪 → 加载中；未确认 → 隐藏 + 重试；未登录 → 去登录。
+   render(user) 只在身份确认后才执行，所以页面组件可以直接写 key={user.id}：账号一换就卸载旧实例，不会用上一个账号的组件 state 渲染任何一帧。导出是为了让回归测试能断言「未确认时不渲染受保护内容」。 */
+export function gate({ ready, verified, user, authError, refresh, children, render }) {
+  if (!ready) return <IdentityPending />
+  if (!verified) return <IdentityUnverified error={authError} onRetry={refresh} />
+  if (!user) return <Navigate to="/login" replace />
+  return render ? render(user) : children
+}
+
 /* ============ 布局（刊头导航） ============ */
 function Shell({ user, setUser, ready, notifUnread }) {
   const [scrolled, setScrolled] = useState(false)
@@ -372,9 +477,7 @@ function Shell({ user, setUser, ready, notifUnread }) {
 }
 
 export default function App() {
-  const { user, setUser, notifUnread, setNotifUnread, ready, refresh } = useUser()
-  // 冷启动先并行抓一次收件箱：不必等 /me 回来才知道用户是谁
-  useEffect(() => { startInboxPrefetch() }, [])
+  const { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh } = useUser()
   // OAuth 回跳：后端已经种好会话 Cookie，这里把用户态补上并清掉查询串
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -389,19 +492,20 @@ export default function App() {
       window.location.hash = '#/login'
     }
   }, [])
-  // 登录后立刻在后台预取赛事列表与面板数据：点开「赛事总览 / 成员面板 / 管理后台」时直接出内容
-  // 注意：必须等 /me 回来（ready）再决定清不清缓存。首屏 user 还是 null 时清缓存，
-  // 会把上一次访问写进 sessionStorage 的数据抹掉，刷新就永远命中不了缓存。
+  // 登录且身份确认后，才在后台预取赛事列表与面板数据：点开「赛事总览 / 成员面板 / 管理后台」时直接出内容。
+  // 身份未确认（verified=false）时既不预取也不渲染敏感缓存：无身份请求不能绑定到某个账号。
   useEffect(() => {
     if (!ready) return
+    if (!verified) return
     if (user) {
       prefetchHunts(user.id)
       prefetchPanel(user)
     } else {
+      // 正常的 200 {user:null}：缓存层已随身份变化作废，这里再兜底清一次
       clearHuntsCache()
       clearPanelCache()
     }
-  }, [user, ready])
+  }, [user, ready, verified])
 
   // 切回标签页时刷新未读动态数（不轮询，避免常驻请求）
   useEffect(() => {
@@ -422,10 +526,13 @@ export default function App() {
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<AuthView mode="login" onLogin={setUser} />} />
           <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
-          <Route path="/hunts" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <HuntsView user={user} onNotifRead={() => setNotifUnread(0)} />} />
-          <Route path="/member" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <MemberView user={user} />} />
-          <Route path="/admin" element={!ready ? null : !isStaff(user) ? <Navigate to="/login" replace /> : <AdminView user={user} />} />
-          <Route path="/account" element={!ready ? null : !user ? <Navigate to="/login" replace /> : <AccountView user={user} setUser={setUser} />} />
+          {/* key={user.id}：账号一换就强制卸载旧实例、用新实例重新初始化。
+               只靠组件内的 useEffect 重置的话，切换后的首个 render 仍会短暂沿用
+               A 的 state 渲染一帧；key 让这条窗口在渲染阶段就消失。 */}
+          <Route path="/hunts" element={gate({ ready, verified, user, authError, refresh, render: (user) => <HuntsView key={user.id} user={user} onNotifRead={() => setNotifUnread(0)} /> })} />
+          <Route path="/member" element={gate({ ready, verified, user, authError, refresh, render: (user) => <MemberView key={user.id} user={user} /> })} />
+          <Route path="/admin" element={!ready ? <IdentityPending /> : !verified ? <IdentityUnverified error={authError} onRetry={refresh} /> : !isStaff(user) ? <Navigate to="/login" replace /> : <AdminView key={user.id} user={user} />} />
+          <Route path="/account" element={gate({ ready, verified, user, authError, refresh, render: (user) => <AccountView key={user.id} user={user} setUser={setUser} /> })} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </HashRouter>

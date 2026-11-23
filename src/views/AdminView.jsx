@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../api'
 import { t, eventLabel } from '../i18n'
 import { fmtDate, fmtDateTime } from '../time'
-import { readOverviewCache, writeOverviewCache, fetchOverview } from '../panelCache'
+import { readOverviewCache, writeOverviewCache, fetchOverview, currentEpoch } from '../panelCache'
 
 export default function AdminView({ user }) {
   const userId = user && user.id
@@ -45,17 +45,51 @@ export default function AdminView({ user }) {
   const [logBudget, setLogBudget] = useState(null)
   const [logLoading, setLogLoading] = useState(false)
 
+  /* 两个"只有最新那份能落地"的守卫：
+     · genRef：换账号后，上一个账号在途的概览/日志/会话响应必须整份丢弃；
+     · logSeqRef：日志筛选会被连续点击（级别 / IP / 清 chip），慢的旧查询不能覆盖新结果。 */
+  const genRef = useRef(0)
+  const userIdRef = useRef(userId)
+  const logSeqRef = useRef(0)
+  const convSeqRef = useRef(0)
+  useEffect(() => { userIdRef.current = userId }, [userId])
+
+  /* 换账号：先清掉上一个账号的后台状态，再用当前账号自己的缓存占位 */
+  useEffect(() => {
+    genRef.current += 1
+    const c = userId ? readOverviewCache(userId) : null
+    setAnns((c && c.anns) || [])
+    setUsers((c && c.users) || [])
+    setConvs((c && c.convs) || [])
+    setStats((c && c.stats) || null)
+    setActive(null)
+    setMsgs([])
+    setMsgsLoading(false)
+    setLogs([])
+    setLogNext(0)
+    setLogStats(null)
+    setLogEvents([])
+    setLogBudget(null)
+    setMsg('')
+    setNotice('')
+  }, [userId])
+
   /* 首屏一次请求取全（公告 / 用户 / 会话 / 统计），原来是 4 个并行请求各验一次会话 */
   const loadOverview = async () => {
     if (!userId) return
+    const gen = genRef.current
+    const ep = currentEpoch()
     try {
       const d = await fetchOverview(userId)
-      if (!d) return
+      // null = 身份已切换（或已被登出），这份概览不属于当前账号
+      if (!d || gen !== genRef.current || ep !== currentEpoch() || userId !== userIdRef.current) return
       setAnns(d.anns || [])
       setUsers(d.users || [])
       setConvs(d.convs || [])
       setStats(d.stats || null)
-    } catch (err) { setMsg(String(err.message)) }
+    } catch (err) {
+      if (gen === genRef.current) setMsg(String(err.message))
+    }
   }
   useEffect(() => { loadOverview() }, [userId])
 
@@ -85,6 +119,9 @@ export default function AdminView({ user }) {
     // 这里不校验 q 长度：IP 按钮、清 chip、切页签都走这个函数，拦住会让人以为筛选失效。
     // 用的是"已应用"的 q，输入框里没提交的字不参与（否则点 IP 会悄悄叠加一个搜索条件）。
     const q = String(f.q || '').trim()
+    const seq = ++logSeqRef.current
+    const gen = genRef.current
+    const ep = currentEpoch()
     setLogLoading(true)
     try {
       const qs = new URLSearchParams()
@@ -95,13 +132,20 @@ export default function AdminView({ user }) {
       if (q.length >= 3) qs.set('q', q)
       if (opts.append && logNext) qs.set('before', String(logNext))
       const d = await api('/admin/logs' + (qs.toString() ? '?' + qs.toString() : ''))
+      // 只有"最后一次发出的筛选"和"当前账号"的响应能落地：
+      // 否则慢的旧查询/上一个账号的响应会覆盖新的筛选结果（审计「旧响应覆盖新数据」）。
+      if (seq !== logSeqRef.current || gen !== genRef.current || ep !== currentEpoch()) return
       setLogs((old) => (opts.append ? old.concat(d.list || []) : (d.list || [])))
       setLogNext(d.nextBefore || 0)
       setLogStats(d.stats || null)
       setLogEvents(d.events || [])
       setLogBudget(d.budget || null)
       if (d.keepDays) setLogKeepDays(d.keepDays)
-    } catch (err) { setMsg(String(err.message)) } finally { setLogLoading(false) }
+    } catch (err) {
+      if (seq === logSeqRef.current && gen === genRef.current) setMsg(String(err.message))
+    } finally {
+      if (seq === logSeqRef.current) setLogLoading(false)
+    }
   }
 
   useEffect(() => { if (tab === 'logs') loadLogs() }, [tab])
@@ -153,6 +197,8 @@ export default function AdminView({ user }) {
 
   /* 打开会话：消息与已读并行发出，不再串行等两次往返 */
   const openConv = async (cv) => {
+    const seq = ++convSeqRef.current
+    const gen = genRef.current
     setActive(cv)
     setMsgs([])
     setMsgsLoading(true)
@@ -161,23 +207,41 @@ export default function AdminView({ user }) {
         api('/conversation/' + cv.id + '/messages'),
         api('/conversation/' + cv.id + '/read', { method: 'POST' })
       ])
+      // 期间换了会话或换了账号：这份消息不能显示在当前会话里
+      if (seq !== convSeqRef.current || gen !== genRef.current) return
       setMsgs(m.list || [])
       setConvs((old) => {
         const next = old.map((c) => (c.id === cv.id ? { ...c, unread: 0 } : c))
         syncCache({ convs: next })
         return next
       })
-    } catch (err) { setMsg(String(err.message)) } finally { setMsgsLoading(false) }
+    } catch (err) {
+      if (seq === convSeqRef.current && gen === genRef.current) setMsg(String(err.message))
+    } finally {
+      if (seq === convSeqRef.current) setMsgsLoading(false)
+    }
+  }
+
+  /* 返回来信列表：让还在途的消息请求作废，避免它回来后又把详情塞进列表页 */
+  const closeConv = () => {
+    convSeqRef.current += 1
+    setActive(null)
+    setMsgs([])
+    setMsgsLoading(false)
   }
 
   /* 回复：本地追加，不再整页重载（原来一次回复要重跑 6 个请求） */
   const doReply = async (e) => {
     e.preventDefault()
     if (sending || !reply.trim() || !active) return
+    const seq = convSeqRef.current
+    const gen = genRef.current
     setMsg(''); setSending(true)
     const text = reply
     try {
       const r = await api('/conversation/reply', { method: 'POST', body: { conv_id: active.id, content: text } })
+      // 期间换了会话/账号：回复已经发到服务端，但不能再追加到当前会话的界面
+      if (seq !== convSeqRef.current || gen !== genRef.current) return
       setReply('')
       if (r.msg && r.msg.id) setMsgs((old) => old.concat([r.msg]))
       setConvs((old) => {
@@ -329,7 +393,7 @@ export default function AdminView({ user }) {
 
       {tab === 'conv' && active && (
         <div className="conv-detail">
-          <button className="mini-btn" onClick={() => setActive(null)}>{t('admin.backToList')}</button>
+          <button className="mini-btn" onClick={closeConv}>{t('admin.backToList')}</button>
           <h3 className="conv-title">{t('admin.conversationWith', { name: active.nickname || active.username, username: active.username })}</h3>
           <div className="chat chat--inadmin">
             <div className="chat-box">

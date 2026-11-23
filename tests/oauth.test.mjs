@@ -345,9 +345,10 @@ test('OAuth 建的账号可以用「设口令」把密码补上（占位值不�
   assert.equal(login.status, 401, '占位口令必须不能登录')
 
   // 已登录用户设口令：不需要旧密码（旧密码根本不存在），但要挡住"给已有口令的账号重置"
+  // 带 Cookie 的写操作受 CSRF 闸门约束：必须显式带精确同源 Origin + JSON 正文
   const set = await worker.fetch(new Request('https://caar.fun/api/password/set', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', cookie: 'caar_session=' + token },
+    headers: { 'content-type': 'application/json', origin: 'https://caar.fun', cookie: 'caar_session=' + token },
     body: JSON.stringify({ new_password: 'a-good-passphrase' })
   }), env, ctx)
   assert.equal(set.status, 200)

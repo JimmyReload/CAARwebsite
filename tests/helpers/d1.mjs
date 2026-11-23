@@ -106,10 +106,15 @@ export async function postLogin(worker, env, { username, password, ip }) {
 }
 
 // 任意 API 调用（带 Cookie / JSON body）
-export async function api(worker, env, path, { method = 'GET', token, body } = {}) {
+// 带 Cookie 的写操作现在必须满足 CSRF 闸门：Origin 精确同源 + JSON Content-Type。
+// 这里显式补上同源 Origin，模拟本站前端的真实请求；专门测拒绝路径的用例自己构造 Request。
+export async function api(worker, env, path, { method = 'GET', token, body, origin } = {}) {
   const headers = {}
+  const mutating = method !== 'GET' && method !== 'HEAD'
   if (token) headers.cookie = 'caar_session=' + token
   if (body !== undefined) headers['content-type'] = 'application/json'
+  if (origin) headers.origin = origin
+  else if (token && mutating) headers.origin = 'https://caar.test'
   const res = await worker.fetch(new Request('https://caar.test/api/' + path, {
     method,
     headers,

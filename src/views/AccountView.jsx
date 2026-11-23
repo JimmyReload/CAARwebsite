@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import api from '../api'
+import { logoutSession } from '../panelCache'
 import { t } from '../i18n'
 import { fmtDate } from '../time'
 
@@ -22,6 +23,8 @@ export default function AccountView({ user, setUser }) {
   const [np, setNp] = useState('')
   const [pwMsg, setPwMsg] = useState('')
   const [saving, setSaving] = useState(false)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutMsg, setLogoutMsg] = useState('')
 
   useEffect(() => {
     if (cooldown <= 0) return
@@ -109,10 +112,22 @@ export default function AccountView({ user, setUser }) {
     }
   }
 
+  /* 退出登录：服务端确认后才清本地身份与缓存。
+     请求失败（网络/服务端错误）时 Cookie 可能仍然有效，此时宣称「已退出」会让人以为
+     会话已经结束；这里保留登录态并给出可重试的错误。 */
   const logout = async () => {
-    try { await api('/logout', { method: 'POST' }) } catch { /* 网络异常也按已退出处理 */ }
-    setUser(null)
-    nav('/')
+    if (loggingOut) return
+    setLogoutMsg('')
+    setLoggingOut(true)
+    try {
+      await logoutSession()
+      setUser(null)
+      nav('/')
+    } catch (err) {
+      setLogoutMsg((err && err.message) || t('api.failed'))
+    } finally {
+      setLoggingOut(false)
+    }
   }
 
   if (!user) return null
@@ -207,7 +222,11 @@ export default function AccountView({ user, setUser }) {
         <h2 className="panel-sec-title">{t('account.session')}</h2>
         <div className="acct-logout">
           <p className="acct-note">{t('account.logoutNote')}</p>
-          <button type="button" className="mini-btn mini-btn--danger" onClick={logout}>{t('account.logout')}</button>
+          <button type="button" className="mini-btn mini-btn--danger" onClick={logout} disabled={loggingOut}>
+            {loggingOut ? t('common.loading') : t('account.logout')}
+          </button>
+          {/* 失败时明确说明登录态仍然有效：文案直接写在这里，src/locales 不在本次改动范围 */}
+          {logoutMsg && <p className="auth-msg" role="alert">退出失败：{logoutMsg}。登录状态仍然有效，请重试。</p>}
         </div>
       </section>
     </div>

@@ -70,10 +70,123 @@ function jsonRetry(data, status, retry) {
   return res;
 }
 
-async function readBody(req) {
-  try { return await req.json(); } catch { return {}; }
-}
+// ---------- 请求体上限与读取 ----------
+// 64 KiB 是**实际读取字节**的上限，不是 Content-Length 的声明值：
+// Content-Length 可由客户端省略（HTTP/2、流式请求）或伪造，只信它等于没有上限。
+// 读取时按块累计，一旦超限立刻 cancel 掉流，绝不把剩余正文继续缓冲进内存。
 const MAX_BODY_BYTES = 64 * 1024;
+
+// 请求体相关的失败用带状态码的错误表达，由 app.fetch 的统一异常兜底转成响应，
+// 这样调用点（十几个 readBody）不必各自处理 413/400
+class HttpError extends Error {
+  constructor(status, key, detail) {
+    super(key);
+    this.status = status;
+    this.localeKey = key;
+    this.detail = detail || '';
+  }
+}
+const tooLarge = () => new HttpError(413, 'errors.bodyTooLarge');
+const badBody = (detail) => new HttpError(400, 'errors.badParams', detail);
+
+// 读正文：先按声明长度快速拒绝，再按实际字节数兜底（两条路径都会拒绝）。
+// 返回解析后的 JSON；空正文按 {} 处理（部分路由允许无正文）。
+async function readBody(req) {
+  const declared = req.headers.get('content-length');
+  if (declared !== null && Number(declared) > MAX_BODY_BYTES) throw tooLarge();
+
+  // body 为 null（GET/HEAD 或确实没有正文）：不必读流
+  if (!req.body) {
+    try {
+      const text = await req.text();
+      return text ? JSON.parse(text) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  const reader = req.body.getReader();
+  const chunks = [];
+  let total = 0;
+  let readFailed = false;
+  try {
+    for (;;) {
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch {
+        // 流中断/底层读取失败：这不是服务端 bug，按客户端错误处理，不要 500
+        readFailed = true;
+        break;
+      }
+      const { done, value } = chunk;
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        // 超限即停：释放底层流，不再读取后续块
+        try { await reader.cancel(); } catch { /* 取消失败也不影响拒绝 */ }
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* 已 cancel 时 release 可能抛错，忽略 */ }
+  }
+  if (readFailed) throw badBody('stream_read');
+
+  if (!total) return {};
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
+  let text;
+  try { text = dec.decode(bytes); } catch { throw badBody('undecodable'); }
+  if (!text.trim()) return {};
+  try { return JSON.parse(text); } catch { throw badBody('malformed_json'); }
+}
+
+// ---------- CSRF：带会话 Cookie 的状态变更 ----------
+// SameSite=Lax 只挡跨站，不挡**同站子域**（attacker.caar.fun 与 caar.fun 同站不同源）；
+// CORS 也不挡服务端副作用（浏览器只挡读取响应）。所以这里两道闸门都在 Worker 内做：
+//   1) Origin 必须**精确**等于请求 URL 的 origin（scheme+host+port）。缺失、'null'、
+//      子域、异协议一律拒绝 —— 不接受"没有 Origin 就当安全"的推断。
+//   2) 带正文的写请求必须是 application/json。text/plain / form 这类浏览器可以
+//      不经预检发出的简单请求一律拒绝，避免"服务端把 text/plain 当 JSON 解析"。
+// 只作用于**携带会话 Cookie 的非安全方法**：匿名流程（登录、注册、邮箱验证码、
+// OAuth 回调 GET、前端错误上报）不受影响；真正的 API 客户端（curl 等）需要显式带
+// 与目标同源的 Origin，这是有意的取舍：宁可让非浏览器客户端多带一个头，
+// 也不给同站子域留下可利用的写通道。
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+const JSON_CONTENT_TYPE = 'application/json';
+
+function hasSessionCookie(req) {
+  return /(?:^|;\s*)caar_session=[^;\s]+/.test(getCookie(req));
+}
+
+// 去掉 `; charset=` 之类的参数后比较媒体类型
+function mediaType(req) {
+  const raw = String(req.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  return raw;
+}
+
+function hasBody(req) {
+  // Content-Length is only a hint. `0` with a present body must not bypass the
+  // Content-Type guard; stream presence is authoritative for simple-request CSRF checks.
+  return !!req.body;
+}
+
+// 返回 Response 表示拒绝，null 表示放行
+function checkCookieMutation(req, url) {
+  if (SAFE_METHODS.has(String(req.method || '').toUpperCase())) return null;
+  if (!hasSessionCookie(req)) return null;
+  const origin = req.headers.get('origin');
+  if (!origin || origin === 'null' || origin !== url.origin) {
+    return json({ error: t('errors.forbidden') }, 403);
+  }
+  if (hasBody(req) && mediaType(req) !== JSON_CONTENT_TYPE) {
+    return json({ error: t('errors.badParams') }, 415);
+  }
+  return null;
+}
 
 // ---------- 密码 ----------
 async function hashPassword(pw, saltHex) {
@@ -136,6 +249,7 @@ function normalizeNickname(raw) {
 const CODE_TTL_MS = 10 * 60 * 1000;      // 验证码 10 分钟有效
 const CODE_COOLDOWN_MS = 60 * 1000;      // 同一邮箱 60 秒内只能发一次
 const CODE_MAX_PER_HOUR = 5;             // 同一邮箱每小时最多 5 封
+const CODE_MAX_IP_PER_HOUR = 15;         // 同一 IP 每小时最多 15 封（防批量刷别人邮箱）
 const CODE_MAX_ATTEMPTS = 5;             // 同一验证码最多试 5 次
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/;
 
@@ -209,6 +323,13 @@ async function sendCodeMail(env, email, code, purpose) {
 }
 
 // 校验验证码；成功即标记已用，失败累计尝试次数
+//
+// 并发安全：读 attempts → 判断 → 写回 是一条存在竞态的读改写链。
+// 8 个并发猜测都能先读到 attempts=0，然后各自 +1，最终 attempts=8（审计 F-05）。
+// 所以「占用一次尝试」和「消费成功」都必须是**单条条件 UPDATE**：
+//   · 错误分支：`attempts = attempts + 1 WHERE ... attempts < 5`，只有 changes=1 才算占用成功；
+//   · 成功分支：`used = 1 WHERE ... used = 0 AND attempts < 5`，只有一条请求能把 0 改成 1。
+// changes=0 说明这一行已被同批请求消耗/达到上限，按最终状态给出错误，绝不再放宽判定。
 async function verifyCode(env, email, purpose, code, log) {
   // 失败只进控制台：单码有 5 次上限，但「换邮箱/换码继续试」的行为需要可见，
   // 又不值得为每次猜测写一行 D1（那正是被放大的路径）
@@ -225,10 +346,26 @@ async function verifyCode(env, email, purpose, code, log) {
   const issuedAt = Number(row.expires_at) - CODE_TTL_MS;
   const hash = await hashCode(email, String(code), issuedAt);
   if (hash !== row.code_hash) {
-    await env.DB.prepare('UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?').bind(row.id).run();
+    const upd = await env.DB.prepare(
+      'UPDATE email_codes SET attempts = attempts + 1 WHERE id = ? AND used = 0 AND attempts < ?'
+    ).bind(row.id, CODE_MAX_ATTEMPTS).run();
+    if (!Number(upd && upd.meta && upd.meta.changes)) {
+      // 抢占失败：要么已被别的请求成功消费，要么尝试次数已到上限
+      const now = await env.DB.prepare('SELECT used, attempts FROM email_codes WHERE id = ?').bind(row.id).first();
+      if (now && Number(now.used)) return fail('errors.codeMissing');
+      return fail('errors.codeTooMany');
+    }
     return fail('errors.codeWrong');
   }
-  await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE id = ?').bind(row.id).run();
+  // 正确码：条件消费保证「最多成功一次」
+  const used = await env.DB.prepare(
+    'UPDATE email_codes SET used = 1 WHERE id = ? AND used = 0 AND attempts < ?'
+  ).bind(row.id, CODE_MAX_ATTEMPTS).run();
+  if (!Number(used && used.meta && used.meta.changes)) {
+    const now = await env.DB.prepare('SELECT used, attempts FROM email_codes WHERE id = ?').bind(row.id).first();
+    if (now && Number(now.used)) return fail('errors.codeMissing');
+    return fail('errors.codeTooMany');
+  }
   return { ok: true };
 }
 
@@ -578,10 +715,18 @@ const app = {
     try {
       res = await app.handle(request, env, ctx, io);
     } catch (err) {
-      // 兜底：未捕获异常必须留痕，同时给用户一个体面的响应（不泄露堆栈）
-      log.error('http.unhandled', { err: describeError(err), uid: io.actor ? io.actor.id : 0 });
-      io.audit('request.error', { level: 'error', status: 500, meta: { err: describeError(err) } });
-      res = json({ error: t('errors.serverError') }, 500);
+      // 请求体自身的错误（超限/畸形 JSON/流读取失败）是客户端问题，按协议状态码回，
+      // 不要混成 500 让人去翻服务端日志
+      if (err instanceof HttpError) {
+        // 事件名复用已有的 http.request（面板有中文名），具体原因放 meta.reject
+        log.warn('http.request', { status: err.status, reject: 'body', reason: err.detail || err.localeKey });
+        res = json({ error: t(err.localeKey) }, err.status);
+      } else {
+        // 兜底：未捕获异常必须留痕，同时给用户一个体面的响应（不泄露堆栈）
+        log.error('http.unhandled', { err: describeError(err), uid: io.actor ? io.actor.id : 0 });
+        io.audit('request.error', { level: 'error', status: 500, meta: { err: describeError(err) } });
+        res = json({ error: t('errors.serverError') }, 500);
+      }
     }
 
     const ms = Date.now() - started;
@@ -645,7 +790,20 @@ const app = {
 
     const path = url.pathname.slice(5); // 去掉 /api/
     const method = request.method;
-    // 请求体上限：未认证即可触发的 CPU 放大（超长口令喂给 PBKDF2）
+    // CSRF：带会话 Cookie 的写操作必须来自精确同源 + JSON 正文（见 checkCookieMutation）
+    const csrfBlocked = checkCookieMutation(request, url);
+    if (csrfBlocked) {
+      // 事件名复用已有的 http.request（面板有中文名），具体原因放 meta.reject
+      log.warn('http.request', {
+        status: csrfBlocked.status, reject: 'csrf',
+        path, method,
+        origin: String(request.headers.get('origin') || '').slice(0, 80),
+        ctype: mediaType(request)
+      });
+      return csrfBlocked;
+    }
+    // 请求体上限：未认证即可触发的 CPU 放大（超长口令喂给 PBKDF2）。
+    // 这里只是按声明长度的快速拒绝；真正的判定在 readBody() 里按实际读取字节做。
     if (method !== 'GET' && method !== 'HEAD') {
       const len = Number(request.headers.get('content-length') || 0);
       if (len > MAX_BODY_BYTES) return json({ error: t('errors.bodyTooLarge') }, 413);
@@ -822,30 +980,46 @@ const app = {
       if (taken) return json({ error: t('errors.emailTaken') }, 409);
 
       const now = Date.now();
-      // 同邮箱冷却
-      const last = await env.DB.prepare('SELECT expires_at FROM email_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1').bind(email, purpose).first();
-      if (last) {
-        const wait = CODE_COOLDOWN_MS - (now - (Number(last.expires_at) - CODE_TTL_MS));
-        if (wait > 0) return json({ error: t('errors.codeCooldown', { s: Math.ceil(wait / 1000) }) }, 429);
-      }
-      // 同邮箱每小时上限
-      const hourly = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_codes WHERE email = ? AND purpose = ? AND expires_at > ?')
-        .bind(email, purpose, now - 60 * 60 * 1000 + CODE_TTL_MS).first();
-      if (hourly && Number(hourly.n) >= CODE_MAX_PER_HOUR) return json({ error: t('errors.codeRateLimit') }, 429);
-      // 同 IP 每小时上限（防批量刷别人的邮箱）
       const ip = request.headers.get('cf-connecting-ip') || '';
-      if (ip) {
-        const byIp = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_codes WHERE ip = ? AND expires_at > ?')
-          .bind(ip, now - 60 * 60 * 1000 + CODE_TTL_MS).first();
-        if (byIp && Number(byIp.n) >= 15) return json({ error: t('errors.codeRateLimit') }, 429);
-      }
-
+      // 冷却 + 两道小时额度必须在**同一条语句**里判定并占位。
+      // 旧实现是「查冷却 → 查邮箱额度 → 查 IP 额度 → INSERT」四条语句，
+      // 并发请求都在任何 INSERT 落库前读到同样的旧状态，于是整批放行（审计 F-04）。
+      // 这里用 INSERT ... SELECT ... WHERE：SQLite/D1 的单条语句是原子的，
+      // 条件不满足时 changes=0（没写行），满足时才占位——超额请求根本走不到发信那一步。
+      const cooldownFloor = now - CODE_COOLDOWN_MS + CODE_TTL_MS; // 该时刻之后签发的码都还在冷却期
+      const hourFloor = now - 60 * 60 * 1000 + CODE_TTL_MS;       // 该时刻之后签发的码都算进这一小时
       const code = randomCode();
       const issuedAt = now;
       const expiresAt = now + CODE_TTL_MS;
-      await env.DB.prepare(
-        'INSERT INTO email_codes (email, purpose, code_hash, expires_at, ip) VALUES (?, ?, ?, ?, ?)'
-      ).bind(email, purpose, await hashCode(email, code, issuedAt), expiresAt, ip).run();
+      const reserved = await env.DB.prepare(
+        `INSERT INTO email_codes (email, purpose, code_hash, expires_at, ip)
+         SELECT ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+                  SELECT 1 FROM email_codes
+                   WHERE email = ? AND purpose = ? AND expires_at > ?)
+            AND (SELECT COUNT(*) FROM email_codes
+                  WHERE email = ? AND purpose = ? AND expires_at > ?) < ?
+            AND (? = '' OR (SELECT COUNT(*) FROM email_codes
+                             WHERE ip = ? AND expires_at > ?) < ?)`
+      ).bind(
+        email, purpose, await hashCode(email, code, issuedAt), expiresAt, ip,
+        email, purpose, cooldownFloor,
+        email, purpose, hourFloor, CODE_MAX_PER_HOUR,
+        ip, ip, hourFloor, CODE_MAX_IP_PER_HOUR
+      ).run();
+
+      if (!Number(reserved && reserved.meta && reserved.meta.changes)) {
+        // 占位失败：读一次现状只为给出准确的错误文案，不做任何写入
+        const last = await env.DB.prepare('SELECT expires_at FROM email_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1').bind(email, purpose).first();
+        if (last) {
+          const wait = CODE_COOLDOWN_MS - (now - (Number(last.expires_at) - CODE_TTL_MS));
+          if (wait > 0) return json({ error: t('errors.codeCooldown', { s: Math.ceil(wait / 1000) }) }, 429);
+        }
+        const hourly = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_codes WHERE email = ? AND purpose = ? AND expires_at > ?')
+          .bind(email, purpose, hourFloor).first();
+        if (hourly && Number(hourly.n) >= CODE_MAX_PER_HOUR) return json({ error: t('errors.codeRateLimit') }, 429);
+        return json({ error: t('errors.codeRateLimit') }, 429);
+      }
 
       try {
         await sendCodeMail(env, email, code, purpose);
