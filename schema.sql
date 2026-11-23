@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS login_fails (
 -- 审计流水：登录/注册/改密、管理操作、公告变更、异常与前端报错
 -- 控制台日志负责「全量排障」，这张表负责「事后追责」，按保留期清理（默认 90 天）
 CREATE TABLE IF NOT EXISTS audit_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,                 -- 行号即可做游标：不需要 AUTOINCREMENT 的永不复用保证，省一次序列写
   ts INTEGER NOT NULL,
   level TEXT NOT NULL DEFAULT 'info',
   event TEXT NOT NULL,

@@ -25,9 +25,20 @@ const MAX_STRING = 400
 const MAX_ARRAY = 20
 const MAX_STACK = 1200
 
-// 命中即整体替换为 ***。键名小写比较，覆盖 password / old_password / new_password /
-// token / code / code_hash / salt / hash / authorization / cookie / api_key …
-const SENSITIVE_KEY = /^(pass(word)?|pwd|old_?pass(word)?|new_?pass(word)?|secret|token|session|cookie|authorization|api_?key|apikey|salt|hash|code|code_hash)$/i
+// 命中即整体替换为 ***。
+// 两段式：精确名单负责普通词，后缀规则负责 camelCase / snake_case 变体
+// （confirmPassword / verificationCode / authToken / apiKey 这类），
+// 同时放过 error_code / status_code 这类"叫 code 但不是凭据"的字段。
+const SENSITIVE_KEY = /^(password|passwd|pwd|secret|token|session|code|code_hash|salt|hash|authorization|cookie)$/i
+const SENSITIVE_SUFFIX = /(password|passwd|pwd|token|secret|code|salt|hash|cookie|api[_-]?key)$/i
+const SAFE_CODE = /^(error|err|status|http|result)_?code$/i
+
+export function isSensitiveKey(key) {
+  const k = String(key)
+  if (SENSITIVE_KEY.test(k)) return true
+  if (!SENSITIVE_SUFFIX.test(k)) return false
+  return !SAFE_CODE.test(k)
+}
 
 export const AUDIT_KEEP_DAYS = 90
 const AUDIT_MAX_META = 2000
@@ -57,7 +68,7 @@ export function redact(value, depth = 0) {
     if (depth >= MAX_DEPTH) return '[object]'
     const out = {}
     for (const k of Object.keys(value)) {
-      out[k] = SENSITIVE_KEY.test(k) ? '***' : redact(value[k], depth + 1)
+      out[k] = isSensitiveKey(k) ? '***' : redact(value[k], depth + 1)
     }
     return out
   }
@@ -140,13 +151,19 @@ export function maskEmail(email) {
 }
 
 // ---------- D1 审计流水 ----------
+//
+// 表结构以 migrations/0010_add_audit_logs.sql 为唯一来源。
+// 默认不在运行时建表：日志系统不该在请求路径上跑 DDL（多 isolate 冷启动会争 D1 写锁，
+// 且兜底建出来的库不会写 schema_migrations，版本状态与事实不符）。
+// 只有显式设置 AUDIT_BOOTSTRAP=1 时才兜底建表，用于「代码先上线、迁移还没跑」的窗口期。
 
-let auditSchemaReady = null
-export function ensureAuditSchema(env) {
-  if (!auditSchemaReady) {
-    auditSchemaReady = (async () => {
+let bootstrapReady = null
+export function bootstrapAuditSchema(env) {
+  if (String((env && env.AUDIT_BOOTSTRAP) || '') !== '1') return Promise.resolve(false)
+  if (!bootstrapReady) {
+    bootstrapReady = (async () => {
       await env.DB.prepare(`CREATE TABLE IF NOT EXISTS audit_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         ts INTEGER NOT NULL,
         level TEXT NOT NULL DEFAULT 'info',
         event TEXT NOT NULL,
@@ -166,20 +183,45 @@ export function ensureAuditSchema(env) {
       await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_audit_level_ts ON audit_logs(level, ts DESC)').run()
       await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_logs(event, ts DESC)').run()
       await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id, ts DESC)').run()
-    })().catch((err) => { auditSchemaReady = null; throw err })
+      return true
+    })().catch((err) => { bootstrapReady = null; throw err })
   }
-  return auditSchemaReady
+  return bootstrapReady
 }
 
-// 每个 isolate 每分钟的写入预算：防止被刷的路径把审计表撑爆（超出只留控制台日志）
-let auditBudget = { minute: -1, n: 0 }
+// 写入预算：每个 isolate 每分钟最多 N 条非关键事件。**关键事件不受限**，
+// 否则洪水期间被封禁、改密、授权这类事件会被静默挤掉，事后追责出现空洞。
+// 丢弃本身必须留痕（audit.dropped），否则「少了一行」无从判断是没发生还是被丢。
+const CRITICAL_EVENT = /^(admin\.|auth\.password\.|request\.error|cron\.)/
+let auditBudget = { minute: -1, n: 0, dropped: 0 }
 
 export function auditBudgetSnapshot() {
-  return { minute: auditBudget.minute, n: auditBudget.n }
+  return { minute: auditBudget.minute, n: auditBudget.n, dropped: auditBudget.dropped }
 }
+
+// 表缺失只在首次与每 10 分钟提醒一次，避免迁移没跑时每个请求刷一行
+let auditMissingAt = 0
 
 function clampStr(v, n) {
   return String(v == null ? '' : v).slice(0, n)
+}
+
+// meta 必须是合法 JSON：超限时不做硬切（会切在字符串中间产出非法 JSON 和半个值），
+// 改为保留预览 + 标记，保证这条记录仍可结构化读出「被截断了」。
+export function metaJson(value) {
+  let raw
+  try {
+    raw = JSON.stringify(redact(value || {}))
+  } catch {
+    return ''
+  }
+  if (!raw || raw === '{}') return ''
+  if (raw.length <= AUDIT_MAX_META) return raw
+  return JSON.stringify({
+    _truncated: true,
+    _size: raw.length,
+    preview: raw.slice(0, AUDIT_MAX_META - 80)
+  })
 }
 
 /**
@@ -196,20 +238,27 @@ function clampStr(v, n) {
 export function audit(env, ctx, rec) {
   const task = (async () => {
     if (!env || !env.DB) return
+
+    const event = clampStr(rec.event || 'unknown', 64)
     const minute = Math.floor(Date.now() / 60000)
-    if (auditBudget.minute !== minute) auditBudget = { minute, n: 0 }
-    if (auditBudget.n >= AUDIT_BUDGET_PER_MIN) return
+    if (auditBudget.minute !== minute) auditBudget = { minute, n: 0, dropped: 0 }
+
+    if (!CRITICAL_EVENT.test(event) && auditBudget.n >= AUDIT_BUDGET_PER_MIN) {
+      if (auditBudget.dropped === 0) {
+        console.warn(safeStringify({
+          ts: new Date().toISOString(), level: 'warn', event: 'audit.dropped',
+          budgetPerMin: AUDIT_BUDGET_PER_MIN, minute
+        }))
+      }
+      auditBudget.dropped += 1
+      return
+    }
     auditBudget.n += 1
 
     const level = ['debug', 'info', 'warn', 'error'].includes(rec.level) ? rec.level : 'info'
-    let meta = ''
-    try {
-      const raw = typeof rec.meta === 'string' ? rec.meta : JSON.stringify(redact(rec.meta || {}))
-      meta = raw === '{}' ? '' : raw.slice(0, AUDIT_MAX_META)
-    } catch { meta = '' }
 
     try {
-      await ensureAuditSchema(env)
+      if (String(env.AUDIT_BOOTSTRAP || '') === '1') await bootstrapAuditSchema(env)
       await env.DB.prepare(
         `INSERT INTO audit_logs
            (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
@@ -217,7 +266,7 @@ export function audit(env, ctx, rec) {
       ).bind(
         Date.now(),
         level,
-        clampStr(rec.event || 'unknown', 64),
+        event,
         rec.actor_id == null || rec.actor_id === '' ? null : Number(rec.actor_id) || null,
         clampStr(rec.actor_name, 40),
         clampStr(rec.target_type, 24),
@@ -228,10 +277,25 @@ export function audit(env, ctx, rec) {
         Number(rec.status) || 0,
         clampStr(rec.rid, 80),
         clampStr(rec.ua, 160),
-        meta
+        metaJson(rec.meta)
       ).run()
+      auditMissingAt = 0
     } catch (err) {
       // 审计失败只能降级成控制台日志：不能把异常抛回请求路径
+      const msg = String((err && err.message) || '')
+      const missing = /no such table/i.test(msg)
+      if (missing) {
+        if (Date.now() - auditMissingAt > 10 * 60 * 1000) {
+          auditMissingAt = Date.now()
+          try {
+            console.warn(safeStringify({
+              ts: new Date().toISOString(), level: 'warn', event: 'audit.table.missing',
+              hint: '执行 migrations/0010_add_audit_logs.sql（或临时设 AUDIT_BOOTSTRAP=1）'
+            }))
+          } catch { /* 彻底放弃 */ }
+        }
+        return
+      }
       try {
         console.warn(safeStringify({ ts: new Date().toISOString(), level: 'warn', event: 'audit.write.fail', err: describeError(err) }))
       } catch { /* 彻底放弃 */ }
@@ -249,10 +313,9 @@ export function auditKeepDays(env) {
   return Number.isFinite(n) && n >= 7 ? Math.floor(n) : AUDIT_KEEP_DAYS
 }
 
-// 按保留期清理；返回删除行数
+// 按保留期清理；返回删除行数。表不存在时抛错，由调用方决定是否降级。
 export async function pruneAuditLogs(env, days) {
   const keep = Number(days) > 0 ? Number(days) : auditKeepDays(env)
-  await ensureAuditSchema(env)
   const cutoff = Date.now() - keep * 24 * 60 * 60 * 1000
   const r = await env.DB.prepare('DELETE FROM audit_logs WHERE ts < ?').bind(cutoff).run()
   return (r.meta && r.meta.changes) || 0

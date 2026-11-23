@@ -8,7 +8,7 @@
 -- 让「代码先上线、迁移后补」也不会 500；本文件是正式来源。
 
 CREATE TABLE IF NOT EXISTS audit_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,                 -- 行号即可做游标：不需要 AUTOINCREMENT 的永不复用保证，省一次序列写
   ts INTEGER NOT NULL,                       -- 毫秒时间戳：排序与保留期清理都靠它
   level TEXT NOT NULL DEFAULT 'info',        -- info | warn | error
   event TEXT NOT NULL,                       -- auth.login.ok / admin.user.ban / request.error …

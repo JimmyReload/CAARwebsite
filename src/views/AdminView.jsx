@@ -38,6 +38,7 @@ export default function AdminView({ user }) {
   const [logEvent, setLogEvent] = useState('')
   const [logQ, setLogQ] = useState('')
   const [logNext, setLogNext] = useState(0)
+  const [logBudget, setLogBudget] = useState(null)
   const [logLoading, setLogLoading] = useState(false)
 
   /* 首屏一次请求取全（公告 / 用户 / 会话 / 统计），原来是 4 个并行请求各验一次会话 */
@@ -89,24 +90,34 @@ export default function AdminView({ user }) {
       setLogNext(d.nextBefore || 0)
       setLogStats(d.stats || null)
       setLogEvents(d.events || [])
+      setLogBudget(d.budget || null)
       if (d.keepDays) setLogKeepDays(d.keepDays)
     } catch (err) { setMsg(String(err.message)) } finally { setLogLoading(false) }
   }
 
   useEffect(() => { if (tab === 'logs') loadLogs() }, [tab])
 
-  /* 清理旧日志：不可恢复，天数与后果都要问清楚 */
+  /* 清理旧日志：不可恢复，天数与后果都要问清楚。范围与服务端保持一致（7–3650），
+     否则服务端静默截断、弹窗里却还是用户输入的值 */
   const purgeLogs = async () => {
     const input = window.prompt(t('admin.logs.purgePrompt', { days: logKeepDays }), String(logKeepDays))
     if (!input) return
     const days = Number(input)
-    if (!Number.isFinite(days) || days < 7) { setMsg(t('admin.logs.purgeBadDays')); return }
+    if (!Number.isFinite(days) || days < 7 || days > 3650) { setMsg(t('admin.logs.purgeBadDays')); return }
     if (!window.confirm(t('admin.logs.purgeConfirm', { days }))) return
     try {
       const r = await api('/admin/logs/purge', { method: 'POST', body: { days } })
       flash(t('admin.logs.purged', { n: r.removed || 0 }))
       loadLogs()
     } catch (err) { setMsg(String(err.message)) }
+  }
+
+  const metaOf = (raw) => {
+    if (!raw) return null
+    try {
+      const v = JSON.parse(raw)
+      return v && typeof v === 'object' ? v : null
+    } catch { return null }
   }
 
   const prettyMeta = (raw) => {
@@ -447,35 +458,45 @@ export default function AdminView({ user }) {
                 total: logStats.total, error: logStats.error, warn: logStats.warn, info: logStats.info, days: logKeepDays
               })
               : t('admin.logs.hint')}
+            {logBudget && logBudget.dropped > 0 ? ' · ' + t('admin.logs.dropped', { n: logBudget.dropped }) : ''}
           </p>
 
           <div className="log-list">
             {!logLoading && logs.length === 0 && <p className="panel-empty">{t('admin.logs.empty')}</p>}
-            {logs.map((row) => (
-              <div key={row.id} className={'log-row log-row--' + row.level}>
-                <span className={'log-badge log-badge--' + row.level}>{row.level}</span>
-                <div className="log-main">
-                  <div className="log-head">
-                    <strong className="log-event">{row.event}</strong>
-                    <span className="log-when">{row.ts ? fmtDateTime(new Date(row.ts).toISOString()) : ''}</span>
+            {logs.map((row) => {
+              const meta = metaOf(row.meta)
+              return (
+                <div key={row.id} className={'log-row log-row--' + row.level}>
+                  <span className={'log-badge log-badge--' + row.level}>{row.level}</span>
+                  <div className="log-main">
+                    <div className="log-head">
+                      <strong className="log-event">{row.event}</strong>
+                      {meta && meta.source === 'client' ? <span className="log-src">{t('admin.logs.clientTag')}</span> : null}
+                      <span className="log-when">{row.ts ? fmtDateTime(new Date(row.ts).toISOString()) : ''}</span>
+                    </div>
+                    <div className="log-meta">
+                      {row.actor_name || t('admin.logs.anon')}
+                      {row.actor_id ? ' #' + row.actor_id : ''}
+                      {row.status ? ' · ' + row.status : ''}
+                      {row.path ? ' · ' + (row.method || 'GET') + ' ' + row.path : ''}
+                      {row.ip ? ' · ' + row.ip : ''}
+                      {row.target_type ? ' · ' + row.target_type + (row.target_id ? ':' + row.target_id : '') : ''}
+                    </div>
+                    {/* rid 是和控制台日志（wrangler tail / Workers Logs）对账的唯一钥匙，必须能看到 */}
+                    <div className="log-rid">
+                      {row.rid ? 'rid ' + row.rid : ''}
+                      {row.ua ? (row.rid ? ' · ' : '') + row.ua : ''}
+                    </div>
+                    {row.meta ? (
+                      <details className="log-json">
+                        <summary>{t('admin.logs.detail')}</summary>
+                        <pre>{prettyMeta(row.meta)}</pre>
+                      </details>
+                    ) : null}
                   </div>
-                  <div className="log-meta">
-                    {row.actor_name || t('admin.logs.anon')}
-                    {row.actor_id ? ' #' + row.actor_id : ''}
-                    {row.status ? ' · ' + row.status : ''}
-                    {row.path ? ' · ' + (row.method || 'GET') + ' ' + row.path : ''}
-                    {row.ip ? ' · ' + row.ip : ''}
-                    {row.target_type ? ' · ' + row.target_type + (row.target_id ? ':' + row.target_id : '') : ''}
-                  </div>
-                  {row.meta ? (
-                    <details className="log-json">
-                      <summary>{t('admin.logs.detail')}</summary>
-                      <pre>{prettyMeta(row.meta)}</pre>
-                    </details>
-                  ) : null}
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
 
           {logNext > 0 && (

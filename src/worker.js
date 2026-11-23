@@ -6,7 +6,7 @@ import { t } from './i18n'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts'
 import {
   createLogger, describeError, requestMeta, maskEmail,
-  audit, ensureAuditSchema, pruneAuditLogs, auditKeepDays, escapeLike
+  audit, auditBudgetSnapshot, pruneAuditLogs, auditKeepDays, escapeLike
 } from './log'
 
 const enc = new TextEncoder();
@@ -158,16 +158,19 @@ function clientIp(request) {
 }
 
 /**
- * 记录一次尝试并判断是否超限。返回 { blocked, retry }（retry 为秒）。
- * 1) 已被封禁：只读返回，不写库；
+ * 记录一次尝试并判断是否超限。返回 { blocked, retry, fresh }（retry 为秒）。
+ * 1) 已被封禁：只读返回，不写库（fresh=false：这次请求没有产生新封禁）；
  * 2) 未封禁：单语句原子自增（并发不丢计数）；
  * 3) 越过阈值：用 blocks 计"第几次被封"决定时长，`WHERE until <= now` 保证并发下只发一次。
+ *
+ * fresh 供调用方决定要不要写审计：封禁期内每次重试都写一行，等于把未认证端点
+ * 变成 D1 写入放大器。一次封禁只记一行，证据价值不变。
  */
 async function hitLimit(env, key, max) {
   const now = Date.now();
   const rec = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
   if (rec && Number(rec.until) > now) {
-    return { blocked: true, retry: Math.max(1, Math.ceil((Number(rec.until) - now) / 1000)) };
+    return { blocked: true, fresh: false, retry: Math.max(1, Math.ceil((Number(rec.until) - now) / 1000)) };
   }
 
   const row = await env.DB.prepare(
@@ -183,7 +186,7 @@ async function hitLimit(env, key, max) {
   ).bind(key, now, now, LOGIN_WINDOW_MS, now, now, LOGIN_WINDOW_MS, now, LOGIN_WINDOW_MS, now, now).first();
 
   const n = Number(row && row.n) || 0;
-  if (n <= max) return { blocked: false, retry: 0 };
+  if (n <= max) return { blocked: false, fresh: false, retry: 0 };
 
   // 阶梯按"第几次被封"增长：60s → 120s → 240s → …（封禁期内不会重复触发，见上面的只读判断）
   const upd = await env.DB.prepare(
@@ -194,10 +197,10 @@ async function hitLimit(env, key, max) {
       RETURNING until`
   ).bind(now, LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS, key, now).first();
 
-  if (upd) return { blocked: true, retry: Math.ceil((Number(upd.until) - now) / 1000) };
+  if (upd) return { blocked: true, fresh: true, retry: Math.ceil((Number(upd.until) - now) / 1000) };
   const again = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
   const until = Number(again && again.until) || 0;
-  return { blocked: true, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
+  return { blocked: true, fresh: false, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
 }
 
 async function clearLimit(env, keys) {
@@ -293,18 +296,24 @@ async function sendCodeMail(env, email, code, purpose) {
 }
 
 // 校验验证码；成功即标记已用，失败累计尝试次数
-async function verifyCode(env, email, purpose, code) {
+async function verifyCode(env, email, purpose, code, log) {
+  // 失败只进控制台：单码有 5 次上限，但「换邮箱/换码继续试」的行为需要可见，
+  // 又不值得为每次猜测写一行 D1（那正是被放大的路径）
+  const fail = (reason) => {
+    if (log) log.warn('verify.code.fail', { purpose, email: maskEmail(email), reason });
+    return { ok: false, error: reason };
+  };
   const row = await env.DB.prepare(
     'SELECT * FROM email_codes WHERE email = ? AND purpose = ? AND used = 0 ORDER BY id DESC LIMIT 1'
   ).bind(email, purpose).first();
-  if (!row) return { ok: false, error: 'errors.codeMissing' };
-  if (Number(row.expires_at) < Date.now()) return { ok: false, error: 'errors.codeExpired' };
-  if (Number(row.attempts) >= CODE_MAX_ATTEMPTS) return { ok: false, error: 'errors.codeTooMany' };
+  if (!row) return fail('errors.codeMissing');
+  if (Number(row.expires_at) < Date.now()) return fail('errors.codeExpired');
+  if (Number(row.attempts) >= CODE_MAX_ATTEMPTS) return fail('errors.codeTooMany');
   const issuedAt = Number(row.expires_at) - CODE_TTL_MS;
   const hash = await hashCode(email, String(code), issuedAt);
   if (hash !== row.code_hash) {
     await env.DB.prepare('UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?').bind(row.id).run();
-    return { ok: false, error: 'errors.codeWrong' };
+    return fail('errors.codeWrong');
   }
   await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE id = ?').bind(row.id).run();
   return { ok: true };
@@ -473,6 +482,10 @@ async function huntInterestCount(env, huntId) {
   return row ? Number(row.n) || 0 : 0;
 }
 
+// 日志页「近 24 小时 / 事件下拉」的全局口径缓存（60 秒），以及"谁翻过日志"的限频表
+let logsSummaryCache = { at: 0, data: null };
+const logsReadSeen = new Map();
+
 // 审计表按保留期清理：每个 isolate 最多 6 小时做一次，避免每 10 分钟的 Cron 都发删除语句
 let lastAuditPrune = 0;
 async function maybePruneAudit(env, log) {
@@ -482,7 +495,10 @@ async function maybePruneAudit(env, log) {
     const removed = await pruneAuditLogs(env);
     if (removed) log.info('audit.prune', { removed, keepDays: auditKeepDays(env) });
   } catch (err) {
-    log.warn('audit.prune.fail', { err: describeError(err) });
+    // 迁移没跑时表不存在，属预期窗口：不刷日志（audit() 自己会在首次写入时提醒一次）
+    if (!/no such table/i.test(String((err && err.message) || ''))) {
+      log.warn('audit.prune.fail', { err: describeError(err) });
+    }
   }
 }
 
@@ -632,6 +648,8 @@ const app = {
       if (!message) return json({ ok: true });
       const level = b.level === 'warn' ? 'warn' : 'error';
       const payload = {
+        // 来源标记：这张行是客户端自述，不是服务端观察到的事实，追责时不能同等看待
+        source: 'client',
         message,
         stack: String(b.stack || '').slice(0, 1200),
         url: String(b.url || '').slice(0, 200)
@@ -722,7 +740,7 @@ const app = {
       }
       const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
       if (taken) return json({ error: t('errors.emailTaken') }, 409);
-      const v = await verifyCode(env, email, 'register', code);
+      const v = await verifyCode(env, email, 'register', code, log);
       if (!v.ok) return json({ error: t(v.error) }, 400);
       const { salt, hash } = await hashPassword(password);
       const ins = await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
@@ -756,11 +774,15 @@ const app = {
         await ensureLoginSchema(env);
         const combo = await hitLimit(env, comboKey, LOGIN_COMBO_MAX);
         if (combo.blocked) {
-          log.warn('auth.login.blocked', { layer: 'combo', retry: combo.retry });
-          io.audit('auth.login.blocked', {
-            level: 'warn', status: 429, target_type: 'user', target_id: lower,
-            meta: { layer: 'combo', retry: combo.retry }
-          });
+          log.warn('auth.login.blocked', { layer: 'combo', fresh: combo.fresh, retry: combo.retry });
+          // 只在"这次请求真的触发了一次新封禁"时落库：封禁期内每次重试都写一行，
+          // 等于把未认证端点变成 D1 写入放大器
+          if (combo.fresh) {
+            io.audit('auth.login.blocked', {
+              level: 'warn', status: 429, target_type: 'user', target_id: lower,
+              meta: { layer: 'combo', retry: combo.retry }
+            });
+          }
           return jsonRetry({ error: t('errors.tooManyAttempts', { n: combo.retry }) }, 429, combo.retry);
         }
         const userMax = row && isStaff(row) ? LOGIN_STAFF_MAX : LOGIN_USER_MAX;
@@ -769,16 +791,20 @@ const app = {
           hitLimit(env, userKey, userMax)
         ]);
         if (ipHit.blocked) {
-          log.warn('auth.login.blocked', { layer: 'ip', retry: ipHit.retry });
-          io.audit('auth.login.blocked', { level: 'warn', status: 429, target_type: 'ip', meta: { layer: 'ip', retry: ipHit.retry } });
+          log.warn('auth.login.blocked', { layer: 'ip', fresh: ipHit.fresh, retry: ipHit.retry });
+          if (ipHit.fresh) {
+            io.audit('auth.login.blocked', { level: 'warn', status: 429, target_type: 'ip', meta: { layer: 'ip', retry: ipHit.retry } });
+          }
           return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
         }
         if (uHit.blocked) {
-          log.warn('auth.login.blocked', { layer: 'user', retry: uHit.retry });
-          io.audit('auth.login.blocked', {
-            level: 'warn', status: 429, target_type: 'user', target_id: lower,
-            meta: { layer: 'user', retry: uHit.retry }
-          });
+          log.warn('auth.login.blocked', { layer: 'user', fresh: uHit.fresh, retry: uHit.retry });
+          if (uHit.fresh) {
+            io.audit('auth.login.blocked', {
+              level: 'warn', status: 429, target_type: 'user', target_id: lower,
+              meta: { layer: 'user', retry: uHit.retry }
+            });
+          }
           return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
         }
       } catch { /* 计数不可用：继续校验口令 */ }
@@ -893,7 +919,7 @@ const app = {
       }
       const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND id <> ?').bind(email, user.id).first();
       if (taken) return json({ error: t('errors.emailTaken') }, 409);
-      const v = await verifyCode(env, email, 'bind', code);
+      const v = await verifyCode(env, email, 'bind', code, log);
       if (!v.ok) return json({ error: t(v.error) }, 400);
       await env.DB.prepare('UPDATE users SET email = ? WHERE id = ?').bind(email, user.id).run();
       // 邮箱是找回口令的唯一凭据，变更必须留档；只记脱敏地址
@@ -1227,16 +1253,14 @@ const app = {
     // ---------- 审计日志（管理员可读） ----------
     if (path === 'admin/logs' && method === 'GET') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
-      try {
-        await ensureAuditSchema(env);
-      } catch {
-        return json({ error: t('errors.serverError') }, 500);
-      }
 
       const levelParam = url.searchParams.get('level');
       const level = ['info', 'warn', 'error'].includes(levelParam) ? levelParam : '';
       const event = String(url.searchParams.get('event') || '').trim().slice(0, 64);
-      const q = String(url.searchParams.get('q') || '').trim().slice(0, 80);
+      const ip = String(url.searchParams.get('ip') || '').trim().slice(0, 64);
+      // 前导通配的全文检索是全表扫：短于 3 个字等于没有选择性，直接忽略
+      const qRaw = String(url.searchParams.get('q') || '').trim().slice(0, 80);
+      const q = qRaw.length >= 3 ? qRaw : '';
       const before = Number(url.searchParams.get('before') || 0);
       const limit = Math.min(200, Math.max(20, Number(url.searchParams.get('limit') || 50) || 50));
 
@@ -1244,41 +1268,82 @@ const app = {
       const args = [];
       if (level) { where.push('level = ?'); args.push(level); }
       if (event) { where.push("event LIKE ? ESCAPE '\\'"); args.push(escapeLike(event) + '%'); }
+      if (ip) { where.push('ip = ?'); args.push(ip); }
       if (q) {
         const like = '%' + escapeLike(q) + '%';
-        where.push("(event LIKE ? ESCAPE '\\' OR actor_name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR meta LIKE ? ESCAPE '\\')");
-        args.push(like, like, like, like);
+        // 覆盖「按 IP 查这个人都干了什么」「拿 rid 去对 wrangler tail」两个最常用的取数场景
+        where.push("(event LIKE ? ESCAPE '\\' OR actor_name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'" +
+          " OR ip LIKE ? ESCAPE '\\' OR rid LIKE ? ESCAPE '\\' OR target_id LIKE ? ESCAPE '\\'" +
+          " OR ua LIKE ? ESCAPE '\\' OR meta LIKE ? ESCAPE '\\')");
+        for (let i = 0; i < 8; i++) args.push(like);
       }
       if (before > 0) { where.push('id < ?'); args.push(before); }
       const sql = 'SELECT * FROM audit_logs' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY id DESC LIMIT ?';
-      // 多取一条用来判断"还有没有下一页"，省掉一次 COUNT
-      const rows = (await env.DB.prepare(sql).bind(...args, limit + 1).all()).results;
+
+      let rows;
+      try {
+        // 多取一条用来判断"还有没有下一页"，省掉一次 COUNT
+        rows = (await env.DB.prepare(sql).bind(...args, limit + 1).all()).results;
+      } catch (err) {
+        // 表不存在（迁移没跑）要说清楚；其他错误不把 SQL 细节暴露给前端
+        if (/no such table/i.test(String((err && err.message) || ''))) {
+          return json({ error: t('errors.logsTableMissing') }, 500);
+        }
+        log.error('admin.logs.fail', { err: describeError(err) });
+        return json({ error: t('errors.serverError') }, 500);
+      }
       const list = rows.slice(0, limit);
 
-      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-      const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      const [statRow, eventRows] = await Promise.all([
-        env.DB.prepare(
-          `SELECT COUNT(*) AS total,
-                  COALESCE(SUM(level = 'error'), 0) AS err,
-                  COALESCE(SUM(level = 'warn'), 0) AS warn,
-                  COALESCE(SUM(level = 'info'), 0) AS info
-             FROM audit_logs WHERE ts >= ?`
-        ).bind(dayAgo).first(),
-        env.DB.prepare('SELECT event, COUNT(*) AS n FROM audit_logs WHERE ts >= ? GROUP BY event ORDER BY n DESC LIMIT 40').bind(weekAgo).all()
-      ]);
+      // 统计与事件下拉是全局口径，不随筛选变化：60 秒内复用，避免每次切页都跑 7 天 GROUP BY
+      const now = Date.now();
+      if (!logsSummaryCache.data || now - logsSummaryCache.at > 60 * 1000) {
+        const dayAgo = now - 24 * 60 * 60 * 1000;
+        const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+        const [statRow, eventRows] = await Promise.all([
+          env.DB.prepare(
+            `SELECT COUNT(*) AS total,
+                    COALESCE(SUM(level = 'error'), 0) AS err,
+                    COALESCE(SUM(level = 'warn'), 0) AS warn,
+                    COALESCE(SUM(level = 'info'), 0) AS info
+               FROM audit_logs WHERE ts >= ?`
+          ).bind(dayAgo).first(),
+          env.DB.prepare('SELECT event, COUNT(*) AS n FROM audit_logs WHERE ts >= ? GROUP BY event ORDER BY n DESC LIMIT 40').bind(weekAgo).all()
+        ]);
+        logsSummaryCache = {
+          at: now,
+          data: {
+            stats: {
+              total: Number(statRow && statRow.total) || 0,
+              error: Number(statRow && statRow.err) || 0,
+              warn: Number(statRow && statRow.warn) || 0,
+              info: Number(statRow && statRow.info) || 0
+            },
+            events: eventRows.results || []
+          }
+        };
+      }
+
+      // 谁翻过日志本身也要留痕；按人每分钟最多 1 条，避免翻页把自己写成洪水
+      const uid = user.id;
+      if (now - (logsReadSeen.get(uid) || 0) > 60 * 1000) {
+        logsReadSeen.set(uid, now);
+        if (logsReadSeen.size > 500) {
+          for (const [k, v] of logsReadSeen) if (now - v > 10 * 60 * 1000) logsReadSeen.delete(k);
+        }
+        io.audit('admin.logs.read', {
+          status: 200,
+          meta: { level, event, ip, q: q ? q.slice(0, 40) : '', before, n: list.length }
+        });
+      }
 
       return json({
         list,
         nextBefore: rows.length > limit && list.length ? list[list.length - 1].id : 0,
-        stats: {
-          total: Number(statRow && statRow.total) || 0,
-          error: Number(statRow && statRow.err) || 0,
-          warn: Number(statRow && statRow.warn) || 0,
-          info: Number(statRow && statRow.info) || 0
-        },
-        events: eventRows.results || [],
-        keepDays: auditKeepDays(env)
+        stats: logsSummaryCache.data.stats,
+        events: logsSummaryCache.data.events,
+        keepDays: auditKeepDays(env),
+        // 本实例本分钟丢弃了多少条（多 isolate 下每个实例各自计数，用来判断"少的那行"是丢了还是没发生）
+        budget: auditBudgetSnapshot()
       });
     }
 

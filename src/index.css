@@ -541,6 +541,14 @@ section[id] { scroll-margin-top: 96px; }
 .log-meta {
   margin-top: 4px; font-family: var(--mono); font-size: 11.5px; font-weight: 500;
   color: #333; line-height: 1.6; word-break: break-all; }
+/* 来源标记：客户端自述的事件不能当服务端事实看 */
+.log-src {
+  font-family: var(--mono); font-size: 10px; font-weight: 900;
+  border: 2px solid #000; padding: 1px 6px; background: var(--grey); }
+/* rid 要能双击选中复制去 wrangler tail 里对账 */
+.log-rid {
+  margin-top: 3px; font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+  color: #777; line-height: 1.5; word-break: break-all; user-select: all; }
 .log-json { margin-top: 6px; }
 .log-json summary { cursor: pointer; font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
 .log-json summary:hover { background: var(--yellow); display: inline-block; }
