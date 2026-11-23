@@ -105,6 +105,19 @@ export async function postLogin(worker, env, { username, password, ip }) {
   }
 }
 
+// 任意 API 调用（带 Cookie / JSON body）
+export async function api(worker, env, path, { method = 'GET', token, body } = {}) {
+  const headers = {}
+  if (token) headers.cookie = 'caar_session=' + token
+  if (body !== undefined) headers['content-type'] = 'application/json'
+  const res = await worker.fetch(new Request('https://caar.test/api/' + path, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body)
+  }), env, ctx)
+  return { status: res.status, body: await res.json().catch(() => ({})) }
+}
+
 // 生成与 worker.js 相同格式（hex 盐:hex 哈希，PBKDF2-SHA256/100k/256bit）的口令哈希，
 // 用于打通"登录成功"这条路径——否则只能测到失败分支
 export async function pbkdf2Hash(password) {

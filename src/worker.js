@@ -106,6 +106,22 @@ function passwordProblem(pw, username) {
   return null;
 }
 
+// ---------- 昵称与标题长度 ----------
+// 昵称会出现在赛事列表（interested[].name）、工单发送者、公告作者等处，
+// 上限必须在**所有写入路径**统一，否则一个超长昵称能让所有人的列表响应体膨胀。
+const NICKNAME_MAX = 20;
+const ANNOUNCE_TITLE_MAX = 100;
+
+// 返回 { value } 或 { error: 文案 key }；注册、后台改名、用户自助改名三条路径共用
+function normalizeNickname(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return { error: 'errors.nicknameEmpty' };
+  if ([...s].length > NICKNAME_MAX) return { error: 'errors.nicknameTooLong' };
+  // 控制字符与双向文本覆盖符：前者会截断/串行显示，后者能伪造列表里的显示顺序
+  if (/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/.test(s)) return { error: 'errors.nicknameInvalid' };
+  return { value: s };
+}
+
 // ---------- 登录节流 ----------
 // 实现与常量见 src/loginLimit.js（单独成模块，便于 tests/ 用 sqlite 驱动验证不变量）。
 // 这里只负责调用：三层键 lf:ipu / lf:u / lf:ip，成功登录只清本人键。
@@ -532,6 +548,15 @@ const app = {
     // 前端异常上报：浏览器里的报错只有用户遇到，不收集就等于没有
     // 限流按 IP 计（同一出口 20 次后封 1 分钟起），并受审计写入预算保护
     if (path === 'log/client' && method === 'POST') {
+      // 只接受同源页面自报：挡掉第三方页面/嵌入 iframe 的刷量。
+      // 注意这只能提高门槛——非浏览器客户端可以伪造 Origin，真正的兜底是下面的
+      // per-IP 限流与 log.js 里的每分钟预算。所以校验失败直接 403，但不作为唯一防线。
+      const origin = request.headers.get('origin');
+      if (origin) {
+        let sameOrigin = false;
+        try { sameOrigin = new URL(origin).host === new URL(request.url).host; } catch { sameOrigin = false; }
+        if (!sameOrigin) return json({ ok: false }, 403);
+      }
       const ipHead = clientIp(request);
       try {
         await ensureLoginSchema(env);
@@ -620,7 +645,7 @@ const app = {
       const b = await readBody(request);
       const username = String(b.username || '').trim();
       const password = String(b.password || '');
-      const nickname = String(b.nickname || '').trim() || username;
+      let nickname = username; // 未填昵称时沿用用户名；填了则在下面统一校验
       const email = String(b.email || '').trim().toLowerCase();
       const code = String(b.code || '').trim();
       if (username.length < 2 || username.length > 20) return json({ error: t('errors.usernameLength') }, 400);
@@ -629,6 +654,12 @@ const app = {
       if (pwErr) return json({ error: t(pwErr) }, 400);
       if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: t('errors.emailInvalid') }, 400);
       if (!code) return json({ error: t('errors.codeRequired') }, 400);
+      // 昵称可选；填了就必须合规（与 /api/profile、后台改名同一口径）
+      if (String(b.nickname || '').trim()) {
+        const nick = normalizeNickname(b.nickname);
+        if (nick.error) return json({ error: t(nick.error) }, 400);
+        nickname = nick.value;
+      }
       const exists = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
       if (exists) return json({ error: t('errors.usernameTaken') }, 409);
       try {
@@ -807,9 +838,9 @@ const app = {
     // 修改自己的昵称（管理员改他人昵称走 admin/users/:id）
     if (path === 'profile' && method === 'PATCH') {
       const b = await readBody(request);
-      const nickname = String(b.nickname || '').trim();
-      if (!nickname) return json({ error: t('errors.nicknameEmpty') }, 400);
-      if ([...nickname].length > 20) return json({ error: t('errors.nicknameTooLong') }, 400);
+      const nick = normalizeNickname(b.nickname);
+      if (nick.error) return json({ error: t(nick.error) }, 400);
+      const nickname = nick.value;
       await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(nickname, user.id).run();
       io.audit('auth.profile.update', { status: 200, meta: { nickname } });
       return json({ ok: true, nickname });
@@ -847,6 +878,8 @@ const app = {
       const b = await readBody(request);
       if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: t('errors.announceEmpty') }, 400);
       if (String(b.content).length > 5000) return json({ error: t('errors.announceTooLong') }, 400);
+      // 标题会出现在成员端列表，不设上限同样能被拿来放大响应体（实测 30000 字可通过）
+      if ([...String(b.title).trim()].length > ANNOUNCE_TITLE_MAX) return json({ error: t('errors.announceTitleTooLong') }, 400);
       // 返回完整行：前端可直接插入列表，不必依赖紧随其后的刷新
       const rows = (await env.DB.prepare(
         'INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?) RETURNING *'
@@ -1314,10 +1347,14 @@ const app = {
       const guarded = targetIsSuper && id !== user.id;
       if (b.nickname !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
-        await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(String(b.nickname).trim(), id).run();
+        // 与 /api/profile 同一口径：非空、≤20 码点、无控制字符。
+        // 昵称会进入所有人的赛事列表与工单，这里漏了上限就能被拿来放大响应体。
+        const nick = normalizeNickname(b.nickname);
+        if (nick.error) return json({ error: t(nick.error) }, 400);
+        await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(nick.value, id).run();
         io.audit('admin.user.nickname', {
           status: 200, target_type: 'user', target_id: id,
-          meta: { username: target.username, nickname: String(b.nickname).trim() }
+          meta: { username: target.username, nickname: nick.value }
         });
       }
       if (b.banned !== undefined) {
@@ -1331,6 +1368,11 @@ const app = {
       }
       if (b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
+        // 管理员之间平权：admin 不得重置同级的口令，否则可横向接管对方账号。
+        // 超管账号已在 guarded 拦掉；这里拦 admin→admin（自己改自己除外），要动管理员口令只能走超管。
+        if (target.role === 'admin' && !isSuper(user) && id !== user.id) {
+          return json({ error: t('errors.superOnly') }, 403);
+        }
         const np = String(b.new_password);
         const pwErr = passwordProblem(np, target.username);
         if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
@@ -1378,7 +1420,13 @@ const app = {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
       const b = await readBody(request);
-      if (b.title !== undefined && !String(b.title).trim()) return json({ error: t('errors.titleEmpty') }, 400);
+      if (b.title !== undefined) {
+        const title = String(b.title).trim();
+        if (!title) return json({ error: t('errors.titleEmpty') }, 400);
+        if ([...title].length > ANNOUNCE_TITLE_MAX) return json({ error: t('errors.announceTitleTooLong') }, 400);
+      }
+      // 编辑路径此前没有 content 上限：创建时限 5000，改一次就能绕过
+      if (b.content !== undefined && String(b.content).length > 5000) return json({ error: t('errors.announceTooLong') }, 400);
       const r = await env.DB.prepare('UPDATE announcements SET title = COALESCE(?, title), content = COALESCE(?, content), pinned = COALESCE(?, pinned) WHERE id = ?')
         .bind(b.title !== undefined ? String(b.title).trim() : null, b.content !== undefined ? String(b.content) : null, b.pinned !== undefined ? (b.pinned ? 1 : 0) : null, id).run();
       // 影响 0 行 = 这条公告已不存在（可能被别的管理员删了）：必须报错，不能静默返回 ok
