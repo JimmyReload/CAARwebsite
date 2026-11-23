@@ -83,8 +83,8 @@ export default {
   /* ---------- 首页 hero ---------- */
   hero: {
     kicker: 'PUZZLE HUNT CLUB',
-    title1: '中国不正常推理协会',
-    title2: 'China Association of Abnormal Reasoning',
+    title1: '不正常推理协会',
+    title2: 'Abnormal Reasoning Association',
     subtitle: '一个人的毫无头绪，放进群里，也许就有了下一步。我们一起参加 puzzle hunt，查资料、做纸笔、试脑洞，直到把「这是什么」变成「原来如此」。',
     cta: '来一起解谜',
     meta: ['CAAR', 'PUZZLE HUNT', '一起想，接着解'],
@@ -106,7 +106,7 @@ export default {
     name: 'CAAR',
     role: '中不正协 · 一个组队解谜的地方',
     intro: [
-      '中国不正常推理协会，简称「中不正协」，英文名是 China Association of Abnormal Reasoning。名字有点长，平时叫我们 CAAR 就好。',
+      '不正常推理协会，简称「中不正协」，英文名是 Abnormal Reasoning Association。名字有点长，平时叫我们 CAAR 就好。',
       '我们因比赛聚在一起。从「无我猪头好」到中不正协，队伍参加过 CCBC、P&KU，也会约上一场周末短赛。有人想冲排名，有人想慢慢体验，报名时先聊清目标和时间，再找合适的队友。',
       '解题时，一张共享表格接住大家的发现：有人查资料，有人攻纸笔，有人盯着几句话反复琢磨。卡住就换个思路、问个提示，或等另一位队友来接棒。完赛之后，群里常常刷起同一句话：「队友太强了！」',
       '我们也站到出题的一边。2026 年 9 月 4 日，成员一起办了第一届「随蓝赛」，把找词、写线索、搭站点的点子做成了一晚上的活动。解别人的题，也让自己的题被大家解开。',
