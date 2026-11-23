@@ -59,7 +59,8 @@ export function reportError(err, extra = {}) {
       keepalive: true,
     }).then((r) => {
       // 被限流就停发一轮窗口：继续重试会把封禁阶梯一路刷上去。
-      // 用时间戳而不是布尔，10 分钟后允许一次探测，防止共享出口上别人的流量把本页永久静音。
+      // 用时间戳而不是布尔：10 分钟后恢复整轮上报（不是只放一条），若仍被限流会再次停发。
+      // 这样共享出口上别人的流量不会把本页永久静音，代价是最多每 10 分钟撞一次限流。
       if (r && (r.status === 429 || r.status === 413)) disabledUntil = Date.now() + PROBE_AFTER_MS
     }).catch(() => {})
   } catch {

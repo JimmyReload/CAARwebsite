@@ -37,6 +37,8 @@ export default function AdminView({ user }) {
   const [logLevel, setLogLevel] = useState('')
   const [logEvent, setLogEvent] = useState('')
   const [logQ, setLogQ] = useState('')
+  // 「输入中」和「已应用」分开：输入框里还没提交的字不该影响 IP/level/event 的即时筛选
+  const [logQApplied, setLogQApplied] = useState('')
   const [logIp, setLogIp] = useState('')
   const [logNext, setLogNext] = useState(0)
   const [logBudget, setLogBudget] = useState(null)
@@ -78,9 +80,9 @@ export default function AdminView({ user }) {
 
   /* 日志查询：filters 显式传入，避免 setState 之后还没生效就发请求 */
   const loadLogs = async (opts = {}) => {
-    const f = { level: logLevel, event: logEvent, q: logQ, ip: logIp, ...(opts.filters || {}) }
+    const f = { level: logLevel, event: logEvent, q: logQApplied, ip: logIp, ...(opts.filters || {}) }
     // 这里不校验 q 长度：IP 按钮、清 chip、切页签都走这个函数，拦住会让人以为筛选失效。
-    // 只在用户主动点「查询」时校验（submitSearch），过短的 q 干脆不发（服务端也会忽略）。
+    // 用的是"已应用"的 q，输入框里没提交的字不参与（否则点 IP 会悄悄叠加一个搜索条件）。
     const q = String(f.q || '').trim()
     setLogLoading(true)
     try {
@@ -107,7 +109,8 @@ export default function AdminView({ user }) {
     e.preventDefault()
     const q = logQ.trim()
     if (q && q.length < 3) { setMsg(t('admin.logs.qTooShort')); return }
-    loadLogs()
+    setLogQApplied(q)
+    loadLogs({ filters: { q } })
   }
 
   /* 清理旧日志：不可恢复，天数与后果都要问清楚。范围与服务端保持一致（7–3650），

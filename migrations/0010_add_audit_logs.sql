@@ -13,6 +13,11 @@
 -- 若某个环境跑过早期版本（e3978d8，当时代码默认建表），它的 id 列仍是
 -- AUTOINCREMENT；CREATE TABLE IF NOT EXISTS 不会改已有表，功能无差异，
 -- 只是与全新环境存在这一点定义分叉。
+--
+-- 关于 event='audit.dropped'：它是"审计写入被预算挡掉"的辅助指标，不是业务事件。
+-- 首条丢弃与分钟汇总都由代码在内存计数里补写，极端情况下会缺行
+-- （isolate 在翻页前被回收、洪水结束后站点彻底静默）。可以用它判断"丢过、大概丢多少"，
+-- 不要当成完整账本。真正无损的账本只有控制台日志，且受平台保留期限制。
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY,                 -- 行号即可做游标：不需要 AUTOINCREMENT 的永不复用保证，省一次序列写
