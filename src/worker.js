@@ -98,23 +98,53 @@ function passwordProblem(pw, username) {
 }
 
 // ---------- 登录节流（D1 原子计数） ----------
-// KV 没有原子自增：并发请求会读到同一个旧值，20 并发只记 1 次。
-// 这里改用 D1 单条 UPSERT 自增（SQLite 语句级原子），并发下每次尝试都会被计入。
-const LOGIN_IP_MAX = 5;        // 同一 IP 允许的尝试次数
-const LOGIN_USER_MAX = 20;     // 同一用户名（非 staff）允许的尝试次数
+// 三层：并发原子性（单语句自增）、归因（按什么键计数）、复位语义（何时清零、封多久）。
+//
+// 计数键：
+//   lf:ipu:<ip>:<user>  同一出口对同一账号 —— 主闸门，阈值低，不牵连同网段其他人
+//   lf:u:<user>         同一账号（跨 IP）—— 防分布式爆破；staff 阈值放宽
+//   lf:ip:<ip>          同一出口总量 —— 防洪泛；阈值高，避免线下共用 Wi-Fi 互相伤害
+//
+// 复位语义：
+//   - 窗口 1 小时 ≫ 封禁上限 15 分钟，保证"按提示等完再试"必然落在重置条件内
+//   - 封禁期内只读不写：否则每次重试都刷新 updated_at，计数永远清不掉（会锁死用户）
+//   - 成功登录只清"本人"的键，不清 IP 计数：否则登录一次就成了攻击者的计数器重置开关
+const LOGIN_IP_MAX = 50;
+const LOGIN_COMBO_MAX = 5;
+const LOGIN_USER_MAX = 20;
+const LOGIN_STAFF_MAX = 60;
 const LOGIN_BLOCK_BASE_MS = 60 * 1000;
 const LOGIN_BLOCK_MAX_MS = 15 * 60 * 1000;
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;  // 计数窗口，超过则重新计数
+const LOGIN_WINDOW_MS = 60 * 60 * 1000;
+const LOGIN_KEEP_MS = 24 * 60 * 60 * 1000; // 计数行保留 24 小时，Cron 清理
 
 let loginSchemaReady = null;
 function ensureLoginSchema(env) {
   if (!loginSchemaReady) {
-    loginSchemaReady = env.DB.prepare(`CREATE TABLE IF NOT EXISTS login_fails (
-      key TEXT PRIMARY KEY,
-      n INTEGER NOT NULL DEFAULT 0,
-      until INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL DEFAULT 0
-    )`).run().catch((err) => { loginSchemaReady = null; throw err; });
+    loginSchemaReady = (async () => {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS login_fails (
+        key TEXT PRIMARY KEY,
+        n INTEGER NOT NULL DEFAULT 0,
+        blocks INTEGER NOT NULL DEFAULT 0,
+        until INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      )`).run();
+      // 旧表没有 blocks 列：兜底补一次（迁移 0009 是正式来源，这里只管"代码先上线、迁移还没跑"的窗口期）
+      //
+      // 不要用 try/catch 猜"列已存在"：ALTER 失败若是别的原因（表被锁、并发 DDL、权限），
+      // 会被当成"一切正常"吞掉，随后 hitLimit 的 UPSERT 报 no such column: blocks，
+      // 又被登录处的 catch 吞掉 —— 限流对所有人静默失效且没有任何信号。先判定，再补，失败必须留痕。
+      const info = await env.DB.prepare('PRAGMA table_info(login_fails)').all();
+      const hasBlocks = (info.results || []).some((c) => c.name === 'blocks');
+      if (!hasBlocks) {
+        try {
+          await env.DB.prepare('ALTER TABLE login_fails ADD COLUMN blocks INTEGER NOT NULL DEFAULT 0').run();
+        } catch (err) {
+          console.error('[login] add blocks column failed, throttling will be skipped:', err && err.message);
+          throw err;
+        }
+      }
+    })().catch((err) => { loginSchemaReady = null; throw err; });
   }
   return loginSchemaReady;
 }
@@ -125,29 +155,45 @@ function clientIp(request) {
 
 /**
  * 记录一次尝试并判断是否超限。返回 { blocked, retry }（retry 为秒）。
- * 先自增再判定：并发请求各自原子自增，超出预算的直接拒绝，不会都挤过闸门。
+ * 1) 已被封禁：只读返回，不写库；
+ * 2) 未封禁：单语句原子自增（并发不丢计数）；
+ * 3) 越过阈值：用 blocks 计"第几次被封"决定时长，`WHERE until <= now` 保证并发下只发一次。
  */
 async function hitLimit(env, key, max) {
   const now = Date.now();
+  const rec = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
+  if (rec && Number(rec.until) > now) {
+    return { blocked: true, retry: Math.max(1, Math.ceil((Number(rec.until) - now) / 1000)) };
+  }
+
   const row = await env.DB.prepare(
-    `INSERT INTO login_fails (key, n, until, updated_at) VALUES (?, 1, 0, ?)
+    `INSERT INTO login_fails (key, n, blocks, until, updated_at) VALUES (?, 1, 0, 0, ?)
      ON CONFLICT(key) DO UPDATE SET
-       n = CASE WHEN ? - login_fails.updated_at > ? THEN 1 ELSE login_fails.n + 1 END,
-       until = CASE WHEN ? - login_fails.updated_at > ? THEN 0 ELSE login_fails.until END,
+       n = CASE WHEN ? - login_fails.updated_at > ? OR (login_fails.until > 0 AND login_fails.until <= ?)
+                THEN 1 ELSE login_fails.n + 1 END,
+       blocks = CASE WHEN ? - login_fails.updated_at > ? THEN 0 ELSE login_fails.blocks END,
+       until = CASE WHEN ? - login_fails.updated_at > ? OR (login_fails.until > 0 AND login_fails.until <= ?)
+                    THEN 0 ELSE login_fails.until END,
        updated_at = ?
-     RETURNING n, until`
-  ).bind(key, now, now, LOGIN_WINDOW_MS, now, LOGIN_WINDOW_MS, now).first();
+     RETURNING n`
+  ).bind(key, now, now, LOGIN_WINDOW_MS, now, now, LOGIN_WINDOW_MS, now, LOGIN_WINDOW_MS, now, now).first();
 
   const n = Number(row && row.n) || 0;
-  const until = Number(row && row.until) || 0;
-  if (until > now) return { blocked: true, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
-  if (n > max) {
-    const step = Math.min(n - max - 1, 10);
-    const wait = Math.min(LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS * Math.pow(2, step));
-    await env.DB.prepare('UPDATE login_fails SET until = ? WHERE key = ?').bind(now + wait, key).run();
-    return { blocked: true, retry: Math.ceil(wait / 1000) };
-  }
-  return { blocked: false, retry: 0 };
+  if (n <= max) return { blocked: false, retry: 0 };
+
+  // 阶梯按"第几次被封"增长：60s → 120s → 240s → …（封禁期内不会重复触发，见上面的只读判断）
+  const upd = await env.DB.prepare(
+    `UPDATE login_fails
+        SET blocks = blocks + 1,
+            until = ? + MIN(?, ? * (1 << MIN(blocks, 8)))
+      WHERE key = ? AND until <= ?
+      RETURNING until`
+  ).bind(now, LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS, key, now).first();
+
+  if (upd) return { blocked: true, retry: Math.ceil((Number(upd.until) - now) / 1000) };
+  const again = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
+  const until = Number(again && again.until) || 0;
+  return { blocked: true, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
 }
 
 async function clearLimit(env, keys) {
@@ -157,6 +203,13 @@ async function clearLimit(env, keys) {
   try {
     await env.DB.prepare(`DELETE FROM login_fails WHERE key IN (${marks})`).bind(...list).run();
   } catch { /* 清理失败不影响主流程 */ }
+}
+
+// Cron：清掉 24 小时没动过的计数行，避免被随机用户名/扫描撑大
+async function pruneLoginFails(env) {
+  try {
+    await env.DB.prepare('DELETE FROM login_fails WHERE updated_at < ?').bind(Date.now() - LOGIN_KEEP_MS).run();
+  } catch { /* 表不存在或清理失败都忽略 */ }
 }
 
 // ---------- 邮箱验证码 ----------
@@ -426,6 +479,7 @@ export default {
           await ensureHuntSchema(env);
           await refreshFeed(env);
         } catch { /* 上游抖动时保留旧快照，下个周期再试 */ }
+        await pruneLoginFails(env);
       })()
     );
   },
@@ -561,26 +615,29 @@ export default {
       const b = await readBody(request);
       const username = String(b.username || '').trim();
       const password = String(b.password || '');
-      // 超长输入直接拒绝：既防 KV/DB 键异常，也防超长口令拖慢 PBKDF2
+      // 超长输入直接拒绝：既防 DB 键异常，也防超长口令拖慢 PBKDF2
       if (username.length > 64 || password.length > PASSWORD_MAX) return json({ error: t('errors.badParams') }, 400);
-      try {
-        await ensureLoginSchema(env);
-      } catch {
-        return json({ error: t('errors.serverError') }, 500);
-      }
-
-      // 先自增再判定：并发请求各自原子计数，超预算的直接 429
-      const ipKey = 'lf:ip:' + clientIp(request);
-      const ipHit = await hitLimit(env, ipKey, LOGIN_IP_MAX);
-      if (ipHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
 
       const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
-      const userKey = 'lf:u:' + username.toLowerCase();
-      // 管理账号不做用户名维度锁定：否则 20 次错误请求就能瘫痪管理台
-      if (!row || !isStaff(row)) {
-        const uHit = await hitLimit(env, userKey, LOGIN_USER_MAX);
+      const lower = username.toLowerCase();
+      const ip = clientIp(request);
+      const comboKey = 'lf:ipu:' + ip + ':' + lower;
+      const ipKey = 'lf:ip:' + ip;
+      const userKey = 'lf:u:' + lower;
+
+      // 限流不可用时降级放行：防御措施不该成为可用性单点（登录仍要靠口令校验兜底）
+      try {
+        await ensureLoginSchema(env);
+        const combo = await hitLimit(env, comboKey, LOGIN_COMBO_MAX);
+        if (combo.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: combo.retry }) }, 429, combo.retry);
+        const userMax = row && isStaff(row) ? LOGIN_STAFF_MAX : LOGIN_USER_MAX;
+        const [ipHit, uHit] = await Promise.all([
+          hitLimit(env, ipKey, LOGIN_IP_MAX),
+          hitLimit(env, userKey, userMax)
+        ]);
+        if (ipHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
         if (uHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
-      }
+      } catch { /* 计数不可用：继续校验口令 */ }
 
       if (!row) {
         // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致
@@ -590,8 +647,8 @@ export default {
       const [salt, hash] = String(row.password).split(':');
       if (!(await verifyPassword(password, salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
       if (row.banned) return json({ error: t('errors.banned') }, 403);
-      // 登录成功清零计数
-      await clearLimit(env, [ipKey, userKey]);
+      // 只清本人的计数：IP 计数若被清掉，登录一次就成了攻击者的"重置开关"
+      await clearLimit(env, [comboKey, userKey]);
       const token = await createSession(env, row.id, row.session_version);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at, email: row.email || null } }, token);
     }
@@ -632,7 +689,7 @@ export default {
       }
       // 改密也校验旧密码：不节流就是一条绕过登录限流的口令猜测通道
       const cpKey = 'cp:u:' + user.id;
-      const cpHit = await hitLimit(env, cpKey, LOGIN_IP_MAX);
+      const cpHit = await hitLimit(env, cpKey, LOGIN_COMBO_MAX);
       if (cpHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: cpHit.retry }) }, 429, cpHit.retry);
 
       const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
@@ -690,6 +747,7 @@ export default {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const b = await readBody(request);
       if (!String(b.title || '').trim() || !String(b.content || '').trim()) return json({ error: t('errors.announceEmpty') }, 400);
+      if (String(b.content).length > 5000) return json({ error: t('errors.announceTooLong') }, 400);
       // 返回完整行：前端可直接插入列表，不必依赖紧随其后的刷新
       const rows = (await env.DB.prepare(
         'INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?) RETURNING *'

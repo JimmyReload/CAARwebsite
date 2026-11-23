@@ -28,7 +28,8 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0005_add_hunt_notifications.sql` | 赛事动态通知表 | 已应用 |
 | `0006_add_email_verification.sql` | `email_codes` + `users.email` | 已应用 |
 | `0007_superadmin.sql` | 把 `admin` 升为 `superadmin` | 已应用 |
-| `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 待应用（执行后补记） |
+| `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 已应用 |
+| `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 待应用 |
 
 > `schema_migrations` 由 **0008** 建立（`schema.sql` 里也有，但那是全新环境用的）。
 > 生产库请先执行 0008，再往里写版本记录：

@@ -477,6 +477,7 @@ export default {
     unauthorized: '未登录',
     adminOnly: '需要管理员权限',
     announceEmpty: '标题和内容不能为空',
+    announceTooLong: '公告正文不能超过 5000 字',
     contentEmpty: '内容不能为空',
     contentTooLong: '内容不能超过 1000 字，请精简后重试',
     badParams: '参数不完整',

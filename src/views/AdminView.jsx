@@ -273,7 +273,7 @@ export default function AdminView({ user }) {
         <>
           <form onSubmit={postAnn} className="msg-form ann-form">
             <label>{t('admin.annForm.titleLabel')} <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength="60" required /></label>
-            <label>{t('admin.annForm.contentLabel')} <textarea value={content} onChange={(e) => setContent(e.target.value)} rows="4" required /></label>
+            <label>{t('admin.annForm.contentLabel')} <textarea value={content} onChange={(e) => setContent(e.target.value)} rows="4" maxLength="5000" required /></label>
             <label className="check"><input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} /> {t('admin.annForm.pinnedLabel')}</label>
             <div className="btn-row">
               <button className="auth-btn" disabled={saving}>
