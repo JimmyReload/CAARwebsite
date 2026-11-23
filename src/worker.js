@@ -118,10 +118,25 @@ const LOGIN_BLOCK_MAX_MS = 15 * 60 * 1000;
 const LOGIN_WINDOW_MS = 60 * 60 * 1000;
 const LOGIN_KEEP_MS = 24 * 60 * 60 * 1000; // 计数行保留 24 小时，Cron 清理
 
+// 结构变更只走 migrations/：这里**不再执行 ALTER**。
+//
+// 运行时补列表面上是"提高可用性"，实际制造三件事：迁移状态不可知、失败被静默、
+// 以及部署窗口内的竞态——多个 isolate 同时 PRAGMA 读到"无 blocks"，同时 ALTER，
+// 只有一个成功，其余报 duplicate column；若那批请求因此跳过限流，就等于在
+// "部署后第一波突发流量"上开了一个无保护的窗口（实测 20 并发放行 19 次）。
+//
+// 所以这里只做检测：缺列就抛带标记的错误，由调用方决定降级方式。
+function loginSchemaMismatch(detail) {
+  const err = new Error('login_fails schema not ready: ' + detail);
+  err.schemaMismatch = true;
+  return err;
+}
+
 let loginSchemaReady = null;
 function ensureLoginSchema(env) {
   if (!loginSchemaReady) {
     loginSchemaReady = (async () => {
+      // 全新库（本地/全新环境）直接按最终结构建表；表已存在时是空操作，不会报错
       await env.DB.prepare(`CREATE TABLE IF NOT EXISTS login_fails (
         key TEXT PRIMARY KEY,
         n INTEGER NOT NULL DEFAULT 0,
@@ -129,20 +144,11 @@ function ensureLoginSchema(env) {
         until INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0
       )`).run();
-      // 旧表没有 blocks 列：兜底补一次（迁移 0009 是正式来源，这里只管"代码先上线、迁移还没跑"的窗口期）
-      //
-      // 不要用 try/catch 猜"列已存在"：ALTER 失败若是别的原因（表被锁、并发 DDL、权限），
-      // 会被当成"一切正常"吞掉，随后 hitLimit 的 UPSERT 报 no such column: blocks，
-      // 又被登录处的 catch 吞掉 —— 限流对所有人静默失效且没有任何信号。先判定，再补，失败必须留痕。
       const info = await env.DB.prepare('PRAGMA table_info(login_fails)').all();
-      const hasBlocks = (info.results || []).some((c) => c.name === 'blocks');
-      if (!hasBlocks) {
-        try {
-          await env.DB.prepare('ALTER TABLE login_fails ADD COLUMN blocks INTEGER NOT NULL DEFAULT 0').run();
-        } catch (err) {
-          console.error('[login] add blocks column failed, throttling will be skipped:', err && err.message);
-          throw err;
-        }
+      const cols = (info.results || []).map((c) => c.name);
+      if (!cols.includes('blocks')) {
+        console.error('[login] login_fails 缺 blocks 列，限流无法工作；请先执行 migrations/0009_add_login_fails_blocks.sql');
+        throw loginSchemaMismatch('missing column blocks');
       }
     })().catch((err) => { loginSchemaReady = null; throw err; });
   }
@@ -637,7 +643,14 @@ export default {
         ]);
         if (ipHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
         if (uHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
-      } catch { /* 计数不可用：继续校验口令 */ }
+      } catch (err) {
+        if (err && err.schemaMismatch) {
+          // 结构没就位：宁可暂时不可用，也不在"限流失效"的状态下接收口令
+          return json({ error: t('errors.throttleUnavailable') }, 503);
+        }
+        // 其他失败（D1 抖动等）仍降级放行：限流不该成为可用性单点
+        console.error('[login] throttle unavailable, fallback to password check:', err && err.message);
+      }
 
       if (!row) {
         // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致

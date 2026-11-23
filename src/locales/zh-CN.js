@@ -469,6 +469,7 @@ export default {
     passwordTooLong: '密码过长，请控制在 200 字符以内',
     bodyTooLarge: '请求内容过大',
     tooManyAttempts: '尝试次数过多，请 {n} 秒后再试',
+    throttleUnavailable: '登录服务暂时不可用，请稍后重试',
     usernameTaken: '该用户名已被注册',
     badCredentials: '用户名或密码错误',
     banned: '该账号已被封禁，请联系管理员',
