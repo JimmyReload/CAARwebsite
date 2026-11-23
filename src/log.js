@@ -29,8 +29,13 @@ const MAX_STACK = 1200
 // 两段式：精确名单负责普通词，后缀规则负责 camelCase / snake_case 变体
 // （confirmPassword / verificationCode / authToken / apiKey 这类），
 // 同时放过 error_code / status_code 这类"叫 code 但不是凭据"的字段。
-const SENSITIVE_KEY = /^(password|passwd|pwd|secret|token|session|code|code_hash|salt|hash|authorization|cookie)$/i
-const SENSITIVE_SUFFIX = /(password|passwd|pwd|token|secret|code|salt|hash|cookie|api[_-]?key)$/i
+//
+// 这是**约定式**覆盖，不是完备的：按 key 结尾识别，所以 `newPasswordConfirm`
+// 这类"敏感词在中间"的命名仍会漏。新字段请沿用 password/passwd/pwd/token/
+// secret/code/salt/hash/cookie/jwt/otp/csrf 结尾，这条约定比正则更可靠。
+// 误伤方向（postcode、decode 被打码）是安全的，不用处理。
+const SENSITIVE_KEY = /^(password|passwd|pwd|secret|token|session|session_?id|code|code_hash|salt|hash|authorization|cookie|jwt|otp|csrf)$/i
+const SENSITIVE_SUFFIX = /(password|passwd|pwd|token|secret|code|salt|hash|cookie|api[_-]?key|jwt|otp|csrf)$/i
 const SAFE_CODE = /^(error|err|status|http|result)_?code$/i
 
 export function isSensitiveKey(key) {
@@ -189,14 +194,19 @@ export function bootstrapAuditSchema(env) {
   return bootstrapReady
 }
 
-// 写入预算：每个 isolate 每分钟最多 N 条非关键事件。**关键事件不受限**，
-// 否则洪水期间被封禁、改密、授权这类事件会被静默挤掉，事后追责出现空洞。
-// 丢弃本身必须留痕（audit.dropped），否则「少了一行」无从判断是没发生还是被丢。
+// 写入预算（每个 isolate、每分钟）：
+//   非关键事件 120 条；关键事件 600 条 —— **有上限，不是"不限"**：
+//   request.error 可以由外部请求触发，完全放行就等于留了一条不限速的 D1 写通道。
+// 丢弃必须留痕：每分钟第一条丢弃放行一行 audit.dropped 落库。
+// 只打 console 等于回到静默——console 有采样与保留期，事后查不到"那个窗口丢了多少"。
 const CRITICAL_EVENT = /^(admin\.|auth\.password\.|request\.error|cron\.)/
-let auditBudget = { minute: -1, n: 0, dropped: 0 }
+const DROPPED_EVENT = 'audit.dropped'
+const AUDIT_CRITICAL_PER_MIN = 600
+
+let auditBudget = { minute: -1, n: 0, crit: 0, dropped: 0 }
 
 export function auditBudgetSnapshot() {
-  return { minute: auditBudget.minute, n: auditBudget.n, dropped: auditBudget.dropped }
+  return { ...auditBudget }
 }
 
 // 表缺失只在首次与每 10 分钟提醒一次，避免迁移没跑时每个请求刷一行
@@ -206,8 +216,8 @@ function clampStr(v, n) {
   return String(v == null ? '' : v).slice(0, n)
 }
 
-// meta 必须是合法 JSON：超限时不做硬切（会切在字符串中间产出非法 JSON 和半个值），
-// 改为保留预览 + 标记，保证这条记录仍可结构化读出「被截断了」。
+// meta 必须是合法 JSON，且长度必须真的收敛在 AUDIT_MAX_META 内。
+// 注意 preview 在序列化时会把 " 和 \ 翻倍，所以要在"最终字符串"上收敛，不能只算原始长度。
 export function metaJson(value) {
   let raw
   try {
@@ -217,11 +227,63 @@ export function metaJson(value) {
   }
   if (!raw || raw === '{}') return ''
   if (raw.length <= AUDIT_MAX_META) return raw
-  return JSON.stringify({
-    _truncated: true,
-    _size: raw.length,
-    preview: raw.slice(0, AUDIT_MAX_META - 80)
-  })
+
+  const size = raw.length
+  // 切点可能落在转义序列中间，先把尾部半截的 " 或 \ 去掉
+  let head = raw.slice(0, AUDIT_MAX_META - 80).replace(/[\\"]+$/, '')
+  let out = JSON.stringify({ _truncated: true, _size: size, preview: head })
+  while (out.length > AUDIT_MAX_META && head.length > 0) {
+    const excess = out.length - AUDIT_MAX_META
+    head = head.slice(0, Math.max(0, head.length - Math.ceil(excess / 2) - 8)).replace(/[\\"]+$/, '')
+    out = JSON.stringify({ _truncated: true, _size: size, preview: head })
+  }
+  return out.length <= AUDIT_MAX_META ? out : JSON.stringify({ _truncated: true, _size: size })
+}
+
+// 单条落库。所有写入（含 audit.dropped）都走这里，异常一律降级成控制台日志。
+async function writeRow(env, rec, event, level) {
+  try {
+    if (String(env.AUDIT_BOOTSTRAP || '') === '1') await bootstrapAuditSchema(env)
+    await env.DB.prepare(
+      `INSERT INTO audit_logs
+         (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      Date.now(),
+      level,
+      event,
+      rec.actor_id == null || rec.actor_id === '' ? null : Number(rec.actor_id) || null,
+      clampStr(rec.actor_name, 40),
+      clampStr(rec.target_type, 24),
+      clampStr(rec.target_id, 64),
+      clampStr(rec.ip, 64),
+      clampStr(rec.method, 12),
+      clampStr(rec.path, 160),
+      Number(rec.status) || 0,
+      clampStr(rec.rid, 80),
+      clampStr(rec.ua, 160),
+      metaJson(rec.meta)
+    ).run()
+    auditMissingAt = 0
+  } catch (err) {
+    // 审计失败只能降级成控制台日志：不能把异常抛回请求路径
+    const msg = String((err && err.message) || '')
+    if (/no such table/i.test(msg)) {
+      if (Date.now() - auditMissingAt > 10 * 60 * 1000) {
+        auditMissingAt = Date.now()
+        try {
+          console.warn(safeStringify({
+            ts: new Date().toISOString(), level: 'warn', event: 'audit.table.missing',
+            hint: '执行 migrations/0010_add_audit_logs.sql（或临时设 AUDIT_BOOTSTRAP=1）'
+          }))
+        } catch { /* 彻底放弃 */ }
+      }
+      return
+    }
+    try {
+      console.warn(safeStringify({ ts: new Date().toISOString(), level: 'warn', event: 'audit.write.fail', err: describeError(err) }))
+    } catch { /* 彻底放弃 */ }
+  }
 }
 
 /**
@@ -241,65 +303,40 @@ export function audit(env, ctx, rec) {
 
     const event = clampStr(rec.event || 'unknown', 64)
     const minute = Math.floor(Date.now() / 60000)
-    if (auditBudget.minute !== minute) auditBudget = { minute, n: 0, dropped: 0 }
-
-    if (!CRITICAL_EVENT.test(event) && auditBudget.n >= AUDIT_BUDGET_PER_MIN) {
-      if (auditBudget.dropped === 0) {
-        console.warn(safeStringify({
-          ts: new Date().toISOString(), level: 'warn', event: 'audit.dropped',
-          budgetPerMin: AUDIT_BUDGET_PER_MIN, minute
-        }))
-      }
-      auditBudget.dropped += 1
-      return
-    }
-    auditBudget.n += 1
+    if (auditBudget.minute !== minute) auditBudget = { minute, n: 0, crit: 0, dropped: 0 }
 
     const level = ['debug', 'info', 'warn', 'error'].includes(rec.level) ? rec.level : 'info'
 
-    try {
-      if (String(env.AUDIT_BOOTSTRAP || '') === '1') await bootstrapAuditSchema(env)
-      await env.DB.prepare(
-        `INSERT INTO audit_logs
-           (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        Date.now(),
-        level,
-        event,
-        rec.actor_id == null || rec.actor_id === '' ? null : Number(rec.actor_id) || null,
-        clampStr(rec.actor_name, 40),
-        clampStr(rec.target_type, 24),
-        clampStr(rec.target_id, 64),
-        clampStr(rec.ip, 64),
-        clampStr(rec.method, 12),
-        clampStr(rec.path, 160),
-        Number(rec.status) || 0,
-        clampStr(rec.rid, 80),
-        clampStr(rec.ua, 160),
-        metaJson(rec.meta)
-      ).run()
-      auditMissingAt = 0
-    } catch (err) {
-      // 审计失败只能降级成控制台日志：不能把异常抛回请求路径
-      const msg = String((err && err.message) || '')
-      const missing = /no such table/i.test(msg)
-      if (missing) {
-        if (Date.now() - auditMissingAt > 10 * 60 * 1000) {
-          auditMissingAt = Date.now()
+    // audit.dropped 自己不受预算约束，否则丢弃记录会被丢弃（递归）
+    if (event !== DROPPED_EVENT) {
+      const critical = CRITICAL_EVENT.test(event)
+      const cap = critical ? AUDIT_CRITICAL_PER_MIN : AUDIT_BUDGET_PER_MIN
+      const used = critical ? auditBudget.crit : auditBudget.n
+      if (used >= cap) {
+        auditBudget.dropped += 1
+        if (auditBudget.dropped === 1) {
           try {
             console.warn(safeStringify({
-              ts: new Date().toISOString(), level: 'warn', event: 'audit.table.missing',
-              hint: '执行 migrations/0010_add_audit_logs.sql（或临时设 AUDIT_BOOTSTRAP=1）'
+              ts: new Date().toISOString(), level: 'warn', event: DROPPED_EVENT,
+              budgetPerMin: AUDIT_BUDGET_PER_MIN, criticalPerMin: AUDIT_CRITICAL_PER_MIN, minute
             }))
           } catch { /* 彻底放弃 */ }
+          // 每分钟放行一条：让"丢了多少"在 D1 里查得到
+          await writeRow(env, {
+            level: 'warn',
+            meta: {
+              minute, kind: critical ? 'critical' : 'normal',
+              budgetPerMin: AUDIT_BUDGET_PER_MIN, criticalPerMin: AUDIT_CRITICAL_PER_MIN
+            }
+          }, DROPPED_EVENT, 'warn')
         }
         return
       }
-      try {
-        console.warn(safeStringify({ ts: new Date().toISOString(), level: 'warn', event: 'audit.write.fail', err: describeError(err) }))
-      } catch { /* 彻底放弃 */ }
+      if (critical) auditBudget.crit += 1
+      else auditBudget.n += 1
     }
+
+    await writeRow(env, rec, event, level)
   })()
 
   if (ctx && typeof ctx.waitUntil === 'function') {

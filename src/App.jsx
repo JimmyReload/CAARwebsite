@@ -307,7 +307,14 @@ function Home() {
           </aside>
         </div>
 
-        <div className="join-foot"><span>{contact.footer}</span></div>
+        <div className="join-foot">
+          <span>{contact.footer}</span>
+          {/* 隐私说明：折叠在页脚，不抢视觉，但比藏在条款页里更容易被看到 */}
+          <details className="privacy">
+            <summary>{t('privacy.title')}</summary>
+            <p>{t('privacy.body')}</p>
+          </details>
+        </div>
       </footer>
     </main>
     <nav className="page-dots" aria-label={t('pageNavigation.label')}>

@@ -461,11 +461,14 @@ export default {
       allEvents: '全部事件',
       hint: '记录登录、改密、授权、封禁、公告变更与异常；更细的请求日志在 Cloudflare 控制台的 Workers Logs。',
       summary: '全部事件近 24 小时 {total} 条：error {error} · warn {warn} · info {info}；保留 {days} 天',
-      dropped: '另有 {n} 条超出写入预算未落库（仅存控制台）',
+      dropped: '本实例本分钟另有 {n} 条超出预算未落库（已记 audit.dropped）',
       clientTag: '客户端上报',
       empty: '没有符合条件的日志',
       anon: '匿名 / 未登录',
       detail: '详情',
+      filterByIp: '只看这个 IP',
+      ipChip: 'IP: {ip} ✕',
+      qTooShort: '搜索至少 3 个字符（避免全表扫描）',
       more: '加载更多',
       purge: '清理旧日志',
       purgePrompt: '只保留最近多少天的日志？（默认 {days}，最小 7，最大 3650）',
@@ -473,6 +476,12 @@ export default {
       purgeConfirm: '将永久删除 {days} 天之前的日志，确定继续？',
       purged: '已清理 {n} 条旧日志',
     },
+  },
+
+  /* ---------- 日志与隐私（页脚折叠说明） ---------- */
+  privacy: {
+    title: '日志与隐私',
+    body: '为安全与排障，访问本站会记录时间、路径、状态码、IP 与浏览器标识；登录、改密、授权等账号操作会额外记录操作者。审计记录保留 90 天，仅管理员可查，不用于广告或对外提供；页面报错上报不含表单内容、密码与链接参数。',
   },
 
   /* ---------- 前端 API 封装 ---------- */

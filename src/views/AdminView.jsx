@@ -37,6 +37,7 @@ export default function AdminView({ user }) {
   const [logLevel, setLogLevel] = useState('')
   const [logEvent, setLogEvent] = useState('')
   const [logQ, setLogQ] = useState('')
+  const [logIp, setLogIp] = useState('')
   const [logNext, setLogNext] = useState(0)
   const [logBudget, setLogBudget] = useState(null)
   const [logLoading, setLogLoading] = useState(false)
@@ -77,13 +78,17 @@ export default function AdminView({ user }) {
 
   /* 日志查询：filters 显式传入，避免 setState 之后还没生效就发请求 */
   const loadLogs = async (opts = {}) => {
-    const f = { level: logLevel, event: logEvent, q: logQ, ...(opts.filters || {}) }
+    const f = { level: logLevel, event: logEvent, q: logQ, ip: logIp, ...(opts.filters || {}) }
+    const q = String(f.q || '').trim()
+    // 服务端对 <3 字会忽略 q（前导通配太贵），前端直接拦住，避免「搜了 2 字却显示全部」
+    if (q.length > 0 && q.length < 3) { setMsg(t('admin.logs.qTooShort')); return }
     setLogLoading(true)
     try {
       const qs = new URLSearchParams()
       if (f.level) qs.set('level', f.level)
       if (f.event) qs.set('event', f.event)
-      if (f.q && f.q.trim()) qs.set('q', f.q.trim())
+      if (f.ip) qs.set('ip', f.ip)
+      if (q) qs.set('q', q)
       if (opts.append && logNext) qs.set('before', String(logNext))
       const d = await api('/admin/logs' + (qs.toString() ? '?' + qs.toString() : ''))
       setLogs((old) => (opts.append ? old.concat(d.list || []) : (d.list || [])))
@@ -445,6 +450,15 @@ export default function AdminView({ user }) {
             <button className="mini-btn" type="submit" disabled={logLoading}>
               {logLoading ? t('admin.logs.loading') : t('admin.logs.query')}
             </button>
+            {logIp ? (
+              <button
+                className="mini-btn"
+                type="button"
+                onClick={() => { setLogIp(''); loadLogs({ filters: { ip: '' } }) }}
+              >
+                {t('admin.logs.ipChip', { ip: logIp })}
+              </button>
+            ) : null}
             {iAmSuper && (
               <button className="mini-btn mini-btn--danger" type="button" onClick={purgeLogs}>
                 {t('admin.logs.purge')}
@@ -479,7 +493,17 @@ export default function AdminView({ user }) {
                       {row.actor_id ? ' #' + row.actor_id : ''}
                       {row.status ? ' · ' + row.status : ''}
                       {row.path ? ' · ' + (row.method || 'GET') + ' ' + row.path : ''}
-                      {row.ip ? ' · ' + row.ip : ''}
+                      {row.ip ? ' · ' : ''}
+                      {row.ip ? (
+                        <button
+                          type="button"
+                          className="log-ip"
+                          title={t('admin.logs.filterByIp')}
+                          onClick={() => { setLogIp(row.ip); loadLogs({ filters: { ip: row.ip } }) }}
+                        >
+                          {row.ip}
+                        </button>
+                      ) : null}
                       {row.target_type ? ' · ' + row.target_type + (row.target_id ? ':' + row.target_id : '') : ''}
                     </div>
                     {/* rid 是和控制台日志（wrangler tail / Workers Logs）对账的唯一钥匙，必须能看到 */}

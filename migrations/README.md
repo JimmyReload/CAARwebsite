@@ -15,9 +15,12 @@
 SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会直接报错并中断整批。
 `0002`、`0006` 都含 `ALTER TABLE`，属于**一次性**迁移。
 
-代码里 `worker.js` 的 `ensureEmailSchema` / `ensureHuntSchema` / `log.js` 的 `ensureAuditSchema` 是兜底：
-只在表/列缺失时补建，用来避免「代码先上线、迁移还没跑」的窗口期 500。
-它们**不能替代**迁移，也不处理 `ALTER` 失败。
+`worker.js` 的 `ensureEmailSchema` / `ensureHuntSchema` 是兜底：只在表/列缺失时补建，
+用来避免「代码先上线、迁移还没跑」的窗口期 500。它们**不能替代**迁移，也不处理 `ALTER` 失败。
+
+审计表不一样：`log.js` 默认**不建表**（日志系统不该在请求路径上跑 DDL）。没跑 `0010` 时，
+`/api/admin/logs` 会返回 500 并提示执行迁移，写入只落控制台。确实需要先上线后补迁移时，
+可临时设 `AUDIT_BOOTSTRAP=1` 让代码兜底建表，建完立刻取消。
 
 ## 执行记录（截至 2026-11-23）
 

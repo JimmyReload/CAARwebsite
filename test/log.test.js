@@ -13,7 +13,8 @@ test('敏感键全被脱敏', () => {
   const keys = [
     'password', 'old_password', 'new_password', 'confirmPassword', 'passwd', 'pwd',
     'secret', 'token', 'authToken', 'refreshToken', 'code', 'emailCode', 'verificationCode',
-    'code_hash', 'salt', 'hash', 'authorization', 'cookie', 'api_key', 'apiKey'
+    'code_hash', 'salt', 'hash', 'authorization', 'cookie', 'api_key', 'apiKey',
+    'otp', 'csrf', 'csrfToken', 'jwt', 'sessionId', 'session_id'
   ]
   const input = {}
   for (const k of keys) input[k] = 'leak-me'
@@ -85,6 +86,17 @@ test('meta 超限仍是合法 JSON', () => {
   assert.equal(parsed._truncated, true)
   assert.ok(parsed._size > 2000)
   assert.ok(big.length <= 2000)
+})
+
+test('meta 截断在转义膨胀下也不越界', () => {
+  // 引号和反斜杠在序列化时翻倍：只算原始长度会在最终字符串上突破上限
+  for (const filler of ['"', '\\\\']) {
+    const wide = {}
+    for (let i = 0; i < 40; i++) wide['k' + i] = filler.repeat(200)
+    const out = metaJson(wide)
+    assert.ok(out.length <= 2000, '超长: ' + out.length)
+    assert.doesNotThrow(() => JSON.parse(out))
+  }
 })
 
 test('meta 为空时返回空串', () => {

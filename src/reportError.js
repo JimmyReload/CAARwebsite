@@ -3,18 +3,20 @@
    ----------------------------------------------------------
    浏览器里的报错只有用户遇到，服务端看不到：不收集就等于没发生。
    约束：
-   - 每 60 秒最多 8 条，按 message 去重 —— 渲染循环里的同一个错会反复触发，
-     不去重会把接口刷满（服务端还有按 IP 的限流兜底）。
-     用时间窗而不是「整页 8 条」，否则长会话后段真正的错误发不出去。
+   - 每 10 分钟最多 8 条，按 message 去重 —— 渲染循环里的同一个错会反复触发，
+     不去重会把接口刷满。用时间窗而不是「整页 8 条」，否则长会话后段真正的错误发不出去。
+   - 节奏必须低于服务端阈值（120 次/小时），被 429 后整页闭嘴：
+     否则一个持续报错的页面会把自己这个出口（可能是共享 NAT）封掉。
    - 用 keepalive：页面正在卸载时也能把最后一条发出去。
    - 上报失败必须静默：日志系统不能把页面再搞崩一次。
    ========================================================== */
 
-const WINDOW_MS = 60 * 1000
+const WINDOW_MS = 10 * 60 * 1000
 const MAX_PER_WINDOW = 8
 
 let windowStart = 0
 let sent = 0
+let disabled = false
 const seen = new Set()
 
 function resetIfNeeded(now) {
@@ -26,6 +28,7 @@ function resetIfNeeded(now) {
 
 export function reportError(err, extra = {}) {
   try {
+    if (disabled) return
     const now = Date.now()
     resetIfNeeded(now)
     if (sent >= MAX_PER_WINDOW) return
@@ -52,6 +55,9 @@ export function reportError(err, extra = {}) {
       body,
       credentials: 'same-origin',
       keepalive: true,
+    }).then((r) => {
+      // 被限流就整页停用：继续重试会把封禁阶梯一路刷上去
+      if (r && (r.status === 429 || r.status === 413)) disabled = true
     }).catch(() => {})
   } catch {
     /* 上报失败就放弃 */

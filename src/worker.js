@@ -644,7 +644,9 @@ const app = {
       const ipHead = clientIp(request);
       try {
         await ensureLoginSchema(env);
-        const hit = await hitLimit(env, 'cl:ip:' + ipHead, 20);
+        // 阈值要和客户端节奏匹配：前端 8 条/10 分钟 ≈ 48 条/小时，这里给 120。
+        // 用 20 的话，一个持续报错的页面 7 分钟就把自己封掉，反而挡掉真实错误。
+        const hit = await hitLimit(env, 'cl:ip:' + ipHead, 120);
         if (hit.blocked) return json({ ok: false }, 429);
       } catch { /* 限流表不可用不拦上报 */ }
 
@@ -1360,7 +1362,12 @@ const app = {
       let removed = 0;
       try {
         removed = await pruneAuditLogs(env, days);
-      } catch {
+      } catch (err) {
+        // 与 admin/logs 保持一致：同一个根因给同一句可操作的提示
+        if (/no such table/i.test(String((err && err.message) || ''))) {
+          return json({ error: t('errors.logsTableMissing') }, 500);
+        }
+        log.error('admin.logs.purge.fail', { err: describeError(err) });
         return json({ error: t('errors.serverError') }, 500);
       }
       io.audit('admin.logs.purge', { level: 'warn', status: 200, meta: { days, removed } });
