@@ -97,5 +97,22 @@ export async function postLogin(worker, env, { username, password, ip }) {
     body: JSON.stringify({ username, password })
   }), env, ctx)
   const body = await res.json().catch(() => ({}))
-  return { status: res.status, body, retryAfter: res.headers.get('retry-after') }
+  return {
+    status: res.status,
+    body,
+    retryAfter: res.headers.get('retry-after'),
+    setCookie: res.headers.get('set-cookie') || ''
+  }
+}
+
+// 生成与 worker.js 相同格式（hex 盐:hex 哈希，PBKDF2-SHA256/100k/256bit）的口令哈希，
+// 用于打通"登录成功"这条路径——否则只能测到失败分支
+export async function pbkdf2Hash(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256
+  )
+  const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('')
+  return hex(salt) + ':' + hex(bits)
 }

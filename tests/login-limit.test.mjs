@@ -1,37 +1,13 @@
 // 登录节流的不变量测试
 //
-// 用 node:sqlite 实现一个最小 D1 适配层（prepare/bind/first/all/run），
-// 直接驱动 src/loginLimit.js 里的真实 SQL —— 不复制 SQL，避免测试与实现漂移。
+// 用 node:sqlite 驱动 src/loginLimit.js 里的真实 SQL —— 不复制 SQL，避免测试与实现漂移。
+// D1 适配层统一放在 tests/helpers/d1.mjs，各测试文件共用一份，避免两份实现悄悄分叉。
 //
 // 覆盖的是前几轮审计里"只能靠手工构造并发和时钟才能发现"的三类问题：
 // 阈值语义、封禁期内只读、退避阶梯与复位，以及缺列时的 fail-closed 信号。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { DatabaseSync } from 'node:sqlite'
-
-// ---------- 最小 D1 适配层 ----------
-function makeD1() {
-  const db = new DatabaseSync(':memory:')
-  const stmt = (sql, args) => ({
-    bind: (...a) => stmt(sql, a),
-    async first() {
-      const row = db.prepare(sql).get(...args)
-      return row === undefined ? null : { ...row }
-    },
-    async all() {
-      return { results: db.prepare(sql).all(...args).map((r) => ({ ...r })) }
-    },
-    async run() {
-      const r = db.prepare(sql).run(...args)
-      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } }
-    }
-  })
-  return {
-    _raw: db,
-    prepare: (sql) => stmt(sql, []),
-    async batch(list) { return Promise.all(list.map((s) => s.run())) }
-  }
-}
+import { makeD1 } from './helpers/d1.mjs'
 
 // ensureLoginSchema 在模块内缓存就绪状态，各用例需要独立实例
 let bust = 0
