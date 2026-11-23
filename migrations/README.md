@@ -15,8 +15,9 @@
 SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会直接报错并中断整批。
 `0002`、`0006` 都含 `ALTER TABLE`，属于**一次性**迁移。
 
-代码里 `worker.js` 的 `ensureEmailSchema` / `ensureHuntSchema` 是兜底：只在表/列缺失时补建，
-用来避免「代码先上线、迁移还没跑」的窗口期 500。它们**不能替代**迁移，也不处理 `ALTER` 失败。
+代码里 `worker.js` 的 `ensureEmailSchema` / `ensureHuntSchema` / `log.js` 的 `ensureAuditSchema` 是兜底：
+只在表/列缺失时补建，用来避免「代码先上线、迁移还没跑」的窗口期 500。
+它们**不能替代**迁移，也不处理 `ALTER` 失败。
 
 ## 执行记录（截至 2026-11-23）
 
@@ -30,6 +31,9 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0007_superadmin.sql` | 把 `admin` 升为 `superadmin` | 已应用 |
 | `0008_add_schema_migrations_and_login_fails.sql` | `schema_migrations` + `login_fails` | 已应用 |
 | `0009_add_login_fails_blocks.sql` | `login_fails.blocks`（退避阶梯按"第几次被封"计） | 待应用 |
+| `0010_add_audit_logs.sql` | `audit_logs`（审计流水，默认保留 90 天） | 待应用 |
+
+> `0010` 只依赖 `0008` 建好的 `schema_migrations`，与 `0009` 互不依赖，应用顺序不分先后。
 
 > `schema_migrations` 由 **0008** 建立（`schema.sql` 里也有，但那是全新环境用的）。
 > 生产库请先执行 0008，再往里写版本记录：

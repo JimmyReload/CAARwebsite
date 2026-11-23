@@ -116,3 +116,27 @@ CREATE TABLE IF NOT EXISTS login_fails (
   until INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL DEFAULT 0
 );
+
+-- 审计流水：登录/注册/改密、管理操作、公告变更、异常与前端报错
+-- 控制台日志负责「全量排障」，这张表负责「事后追责」，按保留期清理（默认 90 天）
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  level TEXT NOT NULL DEFAULT 'info',
+  event TEXT NOT NULL,
+  actor_id INTEGER,
+  actor_name TEXT NOT NULL DEFAULT '',
+  target_type TEXT NOT NULL DEFAULT '',
+  target_id TEXT NOT NULL DEFAULT '',
+  ip TEXT NOT NULL DEFAULT '',
+  method TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  status INTEGER NOT NULL DEFAULT 0,
+  rid TEXT NOT NULL DEFAULT '',
+  ua TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_level_ts ON audit_logs(level, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_logs(event, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id, ts DESC);

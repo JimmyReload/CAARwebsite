@@ -4,6 +4,10 @@
 // 所有面向用户的提示文案统一取自 locales/zh-CN.js
 import { t } from './i18n'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts'
+import {
+  createLogger, describeError, requestMeta, maskEmail,
+  audit, ensureAuditSchema, pruneAuditLogs, auditKeepDays, escapeLike
+} from './log'
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -469,22 +473,105 @@ async function huntInterestCount(env, huntId) {
   return row ? Number(row.n) || 0 : 0;
 }
 
+// 审计表按保留期清理：每个 isolate 最多 6 小时做一次，避免每 10 分钟的 Cron 都发删除语句
+let lastAuditPrune = 0;
+async function maybePruneAudit(env, log) {
+  if (Date.now() - lastAuditPrune < 6 * 60 * 60 * 1000) return;
+  lastAuditPrune = Date.now();
+  try {
+    const removed = await pruneAuditLogs(env);
+    if (removed) log.info('audit.prune', { removed, keepDays: auditKeepDays(env) });
+  } catch (err) {
+    log.warn('audit.prune.fail', { err: describeError(err) });
+  }
+}
+
 // ---------- 主路由 ----------
-export default {
+const app = {
   // Cron Trigger：每 10 分钟把 puzzle.cat 的快照写进 D1，用户请求只读库
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
+        const log = createLogger(env, { job: 'cron' });
         try {
           await ensureHuntSchema(env);
           await refreshFeed(env);
-        } catch { /* 上游抖动时保留旧快照，下个周期再试 */ }
+        } catch (err) {
+          // 上游抖动时保留旧快照、下个周期再试，但错误必须留档：
+          // 否则「赛事列表一直不更新」只能靠猜
+          log.error('cron.feed.fail', { err: describeError(err) });
+          await audit(env, null, {
+            event: 'cron.feed.fail', level: 'error', path: '/__scheduled', meta: { err: describeError(err) }
+          });
+        }
         await pruneLoginFails(env);
+        await maybePruneAudit(env, log);
       })()
     );
   },
 
+  /**
+   * 所有请求的统一入口：注入 request id、捕获未处理异常、输出访问日志。
+   * 业务逻辑在 handle() 里；除日志/响应头外不要往这里加东西。
+   */
   async fetch(request, env, ctx) {
+    const started = Date.now();
+    const url = new URL(request.url);
+    // cf-ray 与 Cloudflare 平台日志天然对得上；本地调试没有就自己生成
+    const rid = String(request.headers.get('cf-ray') || '').trim() || crypto.randomUUID();
+    const log = createLogger(env, { rid });
+    const meta = requestMeta(request);
+
+    // 业务代码用 io.audit(...) 记账：自动补齐请求上下文与操作者，调用处只写业务字段
+    const io = {
+      rid,
+      log,
+      actor: null,
+      audit(event, rec = {}) {
+        const { actor, ...rest } = rec;
+        const who = actor || io.actor;
+        return audit(env, ctx, {
+          event,
+          rid,
+          ...meta,
+          actor_id: who ? who.id : null,
+          actor_name: who ? (who.nickname || who.username || '') : '',
+          ...rest
+        });
+      }
+    };
+
+    let res;
+    try {
+      res = await app.handle(request, env, ctx, io);
+    } catch (err) {
+      // 兜底：未捕获异常必须留痕，同时给用户一个体面的响应（不泄露堆栈）
+      log.error('http.unhandled', { err: describeError(err), uid: io.actor ? io.actor.id : 0 });
+      io.audit('request.error', { level: 'error', status: 500, meta: { err: describeError(err) } });
+      res = json({ error: t('errors.serverError') }, 500);
+    }
+
+    const ms = Date.now() - started;
+    const isApi = url.pathname.startsWith('/api/');
+    const status = res.status;
+    const line = { status, ms, uid: io.actor ? io.actor.id : 0, role: io.actor ? io.actor.role : '' };
+    // 静态资源 2xx 不写访问日志（量大且无信息量）；慢请求与错误一律留痕
+    if (isApi || status >= 400 || ms >= 800) log.info('http.request', line);
+    else log.debug('http.request', line);
+
+    try {
+      res.headers.set('x-request-id', rid);
+      const prev = res.headers.get('server-timing');
+      res.headers.set('server-timing', (prev ? prev + ', ' : '') + 'app;dur=' + ms);
+    } catch { /* 响应头不可写（极少见）时放弃，不影响正文 */ }
+
+    return res;
+  },
+
+  // 业务实现：入口（上面的 fetch）只负责 request id、异常兜底与访问日志，
+  // 真正的路由逻辑都在这里。拆成两个方法是为了让入口保持"薄"，不掺业务。
+  async handle(request, env, ctx, io) {
+    const log = io.log;
     const url = new URL(request.url);
 
     if (!url.pathname.startsWith('/api/')) {
@@ -526,8 +613,34 @@ export default {
       if (len > MAX_BODY_BYTES) return json({ error: t('errors.bodyTooLarge') }, 413);
     }
     const user = await getSessionUser(env, getCookie(request));
+    // 让访问日志与审计记录带上操作者（未登录则为 null）
+    io.actor = user;
 
     // ---------- 公开 ----------
+    // 前端异常上报：浏览器里的报错只有用户遇到，不收集就等于没有
+    // 限流按 IP 计（同一出口 20 次后封 1 分钟起），并受审计写入预算保护
+    if (path === 'log/client' && method === 'POST') {
+      const ipHead = clientIp(request);
+      try {
+        await ensureLoginSchema(env);
+        const hit = await hitLimit(env, 'cl:ip:' + ipHead, 20);
+        if (hit.blocked) return json({ ok: false }, 429);
+      } catch { /* 限流表不可用不拦上报 */ }
+
+      const b = await readBody(request);
+      const message = String(b.message || '').slice(0, 300);
+      if (!message) return json({ ok: true });
+      const level = b.level === 'warn' ? 'warn' : 'error';
+      const payload = {
+        message,
+        stack: String(b.stack || '').slice(0, 1200),
+        url: String(b.url || '').slice(0, 200)
+      };
+      log.warn('client.error', payload);
+      io.audit('client.error', { level, status: 0, meta: payload });
+      return json({ ok: true });
+    }
+
     // 发送邮箱验证码（注册 / 绑定邮箱共用）
     if (path === 'email-code' && method === 'POST') {
       const b = await readBody(request);
@@ -576,6 +689,12 @@ export default {
         // 发信失败：把刚写入的码作废，避免用户拿着收不到的码干等
         await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE email = ? AND purpose = ? AND expires_at = ?').bind(email, purpose, expiresAt).run();
         const reason = String(err && err.message || '');
+        // 邮件通道挂了是「用户注册不了」的常见原因，必须能在日志里一眼看到
+        log.error('mail.send.fail', { purpose, reason });
+        io.audit('mail.send.fail', {
+          level: 'error', status: 502, target_type: 'email', target_id: maskEmail(email),
+          meta: { purpose, reason }
+        });
         return json({ error: reason === 'MAIL_NOT_CONFIGURED' ? t('errors.mailNotConfigured') : t('errors.mailFailed') }, 502);
       }
       return json({ ok: true, ttl: Math.round(CODE_TTL_MS / 1000) });
@@ -606,8 +725,15 @@ export default {
       const v = await verifyCode(env, email, 'register', code);
       if (!v.ok) return json({ error: t(v.error) }, 400);
       const { salt, hash } = await hashPassword(password);
-      await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
+      const ins = await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
         .bind(username, salt + ':' + hash, nickname, 'user', email).run();
+      const newId = ins.meta && ins.meta.last_row_id;
+      io.audit('auth.register', {
+        target_type: 'user',
+        target_id: newId,
+        status: 200,
+        meta: { username, email: maskEmail(email) }
+      });
       return json({ ok: true });
     }
 
@@ -629,33 +755,61 @@ export default {
       try {
         await ensureLoginSchema(env);
         const combo = await hitLimit(env, comboKey, LOGIN_COMBO_MAX);
-        if (combo.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: combo.retry }) }, 429, combo.retry);
+        if (combo.blocked) {
+          log.warn('auth.login.blocked', { layer: 'combo', retry: combo.retry });
+          io.audit('auth.login.blocked', {
+            level: 'warn', status: 429, target_type: 'user', target_id: lower,
+            meta: { layer: 'combo', retry: combo.retry }
+          });
+          return jsonRetry({ error: t('errors.tooManyAttempts', { n: combo.retry }) }, 429, combo.retry);
+        }
         const userMax = row && isStaff(row) ? LOGIN_STAFF_MAX : LOGIN_USER_MAX;
         const [ipHit, uHit] = await Promise.all([
           hitLimit(env, ipKey, LOGIN_IP_MAX),
           hitLimit(env, userKey, userMax)
         ]);
-        if (ipHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
-        if (uHit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
+        if (ipHit.blocked) {
+          log.warn('auth.login.blocked', { layer: 'ip', retry: ipHit.retry });
+          io.audit('auth.login.blocked', { level: 'warn', status: 429, target_type: 'ip', meta: { layer: 'ip', retry: ipHit.retry } });
+          return jsonRetry({ error: t('errors.tooManyAttempts', { n: ipHit.retry }) }, 429, ipHit.retry);
+        }
+        if (uHit.blocked) {
+          log.warn('auth.login.blocked', { layer: 'user', retry: uHit.retry });
+          io.audit('auth.login.blocked', {
+            level: 'warn', status: 429, target_type: 'user', target_id: lower,
+            meta: { layer: 'user', retry: uHit.retry }
+          });
+          return jsonRetry({ error: t('errors.tooManyAttempts', { n: uHit.retry }) }, 429, uHit.retry);
+        }
       } catch { /* 计数不可用：继续校验口令 */ }
 
       if (!row) {
         // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致
         await hashPassword(password, DUMMY_SALT);
+        // 失败只进控制台：这条路径可被随机用户名刷，写库会被放大成 D1 写压力
+        log.warn('auth.login.fail', { user: lower, reason: 'no_user' });
         return json({ error: t('errors.badCredentials') }, 401);
       }
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(password, salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
-      if (row.banned) return json({ error: t('errors.banned') }, 403);
+      if (!(await verifyPassword(password, salt, hash))) {
+        log.warn('auth.login.fail', { user: lower, uid: row.id, reason: 'bad_password' });
+        return json({ error: t('errors.badCredentials') }, 401);
+      }
+      if (row.banned) {
+        log.warn('auth.login.fail', { user: lower, uid: row.id, reason: 'banned' });
+        return json({ error: t('errors.banned') }, 403);
+      }
       // 只清本人的计数：IP 计数若被清掉，登录一次就成了攻击者的"重置开关"
       await clearLimit(env, [comboKey, userKey]);
       const token = await createSession(env, row.id, row.session_version);
+      io.audit('auth.login.ok', { actor: row, status: 200, target_type: 'user', target_id: row.id });
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at, email: row.email || null } }, token);
     }
 
     if (path === 'logout' && method === 'POST') {
       const m = (getCookie(request) || '').split(';').map(s => s.trim()).find(s => s.startsWith(SESSION_COOKIE + '='));
       if (m) { const t = m.slice(SESSION_COOKIE.length + 1); await env.SESSIONS.delete('s:' + t); }
+      io.audit('auth.logout', { status: 200 });
       return okWithCookie({ ok: true }, null);
     }
 
@@ -695,7 +849,11 @@ export default {
       const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
       if (!row) return json({ error: t('errors.unauthorized') }, 401);
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: t('errors.wrongOldPassword') }, 400);
+      if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) {
+        // 旧密码错误不计审计（防刷）；控制台留痕便于判断是否有人在试口令
+        log.warn('auth.password.change.fail', { uid: user.id, reason: 'wrong_old_password' });
+        return json({ error: t('errors.wrongOldPassword') }, 400);
+      }
       const np = String(b.new_password || '');
       const pwErr = passwordProblem(np, user.username);
       if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
@@ -705,6 +863,8 @@ export default {
         .bind(s2 + ':' + h2, user.id).first();
       await clearLimit(env, [cpKey]);
       const token = await createSession(env, user.id, upd ? upd.session_version : Number(row.session_version) + 1);
+      // 改密是账号接管的关键动作：记下来，事后能对上"谁在哪台机器上改了密码"
+      io.audit('auth.password.change', { status: 200, target_type: 'user', target_id: user.id });
       return okWithCookie({ ok: true }, token);
     }
 
@@ -715,6 +875,7 @@ export default {
       if (!nickname) return json({ error: t('errors.nicknameEmpty') }, 400);
       if ([...nickname].length > 20) return json({ error: t('errors.nicknameTooLong') }, 400);
       await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(nickname, user.id).run();
+      io.audit('auth.profile.update', { status: 200, meta: { nickname } });
       return json({ ok: true, nickname });
     }
 
@@ -735,6 +896,8 @@ export default {
       const v = await verifyCode(env, email, 'bind', code);
       if (!v.ok) return json({ error: t(v.error) }, 400);
       await env.DB.prepare('UPDATE users SET email = ? WHERE id = ?').bind(email, user.id).run();
+      // 邮箱是找回口令的唯一凭据，变更必须留档；只记脱敏地址
+      io.audit('auth.email.bind', { status: 200, meta: { email: maskEmail(email) } });
       return json({ ok: true, email });
     }
 
@@ -753,6 +916,10 @@ export default {
         'INSERT INTO announcements (title, content, author, pinned) VALUES (?, ?, ?, ?) RETURNING *'
       ).bind(String(b.title).trim(), String(b.content).trim(), user.nickname || user.username, b.pinned ? 1 : 0).all()).results;
       const ann = rows && rows[0];
+      io.audit('announcement.create', {
+        status: 200, target_type: 'announcement', target_id: ann ? ann.id : null,
+        meta: { title: String(b.title).trim(), pinned: !!b.pinned, len: String(b.content).length }
+      });
       return json({ ok: true, id: ann ? ann.id : null, ann: ann || null });
     }
 
@@ -996,6 +1163,8 @@ export default {
       const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_user', ?) RETURNING id, created_at").bind(convId, user.id, content).all();
       await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(convId).run();
       const row = (ins.results && ins.results[0]) || {};
+      // 客服回复是"以官方身份对外发声"，留档但不存正文（内容已在 messages 表）
+      io.audit('support.reply', { status: 200, target_type: 'conversation', target_id: convId, meta: { len: content.length } });
       return json({
         ok: true,
         msg_id: row.id || null,
@@ -1055,6 +1224,79 @@ export default {
       return json({ anns, users: users.results, convs: convs.results, stats });
     }
 
+    // ---------- 审计日志（管理员可读） ----------
+    if (path === 'admin/logs' && method === 'GET') {
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
+      try {
+        await ensureAuditSchema(env);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+
+      const levelParam = url.searchParams.get('level');
+      const level = ['info', 'warn', 'error'].includes(levelParam) ? levelParam : '';
+      const event = String(url.searchParams.get('event') || '').trim().slice(0, 64);
+      const q = String(url.searchParams.get('q') || '').trim().slice(0, 80);
+      const before = Number(url.searchParams.get('before') || 0);
+      const limit = Math.min(200, Math.max(20, Number(url.searchParams.get('limit') || 50) || 50));
+
+      const where = [];
+      const args = [];
+      if (level) { where.push('level = ?'); args.push(level); }
+      if (event) { where.push("event LIKE ? ESCAPE '\\'"); args.push(escapeLike(event) + '%'); }
+      if (q) {
+        const like = '%' + escapeLike(q) + '%';
+        where.push("(event LIKE ? ESCAPE '\\' OR actor_name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR meta LIKE ? ESCAPE '\\')");
+        args.push(like, like, like, like);
+      }
+      if (before > 0) { where.push('id < ?'); args.push(before); }
+      const sql = 'SELECT * FROM audit_logs' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY id DESC LIMIT ?';
+      // 多取一条用来判断"还有没有下一页"，省掉一次 COUNT
+      const rows = (await env.DB.prepare(sql).bind(...args, limit + 1).all()).results;
+      const list = rows.slice(0, limit);
+
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const [statRow, eventRows] = await Promise.all([
+        env.DB.prepare(
+          `SELECT COUNT(*) AS total,
+                  COALESCE(SUM(level = 'error'), 0) AS err,
+                  COALESCE(SUM(level = 'warn'), 0) AS warn,
+                  COALESCE(SUM(level = 'info'), 0) AS info
+             FROM audit_logs WHERE ts >= ?`
+        ).bind(dayAgo).first(),
+        env.DB.prepare('SELECT event, COUNT(*) AS n FROM audit_logs WHERE ts >= ? GROUP BY event ORDER BY n DESC LIMIT 40').bind(weekAgo).all()
+      ]);
+
+      return json({
+        list,
+        nextBefore: rows.length > limit && list.length ? list[list.length - 1].id : 0,
+        stats: {
+          total: Number(statRow && statRow.total) || 0,
+          error: Number(statRow && statRow.err) || 0,
+          warn: Number(statRow && statRow.warn) || 0,
+          info: Number(statRow && statRow.info) || 0
+        },
+        events: eventRows.results || [],
+        keepDays: auditKeepDays(env)
+      });
+    }
+
+    // 手动清理：删保留期之外的记录。仅超管，且清理动作本身也要留痕
+    if (path === 'admin/logs/purge' && method === 'POST') {
+      if (!isSuper(user)) return json({ error: t('errors.superOnly') }, 403);
+      const b = await readBody(request);
+      const days = Math.max(7, Math.min(3650, Number(b.days) || auditKeepDays(env)));
+      let removed = 0;
+      try {
+        removed = await pruneAuditLogs(env, days);
+      } catch {
+        return json({ error: t('errors.serverError') }, 500);
+      }
+      io.audit('admin.logs.purge', { level: 'warn', status: 200, meta: { days, removed } });
+      return json({ ok: true, removed, keepDays: days });
+    }
+
     // 管理员：用户管理
     if (path === 'admin/users' && method === 'GET') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
@@ -1083,17 +1325,29 @@ export default {
         if (!['user', 'admin'].includes(b.role)) return json({ error: t('errors.invalidRole') }, 400);
         if (targetIsSuper || id === user.id) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(b.role, id).run();
+        io.audit('admin.user.role', {
+          level: 'warn', status: 200, target_type: 'user', target_id: id,
+          meta: { username: target.username, from: target.role, to: b.role }
+        });
       }
       // 其余改动不允许落到超管账号上（自己改自己除外）
       const guarded = targetIsSuper && id !== user.id;
       if (b.nickname !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(String(b.nickname).trim(), id).run();
+        io.audit('admin.user.nickname', {
+          status: 200, target_type: 'user', target_id: id,
+          meta: { username: target.username, nickname: String(b.nickname).trim() }
+        });
       }
       if (b.banned !== undefined) {
         if (id === user.id) return json({ error: t('errors.cannotBanSelf') }, 400);
         if (targetIsSuper) return json({ error: t('errors.cannotEditSuper') }, 400);
         await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
+        io.audit(b.banned ? 'admin.user.ban' : 'admin.user.unban', {
+          level: 'warn', status: 200, target_type: 'user', target_id: id,
+          meta: { username: target.username }
+        });
       }
       if (b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
@@ -1102,6 +1356,11 @@ export default {
         if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
         await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, id).run();
+        // 代改他人口令等于临时接管账号：必须留档
+        io.audit('admin.user.password_reset', {
+          level: 'warn', status: 200, target_type: 'user', target_id: id,
+          meta: { username: target.username }
+        });
       }
       return json({ ok: true });
     }
@@ -1127,6 +1386,11 @@ export default {
       if (target.email) {
         try { await env.DB.prepare('DELETE FROM email_codes WHERE email = ?').bind(target.email).run(); } catch { /* 表未建 */ }
       }
+      // 删号不可恢复：审计里保留被删账号的标识，便于日后追查
+      io.audit('admin.user.delete', {
+        level: 'warn', status: 200, target_type: 'user', target_id: id,
+        meta: { username: target.username, email: maskEmail(target.email) }
+      });
       return json({ ok: true, id });
     }
 
@@ -1139,19 +1403,27 @@ export default {
         .bind(b.title !== undefined ? String(b.title).trim() : null, b.content !== undefined ? String(b.content) : null, b.pinned !== undefined ? (b.pinned ? 1 : 0) : null, id).run();
       // 影响 0 行 = 这条公告已不存在（可能被别的管理员删了）：必须报错，不能静默返回 ok
       if (!r.meta.changes) return json({ error: t('errors.announceGone') }, 404);
+      io.audit('announcement.update', {
+        status: 200, target_type: 'announcement', target_id: id,
+        meta: { fields: Object.keys(b).sort(), title: b.title !== undefined ? String(b.title).trim() : undefined }
+      });
       return json({ ok: true, id });
     }
 
     if (path.startsWith('admin/announcements/') && method === 'DELETE') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
-      const r = await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(Number(path.split('/')[2])).run();
+      const id = Number(path.split('/')[2]);
+      const r = await env.DB.prepare('DELETE FROM announcements WHERE id = ?').bind(id).run();
       if (!r.meta.changes) return json({ error: t('errors.announceGone') }, 404);
+      io.audit('announcement.delete', { level: 'warn', status: 200, target_type: 'announcement', target_id: id });
       return json({ ok: true });
     }
 
     return json({ error: 'Not found' }, 404);
   }
-}
+};
+
+export default app;
 
 function okWithCookie(data, token) {
   const res = json(data);

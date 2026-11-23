@@ -25,5 +25,12 @@
   // 每 10 分钟把 puzzle.cat 赛事快照写入 D1（用户请求只读库，不触发跨站抓取）
   "triggers": {
     "crons": ["*/10 * * * *"]
+  },
+  // 日志开关（改这里或控制台变量都行，不用重新构建）
+  // LOG_LEVEL：debug | info | warn | error | silent。线上用 info；排障时临时调 debug
+  // AUDIT_KEEP_DAYS：审计表保留天数（Cron 定期清理，最小按 7 天算）
+  "vars": {
+    "LOG_LEVEL": "info",
+    "AUDIT_KEEP_DAYS": "90"
   }
 }

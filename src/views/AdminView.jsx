@@ -29,6 +29,17 @@ export default function AdminView({ user }) {
   const [saving, setSaving] = useState(false)
   const [sending, setSending] = useState(false)
 
+  /* 审计日志：筛选条件 + 游标分页（before=上一页最小的 id，不用 offset） */
+  const [logs, setLogs] = useState([])
+  const [logStats, setLogStats] = useState(null)
+  const [logEvents, setLogEvents] = useState([])
+  const [logKeepDays, setLogKeepDays] = useState(90)
+  const [logLevel, setLogLevel] = useState('')
+  const [logEvent, setLogEvent] = useState('')
+  const [logQ, setLogQ] = useState('')
+  const [logNext, setLogNext] = useState(0)
+  const [logLoading, setLogLoading] = useState(false)
+
   /* 首屏一次请求取全（公告 / 用户 / 会话 / 统计），原来是 4 个并行请求各验一次会话 */
   const loadOverview = async () => {
     if (!userId) return
@@ -61,6 +72,46 @@ export default function AdminView({ user }) {
     setNotice(text)
     setMsg('')
     window.setTimeout(() => setNotice(''), 2600)
+  }
+
+  /* 日志查询：filters 显式传入，避免 setState 之后还没生效就发请求 */
+  const loadLogs = async (opts = {}) => {
+    const f = { level: logLevel, event: logEvent, q: logQ, ...(opts.filters || {}) }
+    setLogLoading(true)
+    try {
+      const qs = new URLSearchParams()
+      if (f.level) qs.set('level', f.level)
+      if (f.event) qs.set('event', f.event)
+      if (f.q && f.q.trim()) qs.set('q', f.q.trim())
+      if (opts.append && logNext) qs.set('before', String(logNext))
+      const d = await api('/admin/logs' + (qs.toString() ? '?' + qs.toString() : ''))
+      setLogs((old) => (opts.append ? old.concat(d.list || []) : (d.list || [])))
+      setLogNext(d.nextBefore || 0)
+      setLogStats(d.stats || null)
+      setLogEvents(d.events || [])
+      if (d.keepDays) setLogKeepDays(d.keepDays)
+    } catch (err) { setMsg(String(err.message)) } finally { setLogLoading(false) }
+  }
+
+  useEffect(() => { if (tab === 'logs') loadLogs() }, [tab])
+
+  /* 清理旧日志：不可恢复，天数与后果都要问清楚 */
+  const purgeLogs = async () => {
+    const input = window.prompt(t('admin.logs.purgePrompt', { days: logKeepDays }), String(logKeepDays))
+    if (!input) return
+    const days = Number(input)
+    if (!Number.isFinite(days) || days < 7) { setMsg(t('admin.logs.purgeBadDays')); return }
+    if (!window.confirm(t('admin.logs.purgeConfirm', { days }))) return
+    try {
+      const r = await api('/admin/logs/purge', { method: 'POST', body: { days } })
+      flash(t('admin.logs.purged', { n: r.removed || 0 }))
+      loadLogs()
+    } catch (err) { setMsg(String(err.message)) }
+  }
+
+  const prettyMeta = (raw) => {
+    if (!raw) return ''
+    try { return JSON.stringify(JSON.parse(raw), null, 2) } catch { return String(raw) }
   }
 
   const searchUsers = async (e) => {
@@ -213,6 +264,7 @@ export default function AdminView({ user }) {
         <button className={tab === 'conv' ? 'on' : ''} onClick={() => switchTab('conv')}>{totalUnread > 0 ? t('admin.tabs.convUnread', { n: totalUnread }) : t('admin.tabs.conv')}</button>
         <button className={tab === 'ann' ? 'on' : ''} onClick={() => switchTab('ann')}>{editId ? t('admin.tabs.annEditing') : t('admin.tabs.ann')}</button>
         <button className={tab === 'users' ? 'on' : ''} onClick={() => switchTab('users')}>{t('admin.tabs.users')}</button>
+        <button className={tab === 'logs' ? 'on' : ''} onClick={() => switchTab('logs')}>{t('admin.tabs.logs')}</button>
       </div>
 
       {msg && <p className="auth-msg">{msg}</p>}
@@ -346,6 +398,93 @@ export default function AdminView({ user }) {
               )
             })}
           </div>
+        </>
+      )}
+
+      {/* ===== 日志（审计流水） ===== */}
+      {tab === 'logs' && (
+        <>
+          <form className="log-filter" onSubmit={(e) => { e.preventDefault(); loadLogs() }}>
+            <select
+              value={logLevel}
+              onChange={(e) => { setLogLevel(e.target.value); loadLogs({ filters: { level: e.target.value } }) }}
+              aria-label={t('admin.logs.allLevels')}
+            >
+              <option value="">{t('admin.logs.allLevels')}</option>
+              <option value="error">error</option>
+              <option value="warn">warn</option>
+              <option value="info">info</option>
+            </select>
+            <select
+              value={logEvent}
+              onChange={(e) => { setLogEvent(e.target.value); loadLogs({ filters: { event: e.target.value } }) }}
+              aria-label={t('admin.logs.allEvents')}
+            >
+              <option value="">{t('admin.logs.allEvents')}</option>
+              {logEvents.map((ev) => (
+                <option key={ev.event} value={ev.event}>{ev.event}（{ev.n}）</option>
+              ))}
+            </select>
+            <input
+              value={logQ}
+              onChange={(e) => setLogQ(e.target.value)}
+              maxLength="80"
+              placeholder={t('admin.logs.searchPlaceholder')}
+            />
+            <button className="mini-btn" type="submit" disabled={logLoading}>
+              {logLoading ? t('admin.logs.loading') : t('admin.logs.query')}
+            </button>
+            {iAmSuper && (
+              <button className="mini-btn mini-btn--danger" type="button" onClick={purgeLogs}>
+                {t('admin.logs.purge')}
+              </button>
+            )}
+          </form>
+
+          <p className="acct-note">
+            {logStats
+              ? t('admin.logs.summary', {
+                total: logStats.total, error: logStats.error, warn: logStats.warn, info: logStats.info, days: logKeepDays
+              })
+              : t('admin.logs.hint')}
+          </p>
+
+          <div className="log-list">
+            {!logLoading && logs.length === 0 && <p className="panel-empty">{t('admin.logs.empty')}</p>}
+            {logs.map((row) => (
+              <div key={row.id} className={'log-row log-row--' + row.level}>
+                <span className={'log-badge log-badge--' + row.level}>{row.level}</span>
+                <div className="log-main">
+                  <div className="log-head">
+                    <strong className="log-event">{row.event}</strong>
+                    <span className="log-when">{row.ts ? fmtDateTime(new Date(row.ts).toISOString()) : ''}</span>
+                  </div>
+                  <div className="log-meta">
+                    {row.actor_name || t('admin.logs.anon')}
+                    {row.actor_id ? ' #' + row.actor_id : ''}
+                    {row.status ? ' · ' + row.status : ''}
+                    {row.path ? ' · ' + (row.method || 'GET') + ' ' + row.path : ''}
+                    {row.ip ? ' · ' + row.ip : ''}
+                    {row.target_type ? ' · ' + row.target_type + (row.target_id ? ':' + row.target_id : '') : ''}
+                  </div>
+                  {row.meta ? (
+                    <details className="log-json">
+                      <summary>{t('admin.logs.detail')}</summary>
+                      <pre>{prettyMeta(row.meta)}</pre>
+                    </details>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {logNext > 0 && (
+            <div className="btn-row" style={{ marginTop: 14 }}>
+              <button className="mini-btn" onClick={() => loadLogs({ append: true })} disabled={logLoading}>
+                {t('admin.logs.more')}
+              </button>
+            </div>
+          )}
         </>
       )}
     </div>
