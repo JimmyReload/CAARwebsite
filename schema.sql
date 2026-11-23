@@ -1,14 +1,40 @@
--- CAAR 用户系统
+-- ============================================================
+-- CAAR · 全新建库脚本（仅用于本地或全新环境）
+--
+-- ⚠️ 禁止在生产库执行本文件。
+--    生产库的结构演进一律走 migrations/，并且每次变更前先导出备份：
+--      wrangler d1 export caar-db --remote --output=backup-$(date +%F-%H%M).sql
+--
+--    本文件只做 CREATE TABLE IF NOT EXISTS，不含任何 DROP；
+--    历史版本曾在此处 DROP conversations/messages，误执行会清空全部私信。
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
   password TEXT NOT NULL,
   nickname TEXT NOT NULL DEFAULT '',
-  role TEXT NOT NULL DEFAULT 'user',
+  role TEXT NOT NULL DEFAULT 'user',          -- user | admin | superadmin
   banned INTEGER NOT NULL DEFAULT 0,
   session_version INTEGER NOT NULL DEFAULT 0,
+  email TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
+
+-- 邮箱验证码（只存哈希，不存明文）
+CREATE TABLE IF NOT EXISTS email_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL,
+  purpose TEXT NOT NULL,                      -- register | bind
+  code_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,                -- unix ms
+  attempts INTEGER NOT NULL DEFAULT 0,
+  used INTEGER NOT NULL DEFAULT 0,
+  ip TEXT NOT NULL DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_email_codes ON email_codes(email, purpose, id);
 
 CREATE TABLE IF NOT EXISTS announcements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,8 +46,7 @@ CREATE TABLE IF NOT EXISTS announcements (
 );
 
 -- 工单会话（每个会员一个对话线程）
-DROP TABLE IF EXISTS conversations;
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER UNIQUE NOT NULL,
   user_last_read_id INTEGER NOT NULL DEFAULT 0,
@@ -31,8 +56,7 @@ CREATE TABLE conversations (
 );
 
 -- 消息（会员 to_staff / staff to_user 双向）
-DROP TABLE IF EXISTS messages;
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   conv_id INTEGER NOT NULL,
   sender_id INTEGER NOT NULL,
@@ -77,3 +101,9 @@ CREATE TABLE IF NOT EXISTS hunt_notifications (
   UNIQUE(user_id, hunt_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_hunt_notif_user ON hunt_notifications(user_id, id DESC);
+
+-- 迁移版本记录：与 migrations/ 下的文件对应，用于确认线上跑到第几号
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  applied_at TEXT DEFAULT (datetime('now'))
+);

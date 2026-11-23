@@ -6,7 +6,7 @@ import { fmtDate, fmtDateTime } from '../time'
 import { readInboxCache, writeInboxCache, fetchInbox } from '../panelCache'
 
 /* 私信轮询间隔：4 秒。页面切到后台时暂停，切回来立即补一次 */
-const POLL_MS = 4000
+const POLL_MS = 10000
 
 /* 按 id 合并两批消息（本地已渲染的不会被服务端响应覆盖掉） */
 function mergeMsgs(a, b) {
@@ -159,12 +159,6 @@ export default function MemberView({ user }) {
     } finally {
       setSending(false)
     }
-  }
-
-  const changePw = async (e) => {
-    e.preventDefault(); setPwMsg('')
-    try { await api('/change-password', { method: 'POST', body: { old_password: op, new_password: np } }); setOp(''); setNp(''); setPwMsg(t('password.ok')) }
-    catch (err) { setPwMsg(err.message) }
   }
 
   return (

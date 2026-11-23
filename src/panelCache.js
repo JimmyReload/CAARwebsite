@@ -140,7 +140,8 @@ export function prefetchPanel(user) {
       }
     })
   }
-  if (user.role === 'admin' && !readOverviewCache(user.id)) fetchOverview(user.id).catch(() => null)
+  // admin 与 superadmin 都进管理台，预取条件必须与路由守卫一致
+  if (user.role !== 'user' && !readOverviewCache(user.id)) fetchOverview(user.id).catch(() => null)
 }
 
 export function clearPanelCache() {

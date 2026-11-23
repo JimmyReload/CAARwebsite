@@ -9,12 +9,27 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 // 统一安全响应头（全站出口统一附加）
+// CSP 说明：脚本与连接仅同源；样式需 'unsafe-inline'（首页等用了内联 style）；
+// 图片允许 https:（赛事缩略图来自 puzzle.cat 的第三方 CDN）。
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'"
+].join('; ');
+
 const SECURITY_HEADERS = {
   'x-content-type-options': 'nosniff',
   'x-frame-options': 'DENY',
   'referrer-policy': 'strict-origin-when-cross-origin',
   'strict-transport-security': 'max-age=31536000; includeSubDomains',
-  'permissions-policy': 'geolocation=(), microphone=(), camera=()'
+  'permissions-policy': 'geolocation=(), microphone=(), camera=()',
+  'content-security-policy': CSP
 };
 
 function json(data, status = 200) {
@@ -53,6 +68,53 @@ const DUMMY_SALT = '00000000000000000000000000000000';
 async function verifyPassword(pw, saltHex, hashHex) {
   const { hash } = await hashPassword(pw, saltHex);
   return hash === hashHex;
+}
+
+// ---------- 口令强度 ----------
+const PASSWORD_MIN = 8;
+const WEAK_PASSWORDS = new Set([
+  '12345678', '123456789', '1234567890', 'password', 'password1', 'passw0rd',
+  'qwertyui', 'qwerty123', 'abc12345', 'iloveyou', 'admin123', 'caar1234'
+]);
+// 返回错误文案 key，合法时返回 null
+function passwordProblem(pw, username) {
+  if (String(pw).length < PASSWORD_MIN) return 'errors.passwordLength';
+  const low = String(pw).toLowerCase();
+  if (WEAK_PASSWORDS.has(low)) return 'errors.passwordWeak';
+  if (username && low === String(username).toLowerCase()) return 'errors.passwordWeak';
+  return null;
+}
+
+// ---------- 登录节流 ----------
+// IP 5 次失败后按 60s 起指数退避（上限 15 分钟）；用户名阈值更高，避免被轻易锁号。
+const LOGIN_IP_MAX = 5;
+const LOGIN_USER_MAX = 20;
+const LOGIN_BLOCK_BASE_MS = 60 * 1000;
+const LOGIN_BLOCK_MAX_MS = 15 * 60 * 1000;
+const LOGIN_FAIL_TTL = 60 * 60;
+
+function clientIp(request) {
+  return request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
+}
+
+async function readFail(env, key) {
+  try { return await env.SESSIONS.get(key, 'json'); } catch { return null; }
+}
+
+function failBlocked(rec, threshold) {
+  const n = Number(rec && rec.n) || 0;
+  if (n < threshold) return 0;
+  const until = Number(rec && rec.until) || 0;
+  return until > Date.now() ? until : 0;
+}
+
+async function bumpFail(env, key, rec, threshold) {
+  const n = (Number(rec && rec.n) || 0) + 1;
+  const step = n - threshold;
+  const wait = n >= threshold ? Math.min(LOGIN_BLOCK_MAX_MS, LOGIN_BLOCK_BASE_MS * Math.pow(2, step)) : 0;
+  try {
+    await env.SESSIONS.put(key, JSON.stringify({ n, until: wait ? Date.now() + wait : 0 }), { expirationTtl: LOGIN_FAIL_TTL });
+  } catch { /* 计数失败不阻断登录流程 */ }
 }
 
 // ---------- 邮箱验证码 ----------
@@ -158,11 +220,15 @@ async function createSession(env, userId, version = 0) {
   await env.SESSIONS.put('s:' + token, String(userId) + ':' + Number(version || 0), { expirationTtl: SESSION_TTL });
   return token;
 }
+const SESSION_TOKEN_RE = /^[A-Za-z0-9-]{20,100}$/;
+
 async function getSessionUser(env, cookie) {
   if (!cookie) return null;
   const m = cookie.split(';').map(s => s.trim()).find(s => s.startsWith(SESSION_COOKIE + '='));
   if (!m) return null;
   const token = m.slice(SESSION_COOKIE.length + 1);
+  // 令牌格式先校验：避免超长/畸形值拼进 KV 键（KV 键有长度上限，会抛未捕获异常）
+  if (!SESSION_TOKEN_RE.test(token)) return null;
   const uid = await env.SESSIONS.get('s:' + token);
   if (!uid) return null;
   const userId = Number(String(uid).split(':')[0]);
@@ -181,10 +247,10 @@ async function getSessionUser(env, cookie) {
 // 会话记录形如 "<userId>:<sessionVersion>"；兼容早期只存 userId 的旧值
 function sessVersion(v) { const s = String(v); const i = s.indexOf(':'); return i < 0 ? 0 : Number(s.slice(i + 1)); }
 function sessionCookie(token) {
-  return SESSION_COOKIE + '=' + token + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' + SESSION_TTL;
+  return SESSION_COOKIE + '=' + token + '; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=' + SESSION_TTL;
 }
 function clearCookie() {
-  return SESSION_COOKIE + '=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0';
+  return SESSION_COOKIE + '=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0';
 }
 
 function getCookie(req) { return req.headers.get('cookie') || ''; }
@@ -329,8 +395,13 @@ export default {
       // 静态资源 + SPA 兜底（HTML 不缓存，带 hash 的资源长缓存）
       const res = await env.ASSETS.fetch(request);
       if (res.status === 404) {
-        const idx = await env.ASSETS.fetch(new Request('https://placeholder/index.html'));
+        // 只有页面导航才回落到 index.html；缺失的静态资源保持 404
+        const accept = request.headers.get('accept') || '';
+        if (!accept.includes('text/html')) return harden(res);
+        // SPA 兜底：页面能打开，但状态码保持 404，避免未知路径伪装成正常页面
+        const idx = await env.ASSETS.fetch(new Request(url.origin + '/index.html'));
         return harden(new Response(idx.body, {
+          status: 404,
           headers: {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-cache, no-store, must-revalidate'
@@ -418,7 +489,8 @@ export default {
       const code = String(b.code || '').trim();
       if (username.length < 2 || username.length > 20) return json({ error: t('errors.usernameLength') }, 400);
       if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) return json({ error: t('errors.usernameCharset') }, 400);
-      if (password.length < 6) return json({ error: t('errors.passwordLength') }, 400);
+      const pwErr = passwordProblem(password, username);
+      if (pwErr) return json({ error: t(pwErr) }, 400);
       if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: t('errors.emailInvalid') }, 400);
       if (!code) return json({ error: t('errors.codeRequired') }, 400);
       const exists = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
@@ -440,15 +512,37 @@ export default {
 
     if (path === 'login' && method === 'POST') {
       const b = await readBody(request);
-      const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(String(b.username || '')).first();
+      const username = String(b.username || '').trim();
+      // 登录节流：IP 与用户名两路计数，命中任一即 429（不透露账号是否存在）
+      const ipKey = 'lf:ip:' + clientIp(request);
+      const userKey = 'lf:u:' + username.toLowerCase();
+      const [ipRec, userRec] = await Promise.all([readFail(env, ipKey), readFail(env, userKey)]);
+      const blockedUntil = Math.max(failBlocked(ipRec, LOGIN_IP_MAX), failBlocked(userRec, LOGIN_USER_MAX));
+      if (blockedUntil > Date.now()) {
+        const retry = Math.ceil((blockedUntil - Date.now()) / 1000);
+        return json({ error: t('errors.tooManyAttempts', { n: retry }) }, 429);
+      }
+      const row = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
       if (!row) {
         // 枚举防护：用户名不存在时也执行一次等价的 PBKDF2，使响应耗时与"存在但密码错"一致
         await hashPassword(String(b.password || ''), DUMMY_SALT);
+        await Promise.all([
+          bumpFail(env, ipKey, ipRec, LOGIN_IP_MAX),
+          bumpFail(env, userKey, userRec, LOGIN_USER_MAX)
+        ]);
         return json({ error: t('errors.badCredentials') }, 401);
       }
       const [salt, hash] = String(row.password).split(':');
-      if (!(await verifyPassword(String(b.password || ''), salt, hash))) return json({ error: t('errors.badCredentials') }, 401);
+      if (!(await verifyPassword(String(b.password || ''), salt, hash))) {
+        await Promise.all([
+          bumpFail(env, ipKey, ipRec, LOGIN_IP_MAX),
+          bumpFail(env, userKey, userRec, LOGIN_USER_MAX)
+        ]);
+        return json({ error: t('errors.badCredentials') }, 401);
+      }
       if (row.banned) return json({ error: t('errors.banned') }, 403);
+      // 登录成功清零计数
+      await Promise.all([env.SESSIONS.delete(ipKey), env.SESSIONS.delete(userKey)]);
       const token = await createSession(env, row.id, row.session_version);
       return okWithCookie({ ok: true, user: { id: row.id, username: row.username, nickname: row.nickname, role: row.role, created_at: row.created_at, email: row.email || null } }, token);
     }
@@ -487,7 +581,8 @@ export default {
       const [salt, hash] = String(row.password).split(':');
       if (!(await verifyPassword(String(b.old_password || ''), salt, hash))) return json({ error: t('errors.wrongOldPassword') }, 400);
       const np = String(b.new_password || '');
-      if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
+      const pwErr = passwordProblem(np, user.username);
+      if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
       const { salt: s2, hash: h2 } = await hashPassword(np);
       await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, user.id).run();
       return json({ ok: true });
@@ -880,7 +975,8 @@ export default {
       if (b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         const np = String(b.new_password);
-        if (np.length < 6) return json({ error: t('errors.newPasswordLength') }, 400);
+        const pwErr = passwordProblem(np, null);
+        if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
         const { salt: s2, hash: h2 } = await hashPassword(np);
         await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, id).run();
       }
@@ -896,12 +992,13 @@ export default {
       const target = await env.DB.prepare('SELECT id, username, role, email FROM users WHERE id = ?').bind(id).first();
       if (!target) return json({ error: t('errors.userNotFound') }, 404);
       if (target.role === 'superadmin') return json({ error: t('errors.cannotEditSuper') }, 400);
-      // 没有外键级联，手动按顺序清：消息 → 会话 → 赛事标记/通知 → 验证码 → 用户
+      // 没有外键级联，手动按顺序清：消息 → 会话 → 赛事标记/通知（含他人列表里以他为主角的动态）→ 用户
       await env.DB.batch([
         env.DB.prepare('DELETE FROM messages WHERE conv_id IN (SELECT id FROM conversations WHERE user_id = ?)').bind(id),
         env.DB.prepare('DELETE FROM conversations WHERE user_id = ?').bind(id),
         env.DB.prepare('DELETE FROM hunt_interests WHERE user_id = ?').bind(id),
         env.DB.prepare('DELETE FROM hunt_notifications WHERE user_id = ?').bind(id),
+        env.DB.prepare('DELETE FROM hunt_notifications WHERE actor_id = ?').bind(id),
         env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id)
       ]);
       if (target.email) {

@@ -102,7 +102,8 @@ async function readFeed(env) {
   if (!row) return null;
   let items;
   try { items = JSON.parse(row.payload); } catch { return null; }
-  if (!Array.isArray(items) || !items.length) return null;
+  // 空数组也是有效快照：上游真的没有赛事时，不能当成"没缓存"反复打上游
+  if (!Array.isArray(items)) return null;
   return { at: Number(row.fetched_at) || 0, items };
 }
 
@@ -146,6 +147,16 @@ export async function getHuntFeed(env, opts = {}) {
   if (cached && !force) {
     scheduleRefresh(env, ctx);
     return { ...cached, source: 'stale' };
+  }
+
+  // 显式刷新：最多等 8 秒，超时就先返回旧快照，抓取继续在后台跑完
+  if (force && cached) {
+    const pending = refreshFeed(env).catch(() => null);
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 8000));
+    const fresh = await Promise.race([pending, timeout]);
+    if (fresh) return { ...fresh, source: 'upstream' };
+    return { ...cached, source: 'stale-timeout' };
   }
 
   try {

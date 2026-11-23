@@ -12,9 +12,10 @@
 --
 -- 执行方式（需先备份）：
 --   wrangler d1 export caar-db --remote --output=backup-before-session-version.sql
---   wrangler d1 execute caar-db --remote --file=./migrations/0001_add_session_version.sql
+--   wrangler d1 execute caar-db --remote --file=./migrations/0002_add_session_version.sql
 --
--- 注意：本文件尚未执行。
+-- 状态：已于 2026-09 应用（线上 users.session_version 存在）。
+-- 本文件含裸 ALTER，属于一次性迁移，重复执行会报错。
 -- ============================================================
 
 -- F-04 需要：会话版本号。改密时 +1，使所有旧会话失效。
