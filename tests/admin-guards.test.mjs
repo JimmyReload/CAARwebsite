@@ -88,6 +88,22 @@ test('M-1：管理员仍可重置普通成员口令，且会话被踢', async ()
   assert.equal(await version(env, 4), 1, '改密必须递增 session_version，踢掉旧会话')
 })
 
+test('删号时同时清理该会员的新闻投稿（含已发布稿件），保留其他作者', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+  const insert = async (authorId, title, status) => env.DB.prepare(
+    'INSERT INTO news_articles (title, summary, content, author_id, author_name, status) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(title, '', '正文', authorId, 'member-' + authorId, status).run()
+  await insert(4, '会员待审稿', 'pending')
+  await insert(4, '会员已发布稿', 'published')
+  await insert(3, '其他会员稿', 'published')
+
+  const r = await api(worker, env, 'admin/users/4', { method: 'DELETE', token: SUPER })
+  assert.equal(r.status, 200)
+  assert.equal(Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM news_articles WHERE author_id = 4').first()).n), 0)
+  assert.equal(Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM news_articles WHERE author_id = 3').first()).n), 1)
+})
+
 test('M-1：超管可以重置管理员口令', async () => {
   const env = makeEnv({ fullSchema: true })
   await seed(env)

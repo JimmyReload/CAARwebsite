@@ -141,10 +141,32 @@ CREATE INDEX IF NOT EXISTS idx_audit_level_ts ON audit_logs(level, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_logs(event, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id, ts DESC);
 
+-- 新闻投稿与审核：会员仅能提交和查看自己的稿件，公开端仅显示 published。
+CREATE TABLE IF NOT EXISTS news_articles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  excerpt TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL,
+  content_format TEXT NOT NULL DEFAULT 'plain',
+  author_id INTEGER NOT NULL,
+  author_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'rejected')),
+  review_note TEXT NOT NULL DEFAULT '',
+  reviewed_by INTEGER,
+  reviewed_at TEXT,
+  published_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_news_public ON news_articles(status, published_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_news_author ON news_articles(author_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_news_review ON news_articles(status, id DESC);
+
 -- ============================================================
 -- 迁移版本登记（仅全新环境）
 --
--- 上面建出的结构已经包含 0002–0009 的全部变更，这里直接登记，避免
+-- 上面建出的结构已覆盖所有迁移表结构；全新库在此登记 0002–0011，避免
 -- 「全新环境」与「生产环境」的 schema_migrations 对不上（生产是逐条执行迁移记的）。
 -- 0007 是数据迁移（把 admin 升为 superadmin），新库里没有 admin 账号、
 -- 执行也是空操作，同样登记，避免之后被重复执行。
@@ -158,4 +180,5 @@ INSERT OR REPLACE INTO schema_migrations (version) VALUES
   ('0007_superadmin'),
   ('0008_add_schema_migrations_and_login_fails'),
   ('0009_add_login_fails_blocks'),
-  ('0010_add_audit_logs');
+  ('0010_add_audit_logs'),
+  ('0011_news_articles');

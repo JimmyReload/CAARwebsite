@@ -4,6 +4,7 @@ import api from '../api'
 import { t, eventLabel } from '../i18n'
 import { fmtDate, fmtDateTime } from '../time'
 import { readOverviewCache, writeOverviewCache, fetchOverview, currentEpoch } from '../panelCache'
+import AdminNewsView from './AdminNewsView'
 
 export default function AdminView({ user }) {
   const userId = user && user.id
@@ -356,12 +357,14 @@ export default function AdminView({ user }) {
         <button className={tab === 'dash' ? 'on' : ''} onClick={() => switchTab('dash')}>{t('admin.tabs.dash')}</button>
         <button className={tab === 'conv' ? 'on' : ''} onClick={() => switchTab('conv')}>{totalUnread > 0 ? t('admin.tabs.convUnread', { n: totalUnread }) : t('admin.tabs.conv')}</button>
         <button className={tab === 'ann' ? 'on' : ''} onClick={() => switchTab('ann')}>{editId ? t('admin.tabs.annEditing') : t('admin.tabs.ann')}</button>
+        <button className={tab === 'news' ? 'on' : ''} onClick={() => switchTab('news')}>{t('news.adminTitle')}</button>
         <button className={tab === 'users' ? 'on' : ''} onClick={() => switchTab('users')}>{t('admin.tabs.users')}</button>
         <button className={tab === 'logs' ? 'on' : ''} onClick={() => switchTab('logs')}>{t('admin.tabs.logs')}</button>
       </div>
 
       {msg && <p className="auth-msg">{msg}</p>}
       {notice && <p className="auth-msg auth-msg--ok">{notice}</p>}
+      {tab === 'news' && <AdminNewsView />}
 
       {/* ===== 概览 ===== */}
       {tab === 'dash' && stats && (

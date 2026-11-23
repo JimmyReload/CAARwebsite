@@ -191,6 +191,8 @@ export default function MemberView({ user }) {
       <div className="panel-head">
         <p className="auth-kicker">{t('member.kicker')}</p>
         <h1 className="panel-title">{t('member.title')}</h1>
+        <Link className="panel-back" to="/news">{t('nav.news')}</Link>
+        <Link className="panel-back" to="/member/news">{t('news.memberTitle')}</Link>
         <Link className="panel-back" to="/account">{t('account.title')}</Link>
         <Link className="panel-back" to="/">{t('common.backHome')}</Link>
       </div>

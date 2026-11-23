@@ -3,6 +3,7 @@
 // 会话：随机令牌存 KV，HttpOnly Cookie
 // 所有面向用户的提示文案统一取自 locales/zh-CN.js
 import { t } from './i18n.js'
+import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentExcerpt, newsDocumentText } from './newsContent.js'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts.js'
 // 登录节流单独成模块：不依赖 Workers 运行时，可被 tests/ 直接驱动
 import {
@@ -75,6 +76,7 @@ function jsonRetry(data, status, retry) {
 // Content-Length 可由客户端省略（HTTP/2、流式请求）或伪造，只信它等于没有上限。
 // 读取时按块累计，一旦超限立刻 cancel 掉流，绝不把剩余正文继续缓冲进内存。
 const MAX_BODY_BYTES = 64 * 1024;
+const NEWS_BODY_MAX_BYTES = 128 * 1024;
 
 // 请求体相关的失败用带状态码的错误表达，由 app.fetch 的统一异常兜底转成响应，
 // 这样调用点（十几个 readBody）不必各自处理 413/400
@@ -91,9 +93,10 @@ const badBody = (detail) => new HttpError(400, 'errors.badParams', detail);
 
 // 读正文：先按声明长度快速拒绝，再按实际字节数兜底（两条路径都会拒绝）。
 // 返回解析后的 JSON；空正文按 {} 处理（部分路由允许无正文）。
-async function readBody(req) {
+async function readBody(req, maxBytes = MAX_BODY_BYTES) {
+  const limit = Math.min(MAX_BODY_BYTES * 2, Math.max(0, Number(maxBytes) || MAX_BODY_BYTES));
   const declared = req.headers.get('content-length');
-  if (declared !== null && Number(declared) > MAX_BODY_BYTES) throw tooLarge();
+  if (declared !== null && Number(declared) > limit) throw tooLarge();
 
   // body 为 null（GET/HEAD 或确实没有正文）：不必读流
   if (!req.body) {
@@ -122,7 +125,7 @@ async function readBody(req) {
       const { done, value } = chunk;
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
+      if (total > limit) {
         // 超限即停：释放底层流，不再读取后续块
         try { await reader.cancel(); } catch { /* 取消失败也不影响拒绝 */ }
         throw tooLarge();
@@ -230,6 +233,10 @@ function passwordProblem(pw, username) {
 // 上限必须在**所有写入路径**统一，否则一个超长昵称能让所有人的列表响应体膨胀。
 const NICKNAME_MAX = 20;
 const ANNOUNCE_TITLE_MAX = 100;
+const NEWS_TITLE_MAX = 100;
+const NEWS_SUMMARY_MAX = 280;
+const NEWS_CONTENT_MAX = NEWS_TEXT_MAX;
+const NEWS_PAGE_SIZE = 20;
 
 // 返回 { value } 或 { error: 文案 key }；注册、后台改名、用户自助改名三条路径共用
 function normalizeNickname(raw) {
@@ -538,6 +545,29 @@ async function announcementVersion(env) {
   return row ? Number(row.v) || 0 : 0;
 }
 
+function newsDocumentFromRow(row) {
+  if (row.content_format === 'rich-v1') {
+    try { return normalizeNewsDocument(JSON.parse(row.content)) || { type: 'doc', children: [] }; }
+    catch { return { type: 'doc', children: [] }; }
+  }
+  const text = String(row.content || '');
+  return { type: 'doc', children: text ? text.split(/\n{2,}/).map((part) => ({
+    type: 'paragraph', children: part.split('\n').flatMap((line, i) => i ? [{ type: 'hardBreak' }, { type: 'text', text: line, marks: [] }] : [{ type: 'text', text: line, marks: [] }])
+  })) : [] };
+}
+
+function parseNewsSubmission(body) {
+  const title = String(body.title || '').trim();
+  const summary = String(body.summary || '').trim();
+  const document = normalizeNewsDocument(body.content);
+  const plainText = document ? newsDocumentText(document).trim() : '';
+  if (!title || !plainText) return { error: 'errors.newsEmpty' };
+  if ([...title].length > NEWS_TITLE_MAX) return { error: 'errors.newsTitleTooLong' };
+  if ([...summary].length > NEWS_SUMMARY_MAX) return { error: 'errors.newsSummaryTooLong' };
+  if (!document || [...plainText].length > NEWS_CONTENT_MAX || JSON.stringify(document).length > 60000) return { error: 'errors.newsContentTooLong' };
+  return { title, summary, document, content: JSON.stringify(document), excerpt: plainText.slice(0, 300), length: [...plainText].length };
+}
+
 // ---------- 会话 ----------
 // 已读位只前进不后退，避免并发请求把游标写小
 async function markRead(env, convId, lastId, isOwner) {
@@ -806,7 +836,8 @@ const app = {
     // 这里只是按声明长度的快速拒绝；真正的判定在 readBody() 里按实际读取字节做。
     if (method !== 'GET' && method !== 'HEAD') {
       const len = Number(request.headers.get('content-length') || 0);
-      if (len > MAX_BODY_BYTES) return json({ error: t('errors.bodyTooLarge') }, 413);
+      const bodyMax = path === 'news' || /^news\/\d+\/resubmit$/.test(path) ? NEWS_BODY_MAX_BYTES : MAX_BODY_BYTES;
+      if (len > bodyMax) return json({ error: t('errors.bodyTooLarge') }, 413);
     }
     const user = await getSessionUser(env, getCookie(request));
     // 让访问日志与审计记录带上操作者（未登录则为 null）
@@ -1196,7 +1227,91 @@ const app = {
     }
 
     // ---------- 以下需要登录 ----------
+    // Public news endpoints must precede the authentication gate and reveal only published rows.
+    if (path === 'news' && method === 'GET') {
+      const page = Math.max(1, Math.min(10000, Number(url.searchParams.get('page') || 1) || 1));
+      const rows = await env.DB.prepare("SELECT id,title,summary,excerpt,content,content_format,author_name,published_at FROM news_articles WHERE status='published' ORDER BY published_at DESC,id DESC LIMIT ? OFFSET ?").bind(NEWS_PAGE_SIZE, (page - 1) * NEWS_PAGE_SIZE).all();
+      const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM news_articles WHERE status='published'").first();
+      const list = rows.results.map((row) => ({ id: row.id, title: row.title, summary: row.summary, author_name: row.author_name, published_at: row.published_at, excerpt: newsDocumentExcerpt(newsDocumentFromRow(row), 240) }));
+      return json({ list, page, pageSize: NEWS_PAGE_SIZE, total: Number(count && count.n) || 0 });
+    }
+    if (path.startsWith('news/') && path !== 'news/mine' && !path.startsWith('news/mine/') && method === 'GET') {
+      const parts = path.split('/'); const id = Number(parts[1]);
+      if (parts.length !== 2 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
+      const row = await env.DB.prepare("SELECT * FROM news_articles WHERE id=? AND status='published'").bind(id).first();
+      if (!row) return json({ error: t('errors.newsNotFound') }, 404);
+      return json({ article: { id: row.id, title: row.title, summary: row.summary, excerpt: row.excerpt, author_name: row.author_name, published_at: row.published_at, content: newsDocumentFromRow(row) } });
+    }
     if (!user) return json({ error: t('errors.unauthorized') }, 401);
+
+    // Authenticated news submissions; members only access their own article records.
+    if (path === 'news/mine' && method === 'GET') {
+      const rows = await env.DB.prepare('SELECT id,title,summary,excerpt,content_format,status,review_note,reviewed_at,published_at,created_at,updated_at FROM news_articles WHERE author_id = ? ORDER BY id DESC LIMIT 100').bind(user.id).all();
+      return json({ list: rows.results });
+    }
+    if (path.startsWith('news/mine/') && method === 'GET') {
+      const parts = path.split('/'); const id = Number(parts[2]);
+      if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
+      const row = await env.DB.prepare('SELECT * FROM news_articles WHERE id = ? AND author_id = ?').bind(id,user.id).first();
+      if (!row) return json({ error: t('errors.newsNotFound') }, 404);
+      return json({ article: { ...row, content: newsDocumentFromRow(row) } });
+    }
+    if (path === 'news' && method === 'POST') {
+      const b = await readBody(request, NEWS_BODY_MAX_BYTES);
+      if (b.__tooLarge) return json({ error: t('errors.bodyTooLarge') }, 413);
+      const parsed = parseNewsSubmission(b);
+      if (parsed.error) return json({ error: t(parsed.error) }, 400);
+      const authorName = String(user.nickname || user.username).trim().slice(0, NICKNAME_MAX);
+      const ins = await env.DB.prepare(`INSERT INTO news_articles(title,summary,excerpt,content,content_format,author_id,author_name,status) SELECT ?,?,?,?,'rich-v1',?,?,'pending' WHERE (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5 RETURNING id,title,summary,excerpt,status,created_at`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,user.id,authorName,user.id).all();
+      const article = (ins.results || [])[0] || null;
+      if (!article) return json({ error: t('errors.newsTooManyPending') }, 429);
+      io.audit('news.submit', { status: 200, target_type: 'news', target_id: article.id, meta: { title: parsed.title, len: parsed.length } });
+      return json({ ok: true, article });
+    }
+    if (path.startsWith('news/') && path.endsWith('/resubmit') && method === 'POST') {
+      const parts = path.split('/'); const id = Number(parts[1]);
+      if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
+      const b = await readBody(request, NEWS_BODY_MAX_BYTES);
+      if (b.__tooLarge) return json({ error: t('errors.bodyTooLarge') }, 413);
+      const parsed = parseNewsSubmission(b);
+      if (parsed.error) return json({ error: t(parsed.error) }, 400);
+      const upd = await env.DB.prepare(`UPDATE news_articles SET title=?,summary=?,excerpt=?,content=?,content_format='rich-v1',status='pending',review_note='',reviewed_by=NULL,reviewed_at=NULL,published_at=NULL,updated_at=datetime('now') WHERE id=? AND author_id=? AND status='rejected' AND (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,id,user.id,user.id).run();
+      if (!upd.meta.changes) {
+        const ownedRejected = await env.DB.prepare("SELECT id FROM news_articles WHERE id=? AND author_id=? AND status='rejected'").bind(id,user.id).first();
+        return json({ error: t(ownedRejected ? 'errors.newsTooManyPending' : 'errors.newsResubmitUnavailable') }, ownedRejected ? 429 : 409);
+      }
+      io.audit('news.resubmit', { status: 200, target_type: 'news', target_id: id, meta: { title: parsed.title, len: parsed.length } });
+      return json({ ok: true });
+    }
+    if (path === 'admin/news' && method === 'GET') {
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
+      const status = ['pending','published','rejected'].includes(url.searchParams.get('status')) ? url.searchParams.get('status') : 'pending';
+      const rows = await env.DB.prepare('SELECT n.id,n.title,n.summary,n.excerpt,n.status,n.review_note,n.reviewed_at,n.published_at,n.created_at,n.author_name,u.username AS author_username FROM news_articles n LEFT JOIN users u ON u.id=n.author_id WHERE n.status=? ORDER BY n.id DESC LIMIT 100').bind(status).all();
+      return json({ list: rows.results, status });
+    }
+    if (path.startsWith('admin/news/') && method === 'GET') {
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
+      const parts = path.split('/'); const id = Number(parts[2]);
+      if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
+      const row = await env.DB.prepare('SELECT n.*,u.username AS author_username FROM news_articles n LEFT JOIN users u ON u.id=n.author_id WHERE n.id=?').bind(id).first();
+      if (!row) return json({ error: t('errors.newsNotFound') }, 404);
+      return json({ article: { ...row, content: newsDocumentFromRow(row) } });
+    }
+    if (path.startsWith('admin/news/') && method === 'PATCH') {
+      if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
+      const parts = path.split('/'); const id = Number(parts[2]);
+      if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
+      const b = await readBody(request);
+      if (!['published','rejected'].includes(b.status)) return json({ error: t('errors.badParams') }, 400);
+      const note = String(b.review_note || '').trim();
+      if (b.status === 'rejected' && !note) return json({ error: t('errors.newsReviewNoteRequired') }, 400);
+      if ([...note].length > 500) return json({ error: t('errors.newsReviewNoteTooLong') }, 400);
+      const now = "datetime('now')";
+      const upd = await env.DB.prepare(`UPDATE news_articles SET status=?,review_note=?,reviewed_by=?,reviewed_at=${now},published_at=CASE WHEN ?='published' THEN COALESCE(published_at,${now}) ELSE NULL END,updated_at=${now} WHERE id=? AND status='pending'`).bind(b.status,note,user.id,b.status,id).run();
+      if (!upd.meta.changes) return json({ error: t('errors.newsReviewUnavailable') }, 409);
+      io.audit(b.status === 'published' ? 'news.publish' : 'news.reject', { level: b.status === 'published' ? 'info' : 'warn', status: 200, target_type: 'news', target_id: id, meta: { review_note: note.slice(0,200) } });
+      return json({ ok: true, status: b.status });
+    }
 
     // 给「只走过 PuzzleCat 登录」的账号补设口令。
     //
@@ -1837,6 +1952,7 @@ const app = {
         env.DB.prepare('DELETE FROM hunt_interests WHERE user_id = ?').bind(id),
         env.DB.prepare('DELETE FROM hunt_notifications WHERE user_id = ?').bind(id),
         env.DB.prepare('DELETE FROM hunt_notifications WHERE actor_id = ?').bind(id),
+        env.DB.prepare('DELETE FROM news_articles WHERE author_id = ?').bind(id),
         env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id)
       ]);
       if (target.email) {

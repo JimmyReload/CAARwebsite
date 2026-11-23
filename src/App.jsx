@@ -5,6 +5,8 @@ import MemberView from './views/MemberView'
 import AdminView from './views/AdminView'
 import HuntsView from './views/HuntsView'
 import AccountView from './views/AccountView'
+import NewsView from './views/NewsView'
+import MemberNewsView from './views/MemberNewsView'
 import { t } from './i18n'
 import api from './api'
 import { prefetchHunts, clearHuntsCache, syncHuntsAuth, adoptHuntsIdentity } from './huntsCache'
@@ -526,11 +528,14 @@ export default function App() {
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<AuthView mode="login" onLogin={setUser} />} />
           <Route path="/register" element={<AuthView mode="register" onLogin={setUser} />} />
+          <Route path="/news" element={<NewsView />} />
+          <Route path="/news/:id" element={<NewsView />} />
           {/* key={user.id}：账号一换就强制卸载旧实例、用新实例重新初始化。
                只靠组件内的 useEffect 重置的话，切换后的首个 render 仍会短暂沿用
                A 的 state 渲染一帧；key 让这条窗口在渲染阶段就消失。 */}
           <Route path="/hunts" element={gate({ ready, verified, user, authError, refresh, render: (user) => <HuntsView key={user.id} user={user} onNotifRead={() => setNotifUnread(0)} /> })} />
           <Route path="/member" element={gate({ ready, verified, user, authError, refresh, render: (user) => <MemberView key={user.id} user={user} /> })} />
+          <Route path="/member/news" element={gate({ ready, verified, user, authError, refresh, render: (user) => <MemberNewsView key={user.id} /> })} />
           <Route path="/admin" element={!ready ? <IdentityPending /> : !verified ? <IdentityUnverified error={authError} onRetry={refresh} /> : !isStaff(user) ? <Navigate to="/login" replace /> : <AdminView key={user.id} user={user} />} />
           <Route path="/account" element={gate({ ready, verified, user, authError, refresh, render: (user) => <AccountView key={user.id} user={user} setUser={setUser} /> })} />
           <Route path="*" element={<Navigate to="/" replace />} />
