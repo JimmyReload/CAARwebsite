@@ -528,6 +528,9 @@ section[id] { scroll-margin-top: 96px; }
 /* 级别只在左侧色块与底色上体现，整行不描红，保证长列表可读 */
 .log-row--error { background: #fff4f4; }
 .log-row--warn { background: #fffbe6; }
+/* 客户端自述上报：内容完全由上报方控制，不是服务端观察到的事实。
+   灰底盖过级别底色是有意的——来源比级别更重要，不能让伪造条目伪装成普通警告。 */
+.log-row--client { background: var(--grey); border-left: 8px solid #000; }
 .log-badge {
   flex: 0 0 auto; font-family: var(--mono); font-size: 10.5px; font-weight: 900;
   text-transform: uppercase; letter-spacing: .06em; border: 2px solid #000; padding: 2px 7px; }

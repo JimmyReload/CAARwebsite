@@ -463,6 +463,7 @@ export default {
       summary: '全部事件近 24 小时 {total} 条：error {error} · warn {warn} · info {info}；保留 {days} 天',
       dropped: '本实例本分钟另有 {n} 条超出预算未落库（已记 audit.dropped）',
       clientTag: '客户端上报',
+      showClient: '显示客户端上报',
       empty: '没有符合条件的日志',
       anon: '匿名 / 未登录',
       detail: '详情',

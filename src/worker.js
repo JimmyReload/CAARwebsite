@@ -1221,6 +1221,11 @@ const app = {
         for (let i = 0; i < 8; i++) args.push(like);
       }
       if (before > 0) { where.push('id < ?'); args.push(before); }
+      // 客户端自述上报默认不进主列表：它不是服务端观察到的事实，混在一起会稀释证据链。
+      // 需要时用 client=all（连主列表一起看）或 client=only（只看这些）显式打开。
+      const clientParam = String(url.searchParams.get('client') || '');
+      if (clientParam === 'only') where.push("event = 'client.error'");
+      else if (clientParam !== 'all') where.push("event <> 'client.error'");
       const sql = 'SELECT * FROM audit_logs' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY id DESC LIMIT ?';
 
       let rows;

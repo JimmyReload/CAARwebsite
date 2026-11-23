@@ -304,12 +304,60 @@ async function writeRow(env, rec, event, level) {
  * @param {object} rec { event, level, actor_id, actor_name, target_type, target_id,
  *                       status, ip, method, path, rid, ua, meta }
  */
+// 客户端自述上报（/api/log/client）的全局日闸门
+//
+// 该端点未认证、内容完全由客户端控制，每分钟预算只管住单个 isolate 的瞬时速率，
+// 管不住跨 isolate 的整天累积。所以再加一道 D1 侧的日上限：
+// 每分钟最多查一次（结果缓存在 isolate 内，避免洪水时每个请求都 COUNT），
+// 超过上限后当天不再落库，只写控制台（Workers Logs），
+// 这样即使被刷也不会把证据表灌满，正常运维仍能在面板里看到有限的客户端报错。
+const CLIENT_ERROR_EVENT = 'client.error'
+const CLIENT_ERROR_DAILY_CAP = 2000
+let clientDayGate = { day: -1, checkedAt: 0, exhausted: false }
+
+// 仅供测试：清掉 isolate 内的日闸门缓存，否则同一进程里换个库也复用旧的判定
+export function resetClientDayGate() {
+  clientDayGate = { day: -1, checkedAt: 0, exhausted: false }
+}
+
+async function clientDayExhausted(env, event, now) {
+  if (event !== CLIENT_ERROR_EVENT) return false
+  const day = Math.floor(now / 86400000)
+  if (clientDayGate.day !== day) clientDayGate = { day, checkedAt: 0, exhausted: false }
+  if (clientDayGate.exhausted) return true
+  if (now - clientDayGate.checkedAt < 60000) return false
+  clientDayGate.checkedAt = now
+  try {
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM audit_logs WHERE event = 'client.error' AND ts >= ?"
+    ).bind(day * 86400000).first()
+    if (Number(row && row.n) >= CLIENT_ERROR_DAILY_CAP) {
+      clientDayGate.exhausted = true
+      return true
+    }
+  } catch { /* 查不到就放行：D1 异常时不该把日志整体掐掉，交给每分钟预算兜底 */ }
+  return false
+}
+
 export function audit(env, ctx, rec) {
   const task = (async () => {
     if (!env || !env.DB) return
 
     const event = clampStr(rec.event || 'unknown', 64)
-    const minute = Math.floor(Date.now() / 60000)
+    const now = Date.now()
+    const minute = Math.floor(now / 60000)
+
+    // 客户端报错超日上限：只留控制台，不落证据表
+    if (await clientDayExhausted(env, event, now)) {
+      try {
+        console.warn(safeStringify({
+          ts: new Date(now).toISOString(), level: 'warn', event,
+          dropped: 'daily-cap', cap: CLIENT_ERROR_DAILY_CAP,
+          ip: rec.ip || '', path: rec.path || '', meta: rec.meta || null
+        }))
+      } catch { /* 彻底放弃 */ }
+      return
+    }
 
     if (auditBudget.minute !== minute) {
       const prev = auditBudget

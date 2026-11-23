@@ -40,6 +40,7 @@ export default function AdminView({ user }) {
   // 「输入中」和「已应用」分开：输入框里还没提交的字不该影响 IP/level/event 的即时筛选
   const [logQApplied, setLogQApplied] = useState('')
   const [logIp, setLogIp] = useState('')
+  const [logShowClient, setLogShowClient] = useState(false)
   const [logNext, setLogNext] = useState(0)
   const [logBudget, setLogBudget] = useState(null)
   const [logLoading, setLogLoading] = useState(false)
@@ -80,7 +81,7 @@ export default function AdminView({ user }) {
 
   /* 日志查询：filters 显式传入，避免 setState 之后还没生效就发请求 */
   const loadLogs = async (opts = {}) => {
-    const f = { level: logLevel, event: logEvent, q: logQApplied, ip: logIp, ...(opts.filters || {}) }
+    const f = { level: logLevel, event: logEvent, q: logQApplied, ip: logIp, client: logShowClient ? 'all' : '', ...(opts.filters || {}) }
     // 这里不校验 q 长度：IP 按钮、清 chip、切页签都走这个函数，拦住会让人以为筛选失效。
     // 用的是"已应用"的 q，输入框里没提交的字不参与（否则点 IP 会悄悄叠加一个搜索条件）。
     const q = String(f.q || '').trim()
@@ -90,6 +91,7 @@ export default function AdminView({ user }) {
       if (f.level) qs.set('level', f.level)
       if (f.event) qs.set('event', f.event)
       if (f.ip) qs.set('ip', f.ip)
+      if (f.client) qs.set('client', f.client)
       if (q.length >= 3) qs.set('q', q)
       if (opts.append && logNext) qs.set('before', String(logNext))
       const d = await api('/admin/logs' + (qs.toString() ? '?' + qs.toString() : ''))
@@ -461,6 +463,15 @@ export default function AdminView({ user }) {
             <button className="mini-btn" type="submit" disabled={logLoading}>
               {logLoading ? t('admin.logs.loading') : t('admin.logs.query')}
             </button>
+            {/* 客户端自述上报默认不进主列表（后端默认也是排除），要看得显式打开 */}
+            <label className="check log-client-toggle">
+              <input
+                type="checkbox"
+                checked={logShowClient}
+                onChange={(e) => { setLogShowClient(e.target.checked); loadLogs({ filters: { client: e.target.checked ? 'all' : '' } }) }}
+              />
+              {t('admin.logs.showClient')}
+            </label>
             {logIp ? (
               <button
                 className="mini-btn"
@@ -490,13 +501,14 @@ export default function AdminView({ user }) {
             {!logLoading && logs.length === 0 && <p className="panel-empty">{t('admin.logs.empty')}</p>}
             {logs.map((row) => {
               const meta = metaOf(row.meta)
+              const isClient = !!(meta && meta.source === 'client')
               return (
-                <div key={row.id} className={'log-row log-row--' + row.level}>
+                <div key={row.id} className={'log-row log-row--' + row.level + (isClient ? ' log-row--client' : '')}>
                   <span className={'log-badge log-badge--' + row.level}>{row.level}</span>
                   <div className="log-main">
                     <div className="log-head">
                       <strong className="log-event">{row.event}</strong>
-                      {meta && meta.source === 'client' ? <span className="log-src">{t('admin.logs.clientTag')}</span> : null}
+                      {isClient ? <span className="log-src">{t('admin.logs.clientTag')}</span> : null}
                       <span className="log-when">{row.ts ? fmtDateTime(new Date(row.ts).toISOString()) : ''}</span>
                     </div>
                     <div className="log-meta">
