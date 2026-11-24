@@ -174,7 +174,7 @@ export default function AccountView({ user, setUser }) {
         </div>
       </section>
 
-      <section className="panel-sec acct-form">
+      {!user.email && <section className="panel-sec acct-form">
         <h2 className="panel-sec-title">{t('account.emailTitle')}</h2>
         <form onSubmit={saveMail} className="msg-form">
           <label>{t('auth.emailLabel')}
@@ -193,7 +193,7 @@ export default function AccountView({ user, setUser }) {
           <button className="auth-btn" disabled={mailSaving}>{mailSaving ? t('account.saving') : t('account.bindEmail')}</button>
         </form>
         <p className="acct-note">{t('account.emailNote')}</p>
-      </section>
+      </section>}
 
       <section className="panel-sec acct-form">
         <h2 className="panel-sec-title">{t('account.nicknameEdit')}</h2>
