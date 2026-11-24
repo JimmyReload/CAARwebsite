@@ -1006,9 +1006,7 @@ const app = {
       } catch {
         return json({ error: t('errors.serverError') }, 500);
       }
-      // 邮箱已被别的账号占用：不发码，直接说清楚
-      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND id <> ?').bind(email, user ? user.id : 0).first();
-      if (taken) return json({ error: t('errors.emailTaken') }, 409);
+      // register / bind 都不在发码响应中暴露邮箱占用状态；bind 仍要求登录，且占用邮箱不会收到验证码。
 
       const now = Date.now();
       const ip = request.headers.get('cf-connecting-ip') || '';
@@ -1022,24 +1020,30 @@ const app = {
       const code = randomCode();
       const issuedAt = now;
       const expiresAt = now + CODE_TTL_MS;
-      const reserved = await env.DB.prepare(
-        `INSERT INTO email_codes (email, purpose, code_hash, expires_at, ip)
-         SELECT ?, ?, ?, ?, ?
+      const reservations = await env.DB.prepare(
+        `INSERT INTO email_codes (email, purpose, code_hash, expires_at, ip, used)
+         SELECT ?, ?, ?, ?, ?,
+                CASE WHEN (? = 'register' AND EXISTS (SELECT 1 FROM users WHERE email = ?))
+                       OR (? = 'bind' AND EXISTS (SELECT 1 FROM users WHERE email = ? AND id <> ?))
+                     THEN 1 ELSE 0 END
           WHERE NOT EXISTS (
                   SELECT 1 FROM email_codes
                    WHERE email = ? AND purpose = ? AND expires_at > ?)
             AND (SELECT COUNT(*) FROM email_codes
                   WHERE email = ? AND purpose = ? AND expires_at > ?) < ?
             AND (? = '' OR (SELECT COUNT(*) FROM email_codes
-                             WHERE ip = ? AND expires_at > ?) < ?)`
+                             WHERE ip = ? AND expires_at > ?) < ?)
+         RETURNING used`
       ).bind(
         email, purpose, await hashCode(email, code, issuedAt), expiresAt, ip,
+        purpose, email, purpose, email, user ? user.id : 0,
         email, purpose, cooldownFloor,
         email, purpose, hourFloor, CODE_MAX_PER_HOUR,
         ip, ip, hourFloor, CODE_MAX_IP_PER_HOUR
-      ).run();
+      ).all();
+      const reservation = reservations && reservations.results && reservations.results[0];
 
-      if (!Number(reserved && reserved.meta && reserved.meta.changes)) {
+      if (!reservation) {
         // 占位失败：读一次现状只为给出准确的错误文案，不做任何写入
         const last = await env.DB.prepare('SELECT expires_at FROM email_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1').bind(email, purpose).first();
         if (last) {
@@ -1052,20 +1056,24 @@ const app = {
         return json({ error: t('errors.codeRateLimit') }, 429);
       }
 
-      try {
-        await sendCodeMail(env, email, code, purpose);
-      } catch (err) {
-        // 发信失败：把刚写入的码作废，避免用户拿着收不到的码干等
-        await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE email = ? AND purpose = ? AND expires_at = ?').bind(email, purpose, expiresAt).run();
-        const reason = String(err && err.message || '');
-        // 邮件通道挂了是「用户注册不了」的常见原因，必须能在日志里一眼看到
-        log.error('mail.send.fail', { purpose, reason });
-        io.audit('mail.send.fail', {
-          level: 'error', status: 502, target_type: 'email', target_id: maskEmail(email),
-          meta: { purpose, reason }
-        });
-        return json({ error: reason === 'MAIL_NOT_CONFIGURED' ? t('errors.mailNotConfigured') : t('errors.mailFailed') }, 502);
+      if (!Number(reservation.used)) {
+        try {
+          await sendCodeMail(env, email, code, purpose);
+        } catch (err) {
+          // 发信失败：把刚写入的码作废，避免用户拿着收不到的码干等
+          await env.DB.prepare('UPDATE email_codes SET used = 1 WHERE email = ? AND purpose = ? AND expires_at = ?').bind(email, purpose, expiresAt).run();
+          const reason = String(err && err.message || '');
+          // 邮件通道挂了是「用户注册不了」的常见原因，必须能在日志里一眼看到
+          log.error('mail.send.fail', { purpose, reason });
+          io.audit('mail.send.fail', {
+            level: 'error', status: 502, target_type: 'email', target_id: maskEmail(email),
+            meta: { purpose, reason }
+          });
+          // bind / register 对邮箱占用与邮件通道结果保持同形；失败码已作废，仍占冷却/额度。
+          return json({ ok: true, ttl: Math.round(CODE_TTL_MS / 1000) });
+        }
       }
+      // 占用邮箱以 used=1 的 dummy reservation 计入完全相同的冷却/额度，但不发信。
       return json({ ok: true, ttl: Math.round(CODE_TTL_MS / 1000) });
     }
 
@@ -1088,24 +1096,29 @@ const app = {
         if (nick.error) return json({ error: t(nick.error) }, 400);
         nickname = nick.value;
       }
-      const exists = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
-      if (exists) return json({ error: t('errors.usernameTaken') }, 409);
       try {
         await ensureEmailSchema(env);
       } catch {
         return json({ error: t('errors.serverError') }, 500);
       }
-      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
-      if (taken) return json({ error: t('errors.emailTaken') }, 409);
+      // 先验证并消费验证码；后续若用户名/邮箱冲突，统一返回成功形状但不建号。
+      // 这样冲突请求不能重放验证码，也不会因冲突字段不同暴露账号状态。
       const v = await verifyCode(env, email, 'register', code, log);
-      if (!v.ok) return json({ error: t(v.error) }, 400);
+      // Register dummy reservation and real-code failures must not reveal whether a usable code row exists.
+      if (!v.ok) return json({ error: '验证码无效，请重新检查邮箱和验证码后重试' }, 400);
       const { salt, hash } = await hashPassword(password);
-      const ins = await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
-        .bind(username, salt + ':' + hash, nickname, 'user', email).run();
-      const newId = ins.meta && ins.meta.last_row_id;
+      const inserted = await env.DB.prepare(
+        `INSERT INTO users (username, password, nickname, role, email)
+         SELECT ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = ?)
+            AND NOT EXISTS (SELECT 1 FROM users WHERE email = ?)
+         RETURNING id`
+      ).bind(username, salt + ':' + hash, nickname, 'user', email, username, email).all();
+      const created = inserted && inserted.results && inserted.results[0];
+      if (!created) return json({ ok: true });
       io.audit('auth.register', {
         target_type: 'user',
-        target_id: newId,
+        target_id: created.id,
         status: 200,
         meta: { username, email: maskEmail(email) }
       });
@@ -1398,11 +1411,18 @@ const app = {
       } catch {
         return json({ error: t('errors.serverError') }, 500);
       }
-      const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND id <> ?').bind(email, user.id).first();
-      if (taken) return json({ error: t('errors.emailTaken') }, 409);
       const v = await verifyCode(env, email, 'bind', code, log);
-      if (!v.ok) return json({ error: t(v.error) }, 400);
-      await env.DB.prepare('UPDATE users SET email = ? WHERE id = ?').bind(email, user.id).run();
+      // bind 验证失败原因（无可用行、错误码、过期、超尝试）统一，避免 dummy 与真实验证码状态可区分。
+      if (!v.ok) return json({ error: '验证码无效，请重新检查邮箱和验证码后重试' }, 400);
+      // 仅在正确验证码已被单次消费后检查冲突，避免用无效/缺失验证码枚举邮箱。
+      // 条件 UPDATE 同时复核唯一性，避免 SELECT 与 UPDATE 之间的占用竞态。
+      const updated = await env.DB.prepare(
+        `UPDATE users SET email = ?
+          WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM users WHERE email = ? AND id <> ?)
+         RETURNING id`
+      ).bind(email, user.id, email, user.id).all();
+      if (!updated || !updated.results || !updated.results[0]) return json({ error: t('errors.emailTaken') }, 409);
       // 邮箱是找回口令的唯一凭据，变更必须留档；只记脱敏地址
       io.audit('auth.email.bind', { status: 200, meta: { email: maskEmail(email) } });
       return json({ ok: true, email });

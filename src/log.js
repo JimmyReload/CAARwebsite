@@ -205,6 +205,11 @@ export function bootstrapAuditSchema(env) {
 const CRITICAL_EVENT = /^(admin\.|auth\.password\.|request\.error|cron\.)/
 const DROPPED_EVENT = 'audit.dropped'
 const AUDIT_CRITICAL_PER_MIN = 600
+const CLIENT_ERROR_EVENT = 'client.error'
+const CLIENT_ERROR_DAILY_CAP = 2000
+// Same-isolate non-client events wait until provisional client.error budget
+// reservations are confirmed or refunded by the atomic daily-cap INSERT.
+const pendingClientErrorWrites = new Set()
 
 let auditBudget = {
   minute: -1,
@@ -248,15 +253,11 @@ export function metaJson(value) {
 }
 
 // 单条落库。所有写入（含 audit.dropped）都走这里，异常一律降级成控制台日志。
-async function writeRow(env, rec, event, level) {
+async function writeRow(env, rec, event, level, options = {}) {
   try {
     if (String(env.AUDIT_BOOTSTRAP || '') === '1') await bootstrapAuditSchema(env)
-    await env.DB.prepare(
-      `INSERT INTO audit_logs
-         (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      Date.now(),
+    const values = [
+      options.timestamp == null ? Date.now() : options.timestamp,
       level,
       event,
       rec.actor_id == null || rec.actor_id === '' ? null : Number(rec.actor_id) || null,
@@ -270,8 +271,26 @@ async function writeRow(env, rec, event, level) {
       clampStr(rec.rid, 80),
       clampStr(rec.ua, 160),
       metaJson(rec.meta)
-    ).run()
+    ]
+    const clientError = options.clientErrorDayStart != null && event === CLIENT_ERROR_EVENT
+    const sql = clientError
+      ? `INSERT INTO audit_logs
+           (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE (SELECT COUNT(*) FROM audit_logs WHERE event = ? AND ts >= ? AND ts < ?) < ?`
+      : `INSERT INTO audit_logs
+           (ts, level, event, actor_id, actor_name, target_type, target_id, ip, method, path, status, rid, ua, meta)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    const bindings = clientError
+      ? [...values, CLIENT_ERROR_EVENT, options.clientErrorDayStart, options.clientErrorDayStart + 86400000, CLIENT_ERROR_DAILY_CAP]
+      : values
+    const result = await env.DB.prepare(sql).bind(...bindings).run()
+    if (result && result.success === false) throw new Error('D1 audit insert reported success=false')
     auditMissingAt = 0
+    // The daily-cap SQL has exactly one intentional no-insert result. Keep it
+    // distinct from database errors so a failed write is never reported as a cap hit.
+    if (clientError && result && result.meta && result.meta.changes === 0) return 'daily-cap'
+    return 'written'
   } catch (err) {
     // 审计失败只能降级成控制台日志：不能把异常抛回请求路径
     const msg = String((err && err.message) || '')
@@ -304,60 +323,24 @@ async function writeRow(env, rec, event, level) {
  * @param {object} rec { event, level, actor_id, actor_name, target_type, target_id,
  *                       status, ip, method, path, rid, ua, meta }
  */
-// 客户端自述上报（/api/log/client）的全局日闸门
-//
-// 该端点未认证、内容完全由客户端控制，每分钟预算只管住单个 isolate 的瞬时速率，
-// 管不住跨 isolate 的整天累积。所以再加一道 D1 侧的日上限：
-// 每分钟最多查一次（结果缓存在 isolate 内，避免洪水时每个请求都 COUNT），
-// 超过上限后当天不再落库，只写控制台（Workers Logs），
-// 这样即使被刷也不会把证据表灌满，正常运维仍能在面板里看到有限的客户端报错。
-const CLIENT_ERROR_EVENT = 'client.error'
-const CLIENT_ERROR_DAILY_CAP = 2000
-let clientDayGate = { day: -1, checkedAt: 0, exhausted: false }
-
-// 仅供测试：清掉 isolate 内的日闸门缓存，否则同一进程里换个库也复用旧的判定
-export function resetClientDayGate() {
-  clientDayGate = { day: -1, checkedAt: 0, exhausted: false }
-}
-
-async function clientDayExhausted(env, event, now) {
-  if (event !== CLIENT_ERROR_EVENT) return false
-  const day = Math.floor(now / 86400000)
-  if (clientDayGate.day !== day) clientDayGate = { day, checkedAt: 0, exhausted: false }
-  if (clientDayGate.exhausted) return true
-  if (now - clientDayGate.checkedAt < 60000) return false
-  clientDayGate.checkedAt = now
-  try {
-    const row = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM audit_logs WHERE event = 'client.error' AND ts >= ?"
-    ).bind(day * 86400000).first()
-    if (Number(row && row.n) >= CLIENT_ERROR_DAILY_CAP) {
-      clientDayGate.exhausted = true
-      return true
-    }
-  } catch { /* 查不到就放行：D1 异常时不该把日志整体掐掉，交给每分钟预算兜底 */ }
-  return false
-}
-
+// 客户端自述上报（/api/log/client）每日最多落库 2000 条。
+// 限额在 writeRow 的单条 INSERT ... SELECT 条件中检查，与插入由 D1 原子执行，
+// 因此多个请求/isolate 同时接近上限也不会超写；其他审计事件不受此日额度限制。
 export function audit(env, ctx, rec) {
   const task = (async () => {
     if (!env || !env.DB) return
 
     const event = clampStr(rec.event || 'unknown', 64)
+    // A client.error's minute-budget reservation is provisional until its D1
+    // daily-cap INSERT settles. Do not yield when there is nothing pending:
+    // reserve the current budget synchronously before a later client.error can run.
+    if (event !== CLIENT_ERROR_EVENT) {
+      while (pendingClientErrorWrites.size > 0) {
+        await Promise.all([...pendingClientErrorWrites])
+      }
+    }
     const now = Date.now()
     const minute = Math.floor(now / 60000)
-
-    // 客户端报错超日上限：只留控制台，不落证据表
-    if (await clientDayExhausted(env, event, now)) {
-      try {
-        console.warn(safeStringify({
-          ts: new Date(now).toISOString(), level: 'warn', event,
-          dropped: 'daily-cap', cap: CLIENT_ERROR_DAILY_CAP,
-          ip: rec.ip || '', path: rec.path || '', meta: rec.meta || null
-        }))
-      } catch { /* 彻底放弃 */ }
-      return
-    }
 
     if (auditBudget.minute !== minute) {
       const prev = auditBudget
@@ -414,7 +397,39 @@ export function audit(env, ctx, rec) {
       else auditBudget.n += 1
     }
 
-    await writeRow(env, rec, event, level)
+    const clientErrorDayStart = event === CLIENT_ERROR_EVENT
+      ? Math.floor(now / 86400000) * 86400000
+      : null
+    const writeResult = writeRow(env, rec, event, level, {
+      timestamp: clientErrorDayStart == null ? null : now,
+      clientErrorDayStart
+    }).then((result) => {
+      if (result === 'daily-cap') {
+        // A quota no-op must not consume the isolate's independent per-minute
+        // allowance and indirectly suppress unrelated audit events.
+        if (auditBudget.minute === minute) auditBudget.n = Math.max(0, auditBudget.n - 1)
+        try {
+          console.warn(safeStringify({
+            ts: new Date(now).toISOString(), level: 'warn', event,
+            dropped: 'daily-cap', cap: CLIENT_ERROR_DAILY_CAP,
+            ip: rec.ip || '', path: rec.path || '', meta: rec.meta || null
+          }))
+        } catch { /* 彻底放弃 */ }
+      }
+      return result
+    })
+    if (clientErrorDayStart != null) {
+      // Keep the barrier pending through cap-result accounting so ordinary
+      // events re-check the budget only after a no-op reservation is refunded.
+      let trackedWrite
+      trackedWrite = writeResult.catch(() => undefined).finally(() => {
+        pendingClientErrorWrites.delete(trackedWrite)
+      })
+      pendingClientErrorWrites.add(trackedWrite)
+      await trackedWrite
+    } else {
+      await writeResult
+    }
   })()
 
   if (ctx && typeof ctx.waitUntil === 'function') {

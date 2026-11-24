@@ -110,7 +110,7 @@ test('8 个并发错误码：attempts 最终等于 5，不因竞态超额', asyn
   const row = await env.DB.prepare('SELECT attempts FROM email_codes WHERE id = ?').bind(id).first()
   assert.equal(Number(row.attempts), 5, '错误尝试必须被原子地卡在 5 次，不能到 8 次')
   assert.equal(results.filter((r) => r.status === 400).length, 8, '错误码一律失败')
-  assert.equal(results.filter((r) => /不正确/.test(String(r.body.error))).length, 5, '只有 5 次真正占用尝试次数')
+  assert.ok(results.every((r) => r.body.error === '验证码无效，请重新检查邮箱和验证码后重试'), 'bind 验证失败原因统一，不根据响应区分有效尝试数')
 })
 
 test('8 个并发正确码：最多消费一次，邮箱只绑定一次', async () => {

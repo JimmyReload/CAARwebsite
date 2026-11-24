@@ -323,7 +323,7 @@ export default {
     busy: '处理中…',
     login: '登录',
     register: '注册',
-    registerOk: '注册成功，请登录',
+    registerOk: '如果账号已创建，请登录；如仍无法使用，请检查信息或重试。',
     noAccount: '还没有账号？',
     hasAccount: '已有账号？',
     goRegister: '注册账号',
