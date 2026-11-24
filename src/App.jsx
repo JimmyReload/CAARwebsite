@@ -460,6 +460,7 @@ function Shell({ user, setUser, ready, notifUnread }) {
           <Anchor to="/" id="projects" className="mast-anchor">{t('nav.projects')}</Anchor>
           <Anchor to="/" id="members" className="mast-anchor">{t('nav.members')}</Anchor>
           <Anchor to="/" id="faq" className="mast-anchor">{t('nav.faq')}</Anchor>
+          <Link to="/news" className="mast-anchor">{t('nav.news')}</Link>
           {ready && !user && <Link className="mast-cta" to="/login">{t('nav.login')}</Link>}
           {ready && user && (
             <>
