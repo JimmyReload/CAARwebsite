@@ -30,11 +30,12 @@ function installSessionStorage() {
 
 function installFetch() {
   const calls = []
-  globalThis.fetch = (url) => {
+  globalThis.fetch = (url, init = {}) => {
     let settle
     const gate = new Promise((resolve) => { settle = resolve })
     calls.push({
       url: String(url),
+      init,
       ok: (payload) => settle({ ok: true, status: 200, json: async () => payload }),
       fail: (status, error) => settle({ ok: false, status, json: async () => ({ error }) }),
     })
@@ -187,12 +188,16 @@ test('退出登录失败：抛错、保留登录态与缓存，不能假装已�
   assert.ok(panel.readInboxCache(101), '失败时不应清缓存')
 })
 
-test('退出登录成功：服务端确认后才清身份与缓存', async () => {
+test('退出登录成功：使用空 JSON 请求体，服务端确认后才清身份与缓存', async () => {
   reset()
   panel.syncPanelAuth(101, true)
   panel.writeInboxCache(101, inbox(9001, 101, 'to-be-cleared', 1))
   panel.writeUserCache({ id: 101, username: 'alice' })
   const p = panel.logoutSession()
+  assert.equal(calls[0].url, '/api/logout')
+  assert.equal(calls[0].init.method, 'POST')
+  assert.equal(calls[0].init.headers['content-type'], 'application/json')
+  assert.equal(calls[0].init.body, '{}', '需有 JSON Content-Type 满足 Worker CSRF 请求体检查')
   calls[0].ok({ ok: true })
   await p
   assert.equal(panel.currentIdentity(), null)

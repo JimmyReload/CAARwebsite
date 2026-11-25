@@ -237,7 +237,10 @@ export function prefetchPanel(user) {
  * 请求失败会抛错 —— 调用方必须提示重试，不能把「没清掉 Cookie」说成已退出。
  */
 export async function logoutSession() {
-  await api('/logout', { method: 'POST' })
+  // Worker 要求带会话 Cookie 的写请求使用 application/json。
+  // 即使登出没有业务字段也发送空对象，否则浏览器无正文 POST 可能被 Fetch 适配层
+  // 表示成一个 body stream，却没有 Content-Type，触发 CSRF 闸门 415。
+  await api('/logout', { method: 'POST', body: {} })
   clearPanelCache()
   identity = null
   verified = true // 已由服务端确认处于未登录状态
