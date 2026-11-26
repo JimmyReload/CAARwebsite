@@ -14,6 +14,8 @@
 import test, { before, after } from 'node:test'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 
 function installSessionStorage() {
   const store = new Map()
@@ -77,6 +79,26 @@ before(async () => {
 })
 
 after(async () => { await server.close() })
+
+test('HuntCard：有缩略图时不叠加赛事名称占位文字', () => {
+  const hunt = {
+    id: 'tph', title: "Let's Try Puzzle Hunt", url: 'https://puzzle.cat/hunt/tph',
+    thumb: 'https://cdn.example.test/tph.png', status: 'running', interested: [],
+    tags: [], completedBy: [], mine: false, missing: false, type: 'regular',
+    rating: 0, lang: 'en', external: false, startAt: '2026-11-01', endAt: null,
+  }
+  const markup = renderToStaticMarkup(React.createElement(huntsView.HuntCard, {
+    hunt, pending: false, onToggle() {},
+  }))
+  assert.match(markup, /<img[^>]+src="https:\/\/cdn\.example\.test\/tph\.png"/)
+  assert.doesNotMatch(markup, /hunt-thumb-fallback|hunt-fallback-text/)
+
+  const noThumbMarkup = renderToStaticMarkup(React.createElement(huntsView.HuntCard, {
+    hunt: { ...hunt, thumb: '' }, pending: false, onToggle() {},
+  }))
+  assert.match(noThumbMarkup, /hunt-thumb-fallback/)
+  assert.match(noThumbMarkup, /Let&#x27;s Try Puzzle Hunt/)
+})
 
 function reset() {
   calls.length = 0

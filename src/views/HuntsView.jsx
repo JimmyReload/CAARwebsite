@@ -48,7 +48,8 @@ function fallbackClass(title) {
   return ' is-sm'
 }
 
-function HuntCard({ hunt, pending, onToggle }) {
+export function HuntCard({ hunt, pending, onToggle }) {
+  const [thumbFailed, setThumbFailed] = useState(false)
   const status = STATUS_TONE[hunt.status] || ''
   const statusLabel = status ? t('hunts.status.' + status) : t('hunts.longTerm')
   const shown = hunt.interested.slice(0, 5)
@@ -59,16 +60,18 @@ function HuntCard({ hunt, pending, onToggle }) {
   return (
     <article id={'hunt-' + hunt.id} className={'hunt' + (hunt.mine ? ' hunt--mine' : '') + (hunt.missing ? ' hunt--missing' : '')}>
       <a className="hunt-thumb" href={hunt.url} target="_blank" rel="noreferrer" tabIndex={-1} aria-hidden="true">
-        <span className="hunt-thumb-fallback">
-          <span className={'hunt-fallback-text' + fallbackClass(hunt.title)}>{hunt.title || '?'}</span>
-        </span>
-        {hunt.thumb && (
+        {(!hunt.thumb || thumbFailed) && (
+          <span className="hunt-thumb-fallback">
+            <span className={'hunt-fallback-text' + fallbackClass(hunt.title)}>{hunt.title || '?'}</span>
+          </span>
+        )}
+        {hunt.thumb && !thumbFailed && (
           <img
             src={hunt.thumb}
             alt=""
             loading="lazy"
             decoding="async"
-            onError={(e) => { e.currentTarget.style.display = 'none' }}
+            onError={() => setThumbFailed(true)}
           />
         )}
         <span className={'hunt-badge' + (status ? ' hunt-badge--' + status : '')}>{statusLabel}</span>
