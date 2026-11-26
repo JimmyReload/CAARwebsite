@@ -10,6 +10,8 @@ const OAUTH_ERRORS = {
   banned: 'auth.oauthBanned',
   noemail: 'auth.oauthNoEmail',
   unconfigured: 'auth.oauthUnconfigured',
+  conflict: 'auth.oauthAccountConflict',
+  invalidid: 'auth.oauthInvalidId',
 }
 
 /* App 与 AuthView 之间传错误码的键：App 处理完 ?oauth= 后写进来，AuthView 取一次即清 */

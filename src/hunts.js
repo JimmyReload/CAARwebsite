@@ -46,6 +46,7 @@ function normalize(h) {
       : 'https://puzzle.cat/hunts/' + encodeURIComponent(id);
   return {
     id,
+    slug,
     title: text(h.title, 160),
     summary: text(h.summary, 400),
     url,

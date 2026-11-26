@@ -154,6 +154,45 @@ test('投稿待审队列达到五篇后拒绝新稿和退回稿重投', async ()
   assert.equal(mine.body.list.find((item) => item.id === rejectedId).status, 'rejected')
 })
 
+
+test('迁移 0013/0014 建立完赛快照和退避字段', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+  db.exec("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))")
+  db.exec(readFileSync(new URL('../migrations/0013_hunt_completion_cache.sql', import.meta.url), 'utf8'))
+  let cols = db.prepare('PRAGMA table_info(hunt_completion_cache)').all().map((row) => row.name)
+  assert.deepEqual(cols, ['id', 'payload', 'fetched_at', 'refresh_until'])
+  db.prepare('INSERT INTO hunt_completion_cache (id, payload, fetched_at, refresh_until) VALUES (1, ?, ?, ?)').run('{}', 1, 0)
+  db.exec(readFileSync(new URL('../migrations/0014_hunt_completion_retry_after.sql', import.meta.url), 'utf8'))
+  cols = db.prepare('PRAGMA table_info(hunt_completion_cache)').all().map((row) => row.name)
+  assert.ok(cols.includes('retry_after'))
+  assert.equal(db.prepare('SELECT retry_after FROM hunt_completion_cache WHERE id=1').get().retry_after, 0, '既有单行缓存通过默认值平滑升级')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE version IN (?, ?)').get('0013_hunt_completion_cache', '0014_hunt_completion_retry_after').n, 2)
+  db.close()
+})
+
+
+test('迁移 0012 在生产前序结构上保存唯一 puzzlecat_id', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+  db.exec(`CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT);`)
+  const sql = readFileSync(new URL('../migrations/0012_add_puzzlecat_id.sql', import.meta.url), 'utf8')
+  db.exec(sql)
+  const columns = db.prepare('PRAGMA table_info(users)').all().map((row) => row.name)
+  assert.ok(columns.includes('puzzlecat_id'))
+  db.prepare('INSERT INTO users (id, username, email, puzzlecat_id) VALUES (?, ?, ?, ?)').run(1, 'a', 'a@example.test', 'profile-key')
+  assert.throws(() => db.prepare('INSERT INTO users (id, username, email, puzzlecat_id) VALUES (?, ?, ?, ?)').run(2, 'b', 'b@example.test', 'profile-key'))
+  // 旧账号和密码注册账号保持 NULL 可用，唯一索引只约束非 NULL 的已绑定值。
+  db.prepare('INSERT INTO users (id, username, email) VALUES (?, ?, ?)').run(3, 'legacy', 'legacy@example.test')
+  db.prepare('INSERT INTO users (id, username, email) VALUES (?, ?, ?)').run(4, 'password-user', 'pw@example.test')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM users WHERE puzzlecat_id IS NULL').get().n, 2)
+  assert.equal(db.prepare('SELECT version FROM schema_migrations').get().version, '0012_add_puzzlecat_id')
+  db.close()
+})
+
 test('迁移 0011 在 schema_migrations 已存在时可完整执行', async () => {
   const { readFileSync } = await import('node:fs')
   const { DatabaseSync } = await import('node:sqlite')

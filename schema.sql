@@ -18,9 +18,11 @@ CREATE TABLE IF NOT EXISTS users (
   banned INTEGER NOT NULL DEFAULT 0,
   session_version INTEGER NOT NULL DEFAULT 0,
   email TEXT,
+  puzzlecat_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_puzzlecat_id ON users(puzzlecat_id) WHERE puzzlecat_id IS NOT NULL;
 
 -- 邮箱验证码（只存哈希，不存明文）
 CREATE TABLE IF NOT EXISTS email_codes (
@@ -102,6 +104,15 @@ CREATE TABLE IF NOT EXISTS hunt_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_hunt_notif_user ON hunt_notifications(user_id, id DESC);
 
+-- 0013 建立公开完赛记录缓存；0014 增加 retry_after。只存 profile 可见的 Hunt key 与站内用户显示名。
+CREATE TABLE IF NOT EXISTS hunt_completion_cache (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  payload TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  refresh_until INTEGER NOT NULL DEFAULT 0,
+  retry_after INTEGER NOT NULL DEFAULT 0
+);
+
 -- 迁移版本记录：与 migrations/ 下的文件对应，用于确认线上跑到第几号
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
@@ -166,8 +177,8 @@ CREATE INDEX IF NOT EXISTS idx_news_review ON news_articles(status, id DESC);
 -- ============================================================
 -- 迁移版本登记（仅全新环境）
 --
--- 上面建出的结构已覆盖所有迁移表结构；全新库在此登记 0002–0011，避免
--- 「全新环境」与「生产环境」的 schema_migrations 对不上（生产是逐条执行迁移记的）。
+-- 上面建出的结构已覆盖迁移 0002–0014 的最终表结构；全新库在此逐版登记
+-- 0002–0014（不含不存在的 0001），避免「全新环境」与「生产环境」的 schema_migrations 对不上。
 -- 0007 是数据迁移（把 admin 升为 superadmin），新库里没有 admin 账号、
 -- 执行也是空操作，同样登记，避免之后被重复执行。
 -- ============================================================
@@ -181,4 +192,7 @@ INSERT OR REPLACE INTO schema_migrations (version) VALUES
   ('0008_add_schema_migrations_and_login_fails'),
   ('0009_add_login_fails_blocks'),
   ('0010_add_audit_logs'),
-  ('0011_news_articles');
+  ('0011_news_articles'),
+  ('0012_add_puzzlecat_id'),
+  ('0013_hunt_completion_cache'),
+  ('0014_hunt_completion_retry_after');

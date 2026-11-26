@@ -77,6 +77,19 @@ test('M-1：管理员不能重置同级管理员的口令', async () => {
   assert.equal(await version(env, 3), 0)
 })
 
+test('管理员与超管都不能用 PATCH 重置自己的密码（必须走旧密码校验流程）', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+
+  for (const [id, token] of [[1, SUPER], [2, ADMIN]]) {
+    const r = await api(worker, env, `admin/users/${id}`, {
+      method: 'PATCH', token, body: { new_password: 'Another-Strong-9' }
+    })
+    assert.equal(r.status, 403, '自助改密必须走 /change-password')
+    assert.equal(await version(env, id), 0, '拒绝时不得增加会话版本')
+  }
+})
+
 test('M-1：管理员仍可重置普通成员口令，且会话被踢', async () => {
   const env = makeEnv({ fullSchema: true })
   await seed(env)

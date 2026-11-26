@@ -168,7 +168,7 @@ test('exchangeCode 成功取到 access_token；失败带上游 error 码', async
   })
 })
 
-test('fetchUserinfo 解上游统一包装；403 归为 access_denied', async () => {
+test('fetchUserinfo 校验并规范 userinfo.id，拒绝缺失或含控制字符的 ID', async () => {
   const up = fakeUpstream({ profile: { id: 7, email: 'A@B.com', nickname: '缪月', avatar: 'x', bio: 'b' } })
   await withUpstream(up, async () => {
     const p = await fetchUserinfo(ENV_OAUTH, 'at_1')
@@ -177,6 +177,13 @@ test('fetchUserinfo 解上游统一包装；403 归为 access_denied', async () 
     assert.equal(p.nickname, '缪月')
   })
   assert.equal(up.calls[0].headers.authorization, 'Bearer at_1')
+
+  for (const id of ['', 'bad' + String.fromCharCode(10) + 'id', 'x'.repeat(129)]) {
+    const invalid = fakeUpstream({ profile: { id, email: 'a@b.com', nickname: 'x' } })
+    await withUpstream(invalid, async () => {
+      await assert.rejects(() => fetchUserinfo(ENV_OAUTH, 'at_1'), (err) => err.code === 'invalid_user_id')
+    })
+  }
 
   // 上游失败形状：code/data 包装，不是 error 字段
   const denied = fakeUpstream({ userinfoBody: { code: 403, message: '账号已被禁用', data: null }, userinfoStatus: 403 })
@@ -209,6 +216,32 @@ test('start：302 到授权页，state 落 HttpOnly Cookie 且不回显在跳转
   assert.match(cookies, /HttpOnly/i)
   assert.match(cookies, /SameSite=Lax/i, '回跳是同站顶层导航，Lax 才带得上')
   assert.match(cookies, /caar_oauth_next=%2Fmember/)
+})
+
+test('www start 先通过全站规范化跳到 apex，再创建 apex state cookie', async () => {
+  const env = oauthEnv({
+    PUZZLECAT_REDIRECT_URI: 'https://caar.fun/api/oauth/puzzlecat/callback'
+  })
+  const www = await worker.fetch(new Request(
+    'https://www.caar.fun/api/oauth/puzzlecat/start?next=%2Fhunts'
+  ), env, ctx)
+  assert.equal(www.status, 308)
+  assert.equal(
+    www.headers.get('location'),
+    'https://caar.fun/api/oauth/puzzlecat/start?next=%2Fhunts'
+  )
+  assert.equal(www.headers.get('set-cookie'), null, '规范化之前不应把 host-only state 写给 www')
+
+  const apex = await worker.fetch(new Request(www.headers.get('location')), env, ctx)
+  assert.equal(apex.status, 302)
+  const cookies = apex.headers.getSetCookie ? apex.headers.getSetCookie() : [apex.headers.get('set-cookie') || '']
+  const combined = cookies.join('; ')
+  assert.match(combined, /caar_oauth_state=[^;]+/)
+  assert.doesNotMatch(combined, /Domain=/i, 'host-only cookie 应属于规范 apex')
+  const authorize = new URL(apex.headers.get('location'))
+  assert.equal(authorize.origin + authorize.pathname, 'https://puzzle.cat/oauth/authorize')
+  assert.equal(authorize.searchParams.get('redirect_uri'), 'https://caar.fun/api/oauth/puzzlecat/callback')
+  assert.equal(authorize.searchParams.get('scope'), 'profile')
 })
 
 test('callback：state 不匹配/缺失一律拒绝，且不发起任何上游请求', async () => {
@@ -251,6 +284,7 @@ test('首登建号：邮箱不存在 → 建号 + 会话 Cookie + 撤销令牌',
     assert.ok(row, '邮箱归一化后建号')
     assert.equal(row.nickname, '新人')
     assert.equal(row.role, 'user')
+    assert.equal(row.puzzlecat_id, '42', '首登必须持久化 userinfo.id 作为公开 profileKey')
     assert.ok(isOauthOnly(row.password), '首登账号必须标记为"未设口令"')
   })
   // 上游调用顺序：token → userinfo → revoke（用完即撤销，本站不长期持有凭据）
@@ -272,9 +306,76 @@ test('二次登录：同邮箱命中已有账号，不重复建号，昵称不�
     const r = await callback(env, { state: 's', cookies: 'caar_oauth_state=s' })
     assert.match(r.location, /oauth=ok/)
   })
-  const rows = (await env.DB.prepare('SELECT id, username, nickname FROM users').all()).results
+  const rows = (await env.DB.prepare('SELECT id, username, nickname, puzzlecat_id FROM users').all()).results
   assert.equal(rows.length, 1, '同邮箱不应建第二个账号')
   assert.equal(rows[0].nickname, '站内昵称', 'OAuth 只用来认人，不改站内资料')
+  assert.equal(rows[0].puzzlecat_id, '42', '历史邮箱账号首次 OAuth 成功后应绑定 provider ID')
+})
+
+test('已有同邮箱账号首登 OAuth 时绑定 userinfo.id', async () => {
+  const env = oauthEnv()
+  await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
+    .bind('legacy', 'deadbeef:deadbeef', '原站内昵称', 'user', 'legacy@example.com').run()
+
+  const up = fakeUpstream({ profile: { id: 'profile-legacy-42', email: 'legacy@example.com', nickname: '上游昵称' } })
+  await withUpstream(up, async () => {
+    const r = await callback(env, { state: 's', cookies: 'caar_oauth_state=s' })
+    assert.match(r.location, /oauth=ok/)
+  })
+  const rows = (await env.DB.prepare('SELECT id, nickname, puzzlecat_id FROM users').all()).results
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].nickname, '原站内昵称')
+  assert.equal(rows[0].puzzlecat_id, 'profile-legacy-42')
+})
+
+test('已绑定 userinfo.id 后邮箱变化仍登录同一账号且不覆盖本站邮箱', async () => {
+  const env = oauthEnv()
+  await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email, puzzlecat_id) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind('stable', 'deadbeef:deadbeef', '稳定账号', 'user', 'old@example.com', 'profile-stable-7').run()
+
+  const up = fakeUpstream({ profile: { id: 'profile-stable-7', email: 'new@example.com', nickname: '新邮箱昵称' } })
+  await withUpstream(up, async () => {
+    const r = await callback(env, { state: 's', cookies: 'caar_oauth_state=s' })
+    assert.match(r.location, /oauth=ok/)
+  })
+  const rows = (await env.DB.prepare('SELECT id, email, puzzlecat_id FROM users').all()).results
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].email, 'old@example.com', '不在 OAuth 登录里静默改写本站绑定邮箱')
+  assert.equal(rows[0].puzzlecat_id, 'profile-stable-7')
+})
+
+test('邮箱已绑定另一个 PuzzleCat ID 时拒绝自动合并', async () => {
+  const env = oauthEnv()
+  await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email, puzzlecat_id) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind('legacy', 'deadbeef:deadbeef', '旧用户', 'user', 'same@example.com', 'profile-old-1').run()
+
+  const up = fakeUpstream({ profile: { id: 'profile-new-2', email: 'same@example.com', nickname: '新用户' } })
+  await withUpstream(up, async () => {
+    const r = await callback(env, { state: 's', cookies: 'caar_oauth_state=s' })
+    assert.match(r.location, /oauth=conflict/)
+    assert.equal(r.setCookie.includes('caar_session='), false)
+  })
+  const rows = (await env.DB.prepare('SELECT id, puzzlecat_id FROM users').all()).results
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].puzzlecat_id, 'profile-old-1')
+})
+
+test('同一 PuzzleCat ID 与另一个账号邮箱冲突时拒绝自动合并', async () => {
+  const env = oauthEnv()
+  await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email, puzzlecat_id) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind('provider-owner', 'deadbeef:deadbeef', 'ID 所属', 'user', 'owner@example.com', 'profile-same-9').run()
+  await env.DB.prepare('INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)')
+    .bind('email-owner', 'deadbeef:deadbeef', '邮箱所属', 'user', 'other@example.com').run()
+
+  const up = fakeUpstream({ profile: { id: 'profile-same-9', email: 'other@example.com', nickname: '冲突' } })
+  await withUpstream(up, async () => {
+    const r = await callback(env, { state: 's', cookies: 'caar_oauth_state=s' })
+    assert.match(r.location, /oauth=conflict/)
+    assert.equal(r.setCookie.includes('caar_session='), false)
+  })
+  const rows = (await env.DB.prepare('SELECT puzzlecat_id FROM users ORDER BY id').all()).results
+  assert.equal(rows.length, 2)
+  assert.equal(rows[1].puzzlecat_id, null, '冲突账号不能被静默绑定')
 })
 
 test('封禁账号不能借 OAuth 绕过封禁', async () => {

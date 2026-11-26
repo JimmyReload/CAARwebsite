@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import api from '../api'
 import { t } from '../i18n'
 import { readHuntsCache, writeHuntsCache, fetchHunts, currentHuntsEpoch } from '../huntsCache'
+import { startCompletionPolling as startCompletionPollingImpl } from '../completionPolling'
 
 /* 上游时间是带时区的本地时间（默认 Asia/Shanghai），按墙上时间展示，不做时区换算 */
 function fmtDay(iso) {
@@ -52,6 +53,8 @@ function HuntCard({ hunt, pending, onToggle }) {
   const statusLabel = status ? t('hunts.status.' + status) : t('hunts.longTerm')
   const shown = hunt.interested.slice(0, 5)
   const rest = hunt.interested.length - shown.length
+  const completedNames = Array.isArray(hunt.completedBy) ? hunt.completedBy.slice(0, 4) : []
+  const completedNamesText = completedNames.map((person) => person.name).filter(Boolean).join('、')
 
   return (
     <article id={'hunt-' + hunt.id} className={'hunt' + (hunt.mine ? ' hunt--mine' : '') + (hunt.missing ? ' hunt--missing' : '')}>
@@ -98,6 +101,21 @@ function HuntCard({ hunt, pending, onToggle }) {
           ))}
           {rest > 0 && <span className="hunt-person hunt-person--more">{t('hunts.more', { n: rest })}</span>}
         </div>
+        {completedNames.length > 0 && (
+          <p className="hunt-completed" title={t('hunts.completedBy', { names: completedNamesText })}>
+            <span className="hunt-completed__label">{t('hunts.completedLabel')}</span>
+            {completedNames.map((person) => (
+              <span className="hunt-person hunt-person--finished" key={person.name}>
+                {person.name}
+              </span>
+            ))}
+            {hunt.completedBy.length > completedNames.length && (
+              <span className="hunt-person hunt-person--more">
+                {t('hunts.more', { n: hunt.completedBy.length - completedNames.length })}
+              </span>
+            )}
+          </p>
+        )}
 
         <button
           type="button"
@@ -114,6 +132,28 @@ function HuntCard({ hunt, pending, onToggle }) {
 }
 
 const EMPTY = { list: [], mineCount: 0, updatedAt: 0, total: 0 }
+
+export function normalizeHuntsResponse(d) {
+  return {
+    list: d.list || [],
+    mineCount: d.mineCount || 0,
+    updatedAt: d.updatedAt || 0,
+    total: d.total || 0,
+    completionsPending: d.completionsPending === true
+  }
+}
+
+export function applyHuntsResponse(d, commit, setCompletionsPending) {
+  const next = normalizeHuntsResponse(d)
+  commit(next)
+  setCompletionsPending(next.completionsPending)
+  return next
+}
+
+export function startCompletionPolling({ userId, ...options }) {
+  if (!userId) return () => {}
+  return startCompletionPollingImpl({ baseDelayMs: 1000, ...options })
+}
 
 // 只改动一张卡的标记状态，mineCount 由列表重算，避免并发点击时计数漂移
 function withMine(data, huntId, mine, myName) {
@@ -138,6 +178,7 @@ export default function HuntsView({ user, onNotifRead }) {
   const [notifs, setNotifs] = useState([])
   const [notifUnread, setNotifUnread] = useState(0)
   const [feedSource, setFeedSource] = useState('')
+  const [completionsPending, setCompletionsPending] = useState(() => !!readHuntsCache(userId)?.completionsPending)
   const dataRef = useRef(data)
   /* 账号代次 + 请求序号：换账号或连点「刷新」时，只有最新一次请求的响应能落地。
      否则慢的旧响应/上一个账号的响应会覆盖更新后的列表（审计「赛事请求旧响应覆盖新数据」）。 */
@@ -167,6 +208,7 @@ export default function HuntsView({ user, onNotifRead }) {
     setError('')
     setNotifs([])
     setNotifUnread(0)
+    setCompletionsPending(!!cached?.completionsPending)
   }, [userId])
 
   const load = useCallback(async (force) => {
@@ -180,7 +222,7 @@ export default function HuntsView({ user, onNotifRead }) {
       const d = await fetchHunts(userId, force)
       // null = 身份已切换/登出；seq 落后 = 已被更新的一次请求取代：都不许覆盖当前数据
       if (!d || seq !== seqRef.current || gen !== genRef.current || ep !== currentHuntsEpoch() || userId !== userIdRef.current) return
-      commit({ list: d.list || [], mineCount: d.mineCount || 0, updatedAt: d.updatedAt || 0, total: d.total || 0 })
+      applyHuntsResponse(d, commit, setCompletionsPending)
       setFeedSource(d.source || '')
     } catch (err) {
       if (seq === seqRef.current && gen === genRef.current) setError(err.message || t('hunts.loadFailed'))
@@ -193,6 +235,32 @@ export default function HuntsView({ user, onNotifRead }) {
   }, [userId])
 
   useEffect(() => { load(false) }, [load])
+
+  // Worker 在 /hunts 中标记 pending 时，通过轻量端点短轮询快照；缓存完成或进入退避后停止。
+  // Worker 只在 profile 请求成功后才清 pending；provider 故障继续展示 stale 数据但不高频重试。
+  useEffect(() => {
+    if (!userId || !completionsPending) return
+    const gen = genRef.current
+    return startCompletionPolling({
+      userId,
+      isCurrent: () => gen === genRef.current && userId === userIdRef.current,
+      request: () => api('/hunts/completions'),
+      onResult: (result) => {
+        const byHunt = result.byHunt && typeof result.byHunt === 'object' ? result.byHunt : {}
+        const base = dataRef.current
+        commit({
+          ...base,
+          list: base.list.map((hunt) => ({
+            ...hunt,
+            completedBy: byHunt['id:' + hunt.id] || byHunt['slug:' + String(hunt.slug || '').toLowerCase()] || []
+          })),
+          completionsPending: result.pending === true
+        })
+        if (result.pending !== true) setCompletionsPending(false)
+      },
+      onError: () => setCompletionsPending(false)
+    })
+  }, [userId, completionsPending])
 
   // 动态：别人标记了我已标记的 hunt
   useEffect(() => {
@@ -296,6 +364,7 @@ export default function HuntsView({ user, onNotifRead }) {
         <p className="hunt-summary-line">
           {t('hunts.summary', { total: data.total, mine: data.mineCount, people: peopleCount })}
           {data.updatedAt > 0 && <span className="hunt-updated">{t('hunts.updatedAt', { time: clockOf(data.updatedAt) })}</span>}
+          {completionsPending && <span className="hunt-completions-pending">{t('hunts.completionPending')}</span>}
           {feedSource === 'stale-timeout' && <span className="hunt-slow">{t('hunts.refreshSlow')}</span>}
         </p>
 

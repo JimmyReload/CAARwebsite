@@ -17,6 +17,13 @@ function capMsgs(list) {
   return list.length > MAX_MESSAGES ? list.slice(list.length - MAX_MESSAGES) : list
 }
 
+function markInboxRead(list) {
+  const lastId = (list || []).reduce((max, message) =>
+    message.direction === 'to_user' ? Math.max(max, Number(message.id) || 0) : max, 0)
+  if (lastId) return api('/inbox/read', { method: 'POST', body: { last_id: lastId } })
+  return Promise.resolve()
+}
+
 /* 按 id 合并两批消息（本地已渲染的不会被服务端响应覆盖掉），并对总数封顶 */
 export function mergeMsgs(a, b) {
   if (!b || !b.length) return capMsgs(a)
@@ -108,6 +115,7 @@ export default function MemberView({ user }) {
         msgsRef.current = merged
         setMsgs(merged)
         lastIdRef.current = merged.length ? merged[merged.length - 1].id : 0
+        markInboxRead(d.list || []).catch(() => {})
         scrollDown()
       })
       .catch((err) => {
@@ -146,6 +154,7 @@ export default function MemberView({ user }) {
           setMsgs(merged)
           lastIdRef.current = Math.max(lastIdRef.current, d.list[d.list.length - 1].id)
           persist({ list: merged })
+          markInboxRead(d.list).catch(() => {})
           scrollDown()
         }
       } catch { /* 网络抖动下一轮再试 */ }

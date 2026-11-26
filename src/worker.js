@@ -5,10 +5,11 @@
 import { t } from './i18n.js'
 import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentExcerpt, newsDocumentText } from './newsContent.js'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts.js'
+import { getHuntCompletionData } from './huntCompletions.js'
 // 登录节流单独成模块：不依赖 Workers 运行时，可被 tests/ 直接驱动
 import {
   LOGIN_COMBO_MAX, LOGIN_IP_MAX, LOGIN_USER_MAX, LOGIN_STAFF_MAX,
-  ensureLoginSchema, hitLimit, clearLimit, pruneLoginFails, clientIp
+  MESSAGE_USER_MAX, MESSAGE_WINDOW_MS, ensureLoginSchema, hitLimit, hitWindowLimit, clearLimit, pruneLoginFails, clientIp
 } from './loginLimit.js'
 import {
   createLogger, describeError, requestMeta, maskEmail,
@@ -92,21 +93,22 @@ const tooLarge = () => new HttpError(413, 'errors.bodyTooLarge');
 const badBody = (detail) => new HttpError(400, 'errors.badParams', detail);
 
 // 读正文：先按声明长度快速拒绝，再按实际字节数兜底（两条路径都会拒绝）。
-// 返回解析后的 JSON；空正文按 {} 处理（部分路由允许无正文）。
+// 返回 JSON 对象；空正文按 {} 处理（部分路由允许无正文），合法非对象 JSON 拒绝。
+function parseBodyObject(text) {
+  if (!text.trim()) return {};
+  let body;
+  try { body = JSON.parse(text); } catch { throw badBody('malformed_json'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw badBody('json_object_required');
+  return body;
+}
+
 async function readBody(req, maxBytes = MAX_BODY_BYTES) {
   const limit = Math.min(MAX_BODY_BYTES * 2, Math.max(0, Number(maxBytes) || MAX_BODY_BYTES));
   const declared = req.headers.get('content-length');
   if (declared !== null && Number(declared) > limit) throw tooLarge();
 
-  // body 为 null（GET/HEAD 或确实没有正文）：不必读流
-  if (!req.body) {
-    try {
-      const text = await req.text();
-      return text ? JSON.parse(text) : {};
-    } catch {
-      return {};
-    }
-  }
+  // body 为 null（GET/HEAD 或确实没有正文）：空对象交给路由做业务校验
+  if (!req.body) return {};
 
   const reader = req.body.getReader();
   const chunks = [];
@@ -143,8 +145,7 @@ async function readBody(req, maxBytes = MAX_BODY_BYTES) {
   for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
   let text;
   try { text = dec.decode(bytes); } catch { throw badBody('undecodable'); }
-  if (!text.trim()) return {};
-  try { return JSON.parse(text); } catch { throw badBody('malformed_json'); }
+  return parseBodyObject(text);
 }
 
 // ---------- CSRF：带会话 Cookie 的状态变更 ----------
@@ -469,31 +470,66 @@ async function uniqueUsername(env, base) {
 }
 
 /**
- * 按 PuzzleCat 身份找账号，没有就建一个。
+ * 按稳定的 PuzzleCat userinfo.id 找账号；首次授权时以已验证 email 关联旧账号或建号。
  *
- * 身份绑定用 users.email —— 本站邮箱列已有 UNIQUE 索引（0006 迁移），
- * 且 PuzzleCat 的 userinfo 必带 email，因此不新增表、不新增列就能把
- * 「同一邮箱 = 同一个人」这件事落到库约束上。
+ * userinfo.id 同时是公开主页 /users/{profileKey} 的标识（profile API 已核对相等），
+ * 写入 users.puzzlecat_id 后可用于获取该用户的公开 Hunt 记录。
+ * email 仍用于首次关联，且必须存在；后续登录优先按 puzzlecat_id 识别，避免改邮箱后丢账号。
  *
- * 两种情况要分开：
- *   1) 邮箱已存在 → 直接登录该账号（PuzzleCat 已验证过这个邮箱，等价于邮箱持有证明）
- *   2) 邮箱不存在 → 建号，password 写 oauth$ 前缀的随机占位值（见 oauth.js 注释）
- *
- * 邮箱缺失时不建号：没有稳定标识，重复登录会无限建号。
+ * 安全边界：
+ *   1) ID 已绑定 → 只登录该行；若其当前邮箱已归属另一个站内账号，拒绝模糊合并。
+ *   2) ID 未绑定、邮箱命中旧账号 → 仅当该行未绑定或已绑定同一 ID 时才绑定。
+ *   3) ID / 邮箱归属冲突 → 拒绝，不自动转移链接、不合并账号。
+ *   4) 都未命中 → 创建用户并原子写入唯一 puzzlecat_id。
  */
 async function findOrCreateOauthUser(env, profile) {
+  const puzzlecatId = String(profile.id || '').trim();
+  if (!puzzlecatId || puzzlecatId.length > 128 || /[\u0000-\u001f\u007f]/.test(puzzlecatId)) {
+    return { error: 'errors.oauthInvalidId' };
+  }
   const email = String(profile.email || '').trim().toLowerCase();
-  if (!email) return { error: 'errors.oauthNoEmail' };
   try {
     await ensureEmailSchema(env);
   } catch {
     return { error: 'errors.serverError' };
   }
 
-  const existing = await env.DB.prepare(
-    'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE email = ?'
-  ).bind(email).first();
-  if (existing) return { user: existing, created: false };
+  const selectUser = 'SELECT id, username, nickname, role, banned, session_version, created_at, email, puzzlecat_id FROM users';
+  const byProviderId = await env.DB.prepare(selectUser + ' WHERE puzzlecat_id = ?').bind(puzzlecatId).first();
+  if (byProviderId) {
+    // Provider ID 是稳定主键；不因 email 变更另建本站账号，也不在 OAuth 登录里改写
+    // email（本站 email 仍可能是另一个已验证联系人）。若新邮箱已归属于其他本站账号，
+    // 拒绝登录，避免 ID 和 email 分别指向两个账号时造成横向混淆。
+    if (email && email !== String(byProviderId.email || '').trim().toLowerCase()) {
+      const emailOwner = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+      if (emailOwner && Number(emailOwner.id) !== Number(byProviderId.id)) return { error: 'errors.oauthAccountConflict' };
+    }
+    return { user: byProviderId, created: false };
+  }
+
+  if (!email) return { error: 'errors.oauthNoEmail' };
+
+  const existing = await env.DB.prepare(selectUser + ' WHERE email = ?').bind(email).first();
+  if (existing) {
+    if (existing.puzzlecat_id && String(existing.puzzlecat_id) !== puzzlecatId) {
+      return { error: 'errors.oauthAccountConflict' };
+    }
+    try {
+      const linked = await env.DB.prepare(
+        'UPDATE users SET puzzlecat_id = ? WHERE id = ? AND (puzzlecat_id IS NULL OR puzzlecat_id = ?)'
+      ).bind(puzzlecatId, existing.id, puzzlecatId).run();
+      if (Number(linked && linked.meta && linked.meta.changes)) {
+        return { user: { ...existing, puzzlecat_id: puzzlecatId }, created: false };
+      }
+    } catch {
+      // 唯一索引冲突时继续读取当前绑定状态，不能转移他人的 provider ID。
+    }
+    const idOwner = await env.DB.prepare(
+      'SELECT id, username, nickname, role, banned, session_version, created_at, email, puzzlecat_id FROM users WHERE puzzlecat_id = ?'
+    ).bind(puzzlecatId).first();
+    if (idOwner && Number(idOwner.id) === Number(existing.id)) return { user: idOwner, created: false };
+    return { error: 'errors.oauthAccountConflict' };
+  }
 
   // 昵称：上游昵称合规就用，否则沿用用户名（注册路径同样允许不填昵称）
   const nick = normalizeNickname(profile.nickname);
@@ -501,21 +537,29 @@ async function findOrCreateOauthUser(env, profile) {
   const nickname = nick.error ? username : nick.value;
   try {
     const ins = await env.DB.prepare(
-      'INSERT INTO users (username, password, nickname, role, email) VALUES (?, ?, ?, ?, ?)'
-    ).bind(username, makeOauthOnlyPassword(), nickname, 'user', email).run();
+      'INSERT INTO users (username, password, nickname, role, email, puzzlecat_id) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(username, makeOauthOnlyPassword(), nickname, 'user', email, puzzlecatId).run();
     const id = ins.meta && ins.meta.last_row_id;
-    const row = await env.DB.prepare(
-      'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE id = ?'
-    ).bind(id).first();
+    const row = await env.DB.prepare(selectUser + ' WHERE id = ?').bind(id).first();
     return { user: row, created: true };
-  } catch (err) {
-    // 并发首登：两个请求同时看到"邮箱不存在"，其中一个会撞 UNIQUE 索引。
-    // 这不是错误，重查一次即可拿到对方刚建的那一行。
-    const again = await env.DB.prepare(
-      'SELECT id, username, nickname, role, banned, session_version, created_at, email FROM users WHERE email = ?'
-    ).bind(email).first();
-    if (again) return { user: again, created: false };
-    throw err;
+  } catch {
+    // 并发首登：若同一 ID 或 email 已由并发请求建好，返回唯一身份行；
+    // 若两者分别指向不同用户，则拒绝，绝不自动合并。
+    const idOwner = await env.DB.prepare(selectUser + ' WHERE puzzlecat_id = ?').bind(puzzlecatId).first();
+    const emailOwner = await env.DB.prepare(selectUser + ' WHERE email = ?').bind(email).first();
+    if (idOwner && emailOwner && Number(idOwner.id) !== Number(emailOwner.id)) return { error: 'errors.oauthAccountConflict' };
+    if (idOwner) return { user: idOwner, created: false };
+    if (emailOwner && (!emailOwner.puzzlecat_id || String(emailOwner.puzzlecat_id) === puzzlecatId)) {
+      const linked = await env.DB.prepare(
+        'UPDATE users SET puzzlecat_id = ? WHERE id = ? AND (puzzlecat_id IS NULL OR puzzlecat_id = ?)'
+      ).bind(puzzlecatId, emailOwner.id, puzzlecatId).run();
+      if (Number(linked && linked.meta && linked.meta.changes)) {
+        return { user: { ...emailOwner, puzzlecat_id: puzzlecatId }, created: false };
+      }
+      const current = await env.DB.prepare(selectUser + ' WHERE puzzlecat_id = ?').bind(puzzlecatId).first();
+      if (current && Number(current.id) === Number(emailOwner.id)) return { user: current, created: false };
+    }
+    return { error: 'errors.oauthAccountConflict' };
   }
 }
 
@@ -715,8 +759,18 @@ const app = {
    * 业务逻辑在 handle() 里；除日志/响应头外不要往这里加东西。
    */
   async fetch(request, env, ctx) {
-    const started = Date.now();
     const url = new URL(request.url);
+    // 规范主机名：所有 www.caar.fun 请求 308 到裸域，保留 method、path、query。
+    // Location 固定使用本站 canonical origin，不信任 Host/X-Forwarded-Host，防止重定向注入。
+    if (url.hostname.toLowerCase() === 'www.caar.fun') {
+      const canonical = new URL(url.pathname + url.search, 'https://caar.fun');
+      return harden(new Response(null, {
+        status: 308,
+        headers: { location: canonical.href, 'cache-control': 'no-store' }
+      }));
+    }
+
+    const started = Date.now();
     // cf-ray 与 Cloudflare 平台日志天然对得上；本地调试没有就自己生成
     const rid = String(request.headers.get('cf-ray') || '').trim() || crypto.randomUUID();
     const log = createLogger(env, { rid });
@@ -892,6 +946,19 @@ const app = {
     if (path === 'oauth/' + OAUTH_PROVIDER + '/start' && method === 'GET') {
       if (!oauthConfigured(env)) return json({ error: t('errors.oauthNotConfigured') }, 503);
       const redirect = redirectUri(env, url.href);
+      const callbackOrigin = new URL(redirect).origin;
+
+      // OAuth authorize 的 redirect_uri 必须与应用登记值逐字一致；而 state cookie
+      // 是 host-only 的。所以如果用户从 www.caar.fun 进入、登记回调在 caar.fun，
+      // 先把 start 请求规范化到回调所在 origin，再创建 state cookie，避免跨 host 回调丢 state。
+      if (url.origin !== callbackOrigin) {
+        const canonicalStart = new URL(url.pathname + url.search, callbackOrigin);
+        return harden(new Response(null, {
+          status: 302,
+          headers: { location: canonicalStart.href, 'cache-control': 'no-store' }
+        }));
+      }
+
       const next = safeNext(url.searchParams.get('next'), '/account');
       const state = randomState();
       const res = new Response(null, {
@@ -950,7 +1017,7 @@ const app = {
         io.audit('auth.oauth.fail', {
           level: 'warn', status: 400, meta: { reason: 'userinfo', code: err && err.code }
         });
-        return oauthLanding(next, 'failed');
+        return oauthLanding(next, err && err.code === 'invalid_user_id' ? 'invalidid' : 'failed');
       } finally {
         // 本站只用它做一次登录：不保存 PuzzleCat 的令牌，用完即撤销
         if (tokens && tokens.access_token) revokeToken(env, tokens.access_token).catch(() => {});
@@ -961,7 +1028,13 @@ const app = {
         io.audit('auth.oauth.fail', {
           level: 'warn', status: 400, meta: { reason: 'account', code: found.error }
         });
-        return oauthLanding(next, found.error === 'errors.oauthNoEmail' ? 'noemail' : 'failed');
+        const failureCodes = {
+          'errors.oauthNoEmail': 'noemail',
+          'errors.oauthAccountConflict': 'conflict',
+          'errors.oauthInvalidId': 'invalidid'
+        };
+        const failureCode = failureCodes[found.error] || 'failed';
+        return oauthLanding(next, failureCode);
       }
       const row = found.user;
       if (!row) {
@@ -1457,8 +1530,7 @@ const app = {
     // after>0 时只取增量消息（公告只回版本号，变了前端再单独拉）
     if (path === 'inbox' && method === 'GET') {
       const after = Number(url.searchParams.get('after') || 0);
-      // mark=0：只取数据、不推进已读位。用于「登录后在首页后台预取」，避免用户还没看就把消息标成已读
-      const mark = url.searchParams.get('mark') !== '0';
+      // GET 永远只读：后台预取和面板轮询都不能隐式推进已读游标。
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
       const annVersionP = announcementVersion(env);
 
@@ -1473,12 +1545,6 @@ const app = {
           annVersionP
         ]);
         const list = msgs.results;
-        if (list.length && mark) {
-          const last = list[list.length - 1].id;
-          // 已读标记放到响应之后执行，不占用户等待时间
-          if (ctx && ctx.waitUntil) ctx.waitUntil(markRead(env, conv.id, last, true));
-          else await markRead(env, conv.id, last, true);
-        }
         return json({ annVersion, convId: conv.id, list, unread: 0 });
       }
 
@@ -1489,11 +1555,6 @@ const app = {
         env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND direction = 'to_user' AND id > ?").bind(conv.id, conv.user_last_read_id).first()
       ]);
       const list = msgs.results.reverse();
-      const last = list.length ? list[list.length - 1].id : 0;
-      if (last && mark) {
-        if (ctx && ctx.waitUntil) ctx.waitUntil(markRead(env, conv.id, last, true));
-        else await markRead(env, conv.id, last, true);
-      }
       return json({
         announcements: anns,
         annVersion,
@@ -1501,6 +1562,20 @@ const app = {
         list,
         unread: unreadRow ? Number(unreadRow.n) || 0 : 0
       });
+    }
+
+    // 显式推进成员已读位；仅能标记自己的「客服→成员」消息，GET /inbox 永不写入。
+    if (path === 'inbox/read' && method === 'POST') {
+      const b = await readBody(request);
+      const lastId = Number(b.last_id);
+      if (!Number.isSafeInteger(lastId) || lastId < 0) return json({ error: t('errors.badParams') }, 400);
+      const conv = await env.DB.prepare('SELECT id FROM conversations WHERE user_id = ?').bind(user.id).first();
+      if (!conv || lastId === 0) return json({ ok: true });
+      const row = await env.DB.prepare(
+        "SELECT MAX(id) AS n FROM messages WHERE conv_id = ? AND direction = 'to_user' AND id <= ?"
+      ).bind(conv.id, lastId).first();
+      await markRead(env, conv.id, Number(row && row.n) || 0, true);
+      return json({ ok: true });
     }
 
     // ---------- 赛事总览（登录可见） ----------
@@ -1520,15 +1595,22 @@ const app = {
         return json({ error: t('errors.huntsUnavailable') }, 502);
       }
       const feedMs = Date.now() - started;
-      const marks = await loadInterests(env);
+      const [marks, completionData] = await Promise.all([
+        loadInterests(env),
+        getHuntCompletionData(env, ctx).catch(() => ({ byHunt: Object.create(null), source: 'unavailable' }))
+      ]);
       const seen = new Set();
       const list = feed.items.map((h) => {
         seen.add(h.id);
         const m = marks.get(h.id);
         const people = m ? m.people : [];
+        const completed = completionData.byHunt['id:' + h.id]
+          || completionData.byHunt['slug:' + String(h.slug || '').toLowerCase()]
+          || [];
         return {
           ...h,
           interested: people.map((p) => ({ name: p.name, me: p.id === user.id })),
+          completedBy: completed,
           mine: people.some((p) => p.id === user.id)
         };
       });
@@ -1554,6 +1636,7 @@ const app = {
           external: false,
           missing: true,
           interested: m.people.map((p) => ({ name: p.name, me: p.id === user.id })),
+          completedBy: completionData.byHunt['id:' + huntId] || [],
           mine: m.people.some((p) => p.id === user.id)
         });
       }
@@ -1562,6 +1645,7 @@ const app = {
         list,
         total: list.length,
         mineCount: list.filter((h) => h.mine).length,
+        completionsPending: completionData.pending === true,
         // 前端据此提示「刷新没生效」：stale-timeout 表示上游慢、已转后台更新
         source: feed.source || 'unknown'
       });
@@ -1569,6 +1653,14 @@ const app = {
       res.headers.set('x-feed-source', feed.source || 'unknown');
       res.headers.set('server-timing', 'feed;desc=' + (feed.source || 'unknown') + ';dur=' + feedMs);
       return res;
+    }
+
+    // 赛事卡片完赛标记快照；前端仅在 source=pending 时短暂轮询。
+    if (path === 'hunts/completions' && method === 'GET') {
+      const completions = await getHuntCompletionData(env, ctx).catch(() => ({ byHunt: Object.create(null), source: 'unavailable' }));
+      const response = json(completions);
+      response.headers.set('cache-control', 'no-store');
+      return response;
     }
 
     // 标记 / 取消标记「我想参加」
@@ -1660,11 +1752,16 @@ const app = {
       const content = String(b.content || '').trim();
       if (!content) return json({ error: t('errors.contentEmpty') }, 400);
       if (content.length > 1000) return json({ error: t('errors.contentTooLong') }, 400);
-      let conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
-      if (!conv) {
-        const cr = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (?)').bind(user.id).run();
-        conv = { id: cr.meta.last_row_id };
+      try {
+        await ensureLoginSchema(env);
+      } catch {
+        return json({ error: t('errors.throttleUnavailable') }, 503);
       }
+      const limit = await hitWindowLimit(env, 'msg:u:' + user.id, MESSAGE_USER_MAX, MESSAGE_WINDOW_MS);
+      if (limit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: limit.retry }) }, 429, limit.retry);
+      // 唯一 user_id + conflict-ignore 可在并发首发时安全建立唯一会话。
+      await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING').bind(user.id).run();
+      const conv = await env.DB.prepare('SELECT * FROM conversations WHERE user_id = ?').bind(user.id).first();
       const ins = await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, ?, 'to_staff', ?) RETURNING id, created_at").bind(conv.id, user.id, content).all();
       await env.DB.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").bind(conv.id).run();
       const row = (ins.results && ins.results[0]) || {};
@@ -1900,6 +1997,8 @@ const app = {
       // 三处分支共用这一个判定，避免只堵了一条路径又从前门进来。
       const peerAdmin = target.role === 'admin' && !isSuper(user) && id !== user.id;
       const b = await readBody(request);
+      // 管理员改自己的口令必须走 /change-password 验证旧口令，禁止 PATCH 旁路。
+      if (b.new_password !== undefined && id === user.id) return json({ error: t('errors.forbidden') }, 403);
 
       // 授权（设为/撤销管理员）只给超管
       if (b.role !== undefined) {

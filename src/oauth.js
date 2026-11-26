@@ -105,14 +105,21 @@ export async function fetchUserinfo(env, accessToken) {
   const data = await readJson(res);
   // 统一包装：{ code, message, data, timestamp }，用户字段在 data 里
   const profile = data && data.data;
-  if (!res.ok || Number(data && data.code) !== 200 || !profile || profile.id == null || profile.id === '') {
+  if (!res.ok || Number(data && data.code) !== 200 || !profile) {
     const err = new Error('oauth_userinfo_failed');
     err.code = res.status === 403 ? 'access_denied' : 'userinfo_' + res.status;
     err.status = res.status;
     throw err;
   }
+  const profileId = String(profile.id == null ? '' : profile.id).trim();
+  if (!profileId || profileId.length > 128 || /[\u0000-\u001f\u007f]/.test(profileId)) {
+    const err = new Error('oauth_userinfo_invalid_id');
+    err.code = 'invalid_user_id';
+    err.status = 502;
+    throw err;
+  }
   return {
-    id: String(profile.id),
+    id: profileId,
     email: String(profile.email || '').trim().toLowerCase(),
     nickname: String(profile.nickname || '').trim(),
     avatar: String(profile.avatar || '').trim(),

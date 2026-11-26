@@ -19,11 +19,9 @@
 | `src/views/AuthView.jsx` | 登录/注册页的「用 PuzzleCat 账号登录」按钮与失败提示 |
 | `src/views/AccountView.jsx` | 首登建号账号的「设置密码」表单 |
 | `src/App.jsx` | 处理回跳的 `?oauth=` 结果并刷新登录态 |
-| `tests/oauth.test.mjs` | 18 个用例，stub 全局 `fetch` 驱动整条流程 |
+| `tests/oauth.test.mjs` | OAuth 流程、provider ID 持久绑定与冲突保护用例，stub 全局 `fetch` 驱动整条流程 |
 
-**没有新增数据库迁移**：身份绑定落在既有的 `users.email`（0006 迁移已建 UNIQUE 索引），
-口令字段用 `oauth$` 前缀的随机占位值表示「还没设过密码」。
-所以这份代码可以先上线、不需要等迁移，也不会有「代码先于迁移」的 500 窗口。
+**身份绑定字段**：迁移 `0012_add_puzzlecat_id.sql` 新增 `users.puzzlecat_id` 与部分唯一索引，保存 PuzzleCat `userinfo.id`（已核实与公开主页 `/users/{profileKey}` 的 `data.id` 一致）。存量用户下次 OAuth 登录时按已验证邮箱补绑；账号冲突拒绝自动合并。口令字段仍用 `oauth$` 随机占位值标记「还没设过密码」。生产库必须先备份并应用 0012，再部署使用该字段的 Worker。
 
 ### 端点
 
@@ -51,13 +49,16 @@
 
 ```bash
 npx wrangler secret put PUZZLECAT_CLIENT_SECRET
+# 已固定生产 callback URL；OAuth ID 字段需先应用 0012 迁移
+npx wrangler d1 export caar-db --remote --output=backup-before-0012.sql
+npx wrangler d1 execute caar-db --remote --file=migrations/0012_add_puzzlecat_id.sql
 ```
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `PUZZLECAT_CLIENT_ID` | 是 | 申请得到的 App ID |
 | `PUZZLECAT_CLIENT_SECRET` | 是 | App Secret（只放 secret，永不进前端） |
-| `PUZZLECAT_REDIRECT_URI` | 否 | 回调地址。缺省按当前站点推导为 `<origin>/api/oauth/puzzlecat/callback`；**必须与申请时登记的逐字一致** |
+| `PUZZLECAT_REDIRECT_URI` | 是（生产已固定） | `https://caar.fun/api/oauth/puzzlecat/callback`；**必须与申请时登记的逐字一致**。所有 www 请求先 308 到 apex，因此授权回调域稳定 |
 | `PUZZLECAT_BASE` | 否 | 上游域名，默认 `https://puzzle.cat`；仅供本地/测试指向假服务 |
 
 本地联调写 `.dev.vars`（已被 `.gitignore` 忽略）：
@@ -96,6 +97,11 @@ curl -si https://caar.fun/api/oauth/puzzlecat/start | head -3   # 302 + puzzle.c
 
 被封禁的站内账号不能借 OAuth 绕过封禁（回调里查 `banned` 直接拒绝）。
 首登建出来的账号在个人主页可以「设置密码」；设过之后密码登录与 PuzzleCat 登录进的是同一个账号。
+`puzzlecat_id` 是公开个人主页的 ID，可用来读取该用户公开的完赛 Hunt 列表。本站只查询用户公开可见内容。
+
+### 完赛 Hunt 展示（当前开发中的功能）
+
+站内赛事卡片会从绑定账号对应的公开主页读取 `finishedHunts`，仅将明确标记为公开的 Hunt `id` / `slug` 与本站赛事匹配，并展示本站显示名。若用户设置 `hideSolvedHunts`，则不展示该用户的完赛标记。服务端使用 D1 快照缓存、限并发与请求超时；缓存只保存本站用户 ID、公开 Hunt 键和显示名，不保存邮箱、简介、头像或 OAuth 令牌。生产发布前须先备份并执行迁移 `0013_hunt_completion_cache.sql`。
 
 ## 四、安全边界
 

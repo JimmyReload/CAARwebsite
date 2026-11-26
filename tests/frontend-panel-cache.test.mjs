@@ -49,6 +49,7 @@ const calls = installFetch()
 let server
 let panel
 let hunts
+let huntsView
 
 // src 里的相对 import 没写扩展名（Vite 负责解析），所以统一用 Vite SSR 加载真实模块。
 before(async () => {
@@ -72,6 +73,7 @@ before(async () => {
   })
   panel = await server.ssrLoadModule('/src/panelCache.js')
   hunts = await server.ssrLoadModule('/src/huntsCache.js')
+  huntsView = await server.ssrLoadModule('/src/views/HuntsView.jsx')
 })
 
 after(async () => { await server.close() })
@@ -320,6 +322,120 @@ test('F-03 竞态：并发 /me 只有最后发起的那一个能落地（旧先�
   gate.commit(snapE, () => { verified = false; marked = true })
   assert.equal(marked, false)
   assert.equal(verified, true)
+})
+
+test('visibilitychange 身份复核：先隐藏旧身份，再只在 /me 确认后采纳新身份', async () => {
+  const app = await server.ssrLoadModule('/src/App.jsx')
+  const authGate = app.createAuthGate()
+  const events = []
+  let identity = 'A'
+  let user = { id: 'A' }
+  let verified = true
+  let ready = true
+  let unread = 3
+  let resolveRequest
+  const request = () => new Promise((resolve) => { resolveRequest = resolve })
+  const refresh = app.createAuthRefresher({
+    authGate,
+    request,
+    adopt: (nextUser, isVerified) => { user = nextUser; identity = nextUser && nextUser.id; verified = isVerified; events.push(['adopt', identity]) },
+    markUnverified: () => { events.push(['hide', identity]); verified = false },
+    setVerified: (value) => { verified = value },
+    setReady: (value) => { ready = value },
+    setNotifUnread: (value) => { unread = value },
+    setAuthError: () => {}
+  })
+  let listener
+  const doc = {
+    visibilityState: 'visible',
+    addEventListener: (name, fn) => { assert.equal(name, 'visibilitychange'); listener = fn },
+    removeEventListener: (name, fn) => { assert.equal(name, 'visibilitychange'); listener = null }
+  }
+  const cleanup = app.bindVisibilityRefresh(doc, refresh)
+  const pending = listener()
+  assert.deepEqual(events, [['hide', 'A']], '请求期间必须先屏蔽旧身份内容')
+  assert.equal(verified, false)
+  assert.equal(ready, true, 'visibility refresh 不改动初始加载 ready 状态，避免加载 UI 竞态')
+  assert.equal(app.gate({ ready, verified, user, children: 'private A' }).type.name, 'IdentityUnverified', '旧用户的保护页面必须在确认期间卸载')
+  assert.equal(identity, 'A', '尚未确认时不能把快照身份当成新确认身份')
+  resolveRequest({ user: { id: 'B' }, notifUnread: 9 })
+  assert.deepEqual(await pending, { id: 'B' })
+  assert.deepEqual(events, [['hide', 'A'], ['adopt', 'B']])
+  assert.equal(identity, 'B')
+  assert.equal(verified, true)
+  assert.equal(unread, 9)
+  cleanup()
+  assert.equal(listener, null)
+})
+
+test('身份复核开始立即作废私有缓存在途请求，即使 /me 失败也不缓存跨标签账号数据', async () => {
+  reset()
+  const app = await server.ssrLoadModule('/src/App.jsx')
+  panel.syncPanelAuth(101, true)
+  hunts.syncHuntsAuth(101)
+  panel.writeInboxCache(101, inbox(9001, 101, 'old-cache', 1))
+  const inboxFlight = panel.fetchInbox(101)
+  const huntsFlight = hunts.fetchHunts(101)
+  let rejectMe
+  const refresh = app.createAuthRefresher({
+    authGate: app.createAuthGate(),
+    request: () => new Promise((_resolve, reject) => { rejectMe = reject }),
+    adopt: () => assert.fail('failed /me must not adopt an identity'),
+    invalidate: () => { panel.clearPanelCache(); hunts.clearHuntsCache() },
+    markUnverified: panel.markPanelAuthUnverified,
+    setVerified: () => {},
+    setNotifUnread: () => {},
+    setAuthError: () => {}
+  })
+  const verifying = refresh()
+  assert.equal(panel.readInboxCache(101), null)
+  calls[0].ok(inbox(9002, 202, 'other-tab-private', 21))
+  calls[1].ok({ list: [{ id: 'other-tab-hunt' }] })
+  assert.equal(await inboxFlight, null)
+  assert.equal(await huntsFlight, null)
+  rejectMe(new Error('offline'))
+  assert.equal(await verifying, null)
+  assert.equal(panel.isIdentityVerified(), false)
+  assert.equal(panel.readInboxCache(101), null)
+  assert.equal(hunts.readHuntsCache(101), null)
+  assert.equal([...store.values()].some((value) => value.includes('other-tab-private')), false)
+})
+
+test('HuntsView：成功加载 pending 快照会启用轮询，不触发未声明变量错误', async () => {
+  const committed = []
+  const pendingStates = []
+  const next = huntsView.applyHuntsResponse({ list: [], mineCount: 0, total: 2, completionsPending: true }, (value) => committed.push(value), (value) => pendingStates.push(value))
+  assert.equal(next.completionsPending, true)
+  assert.equal(committed[0].total, 2)
+  assert.deepEqual(pendingStates, [true])
+
+  const scheduled = []
+  const cancelled = []
+  const results = []
+  let requests = 0
+  const cleanup = huntsView.startCompletionPolling({
+    userId: 101,
+    isCurrent: () => true,
+    request: async () => { requests += 1; return { pending: true } },
+    onResult: (result) => results.push(result),
+    onError: (error) => { throw error },
+    schedule: (fn, delay) => { scheduled.push({ fn, delay }); return scheduled.length },
+    cancel: (id) => cancelled.push(id)
+  })
+  assert.equal(scheduled.length, 1, 'pending 状态应启动首轮轮询')
+  assert.equal(scheduled[0].delay, 1000)
+  await scheduled[0].fn()
+  assert.equal(requests, 1)
+  assert.deepEqual(results, [{ pending: true }])
+  assert.equal(scheduled.length, 2, '服务端仍 pending 时继续轮询')
+  // Finish the bounded retry window; it must cover the 12.5s worst-case provider batch.
+  for (let index = 1; index < 12; index += 1) await scheduled[index].fn()
+  assert.equal(requests, 12)
+  assert.equal(scheduled.length, 12, '达到上限后不再安排无限轮询')
+  assert.ok(scheduled.reduce((total, item) => total + item.delay, 0) >= 12500)
+  assert.equal(results.at(-1).pending, false)
+  cleanup()
+  assert.deepEqual(cancelled, [12])
 })
 
 test('F-03：/me 未确认时受保护页面渲染重试界面，不把缓存的私信内容交给 children', async () => {

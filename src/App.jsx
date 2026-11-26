@@ -33,6 +33,42 @@ export function createAuthGate() {
   }
 }
 
+/* 复用同一条身份确认路径做显式 refresh 与 visibilitychange：刷新一开始就隐藏
+   受保护内容，只有 /me 成功确认后才采纳新身份并重新显示。 */
+export function createAuthRefresher({ authGate, request, adopt, invalidate = () => {}, markUnverified, setVerified, setNotifUnread, setAuthError }) {
+  return () => {
+    const snap = authGate.bump()
+    // Shared cookies can change outside this tab. Revoke old private-cache flights
+    // before /me settles, including when identity verification later fails.
+    invalidate()
+    markUnverified()
+    setVerified(false)
+    setAuthError('')
+    return request()
+      .then((d) => authGate.commit(snap, () => {
+        adopt(d.user || null, true)
+        setNotifUnread(d.notifUnread || 0)
+        setAuthError('')
+        return d.user || null
+      }))
+      .catch((err) => authGate.commit(snap, () => {
+        markUnverified()
+        setVerified(false)
+        setAuthError((err && err.message) || t('api.failed'))
+        return null
+      }))
+  }
+}
+
+/* 返回清理函数，便于验证并确保监听器调用完整的身份 refresh，而不只是取未读数。 */
+export function bindVisibilityRefresh(documentRef, refresh) {
+  const onVisible = () => {
+    if (documentRef.visibilityState === 'visible') return refresh()
+  }
+  documentRef.addEventListener('visibilitychange', onVisible)
+  return () => documentRef.removeEventListener('visibilitychange', onVisible)
+}
+
 /* 用户态
    · 先用上次的登录态快照渲染外壳，但 verified 保持 false：私信/管理这类敏感内容
      必须等 /me 确认身份后才渲染（审计 F-03）。
@@ -69,31 +105,33 @@ function useUser() {
     setVerified(isVerified)
   }, [])
 
-  // 拉一次 /me 并把结果写回状态；OAuth 回跳后需要重跑一次（Cookie 刚种下）
-  const refresh = useCallback(() => {
-    // 发起时就推进代次：并发的两个 /me 里，先发起的那一个立刻过期；
-    // 回调只认自己这一代，且期间发生登录/退出也会让它整份失效
-    const snap = authGate.current.bump()
-    return api('/me')
-      .then((d) => authGate.current.commit(snap, () => {
-        adopt(d.user || null, true)
-        setNotifUnread(d.notifUnread || 0)
-        setAuthError('')
-        return d.user || null
-      }))
-      .catch((err) => authGate.current.commit(snap, () => {
-        // 身份没有被确认：不清缓存（可能只是断网），但绝不能把它当已认证状态
-        markPanelAuthUnverified()
-        setVerified(false)
-        setAuthError((err && err.message) || t('api.failed'))
-        return null
-      }))
-  }, [adopt])
+  // 拉一次 /me 并把结果写回状态；OAuth 回跳后需要重跑一次（Cookie 刚种下）。
+  // 普通 mount/登录重试保留账号自身 cache；跨标签恢复可见时再显式作废共享 Cookie
+  // 变化前的在途响应与本地私有缓存。
+  const refresh = useCallback(() => createAuthRefresher({
+    authGate: authGate.current,
+    request: () => api('/me'),
+    adopt,
+    markUnverified: markPanelAuthUnverified,
+    setVerified,
+    setNotifUnread,
+    setAuthError
+  })(), [adopt])
+  const refreshOnVisible = useCallback(() => createAuthRefresher({
+    authGate: authGate.current,
+    request: () => api('/me'),
+    adopt,
+    invalidate: () => { clearPanelCache(); clearHuntsCache() },
+    markUnverified: markPanelAuthUnverified,
+    setVerified,
+    setNotifUnread,
+    setAuthError
+  })(), [adopt])
 
   useEffect(() => { refresh().finally(() => setReady(true)) }, [refresh])
   // 所有改用户态的地方（登录、改昵称、退出）都同步写快照
   const setUser = (u) => adopt(u, true)
-  return { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh }
+  return { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh, refreshOnVisible }
 }
 
 /* 首页锚点链接（兼容 HashRouter） */
@@ -480,7 +518,7 @@ function Shell({ user, setUser, ready, notifUnread }) {
 }
 
 export default function App() {
-  const { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh } = useUser()
+  const { user, setUser, notifUnread, setNotifUnread, ready, verified, authError, refresh, refreshOnVisible } = useUser()
   // OAuth 回跳：后端已经种好会话 Cookie，这里把用户态补上并清掉查询串
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -510,16 +548,12 @@ export default function App() {
     }
   }, [user, ready, verified])
 
-  // 切回标签页时刷新未读动态数（不轮询，避免常驻请求）
+  // 切回标签页时重新确认完整身份，而不只是更新未读数：共享 Cookie 可能已由
+  // 另一个标签页切换，refresh 会先隐藏旧身份内容，并在 /me 确认后同步新身份。
   useEffect(() => {
     if (!user) return
-    const onVisible = () => {
-      if (document.visibilityState !== 'visible') return
-      api('/me').then((d) => setNotifUnread(d.notifUnread || 0)).catch(() => {})
-    }
-    document.addEventListener('visibilitychange', onVisible)
-    return () => document.removeEventListener('visibilitychange', onVisible)
-  }, [user, setNotifUnread])
+    return bindVisibilityRefresh(document, refreshOnVisible)
+  }, [user, refreshOnVisible])
 
   return (
     <>

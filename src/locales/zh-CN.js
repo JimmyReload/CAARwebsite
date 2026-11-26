@@ -340,6 +340,8 @@ export default {
     oauthState: '授权已过期或来源校验失败，请重新发起登录',
     oauthBanned: '该账号已被封禁，请联系管理员',
     oauthNoEmail: 'PuzzleCat 账号没有可用邮箱，无法与站内账号对应，请联系管理员',
+    oauthAccountConflict: 'PuzzleCat 账号与本站账号对应关系冲突，请联系管理员处理',
+    oauthInvalidId: 'PuzzleCat 返回的用户标识无效，请联系管理员',
     oauthOk: '✓ 已用 PuzzleCat 账号登录',
   },
 
@@ -376,6 +378,9 @@ export default {
     marked: '✓ 已标记',
     marking: '处理中…',
     nobodyYet: '还没有人标记',
+    completedLabel: '已完赛',
+    completedBy: '已完赛成员：{names}',
+    completionPending: '正在读取公开完赛标记…',
     more: '+{n}',
     me: '我',
     longTerm: '长期赛',

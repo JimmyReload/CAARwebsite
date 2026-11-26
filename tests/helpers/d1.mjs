@@ -40,6 +40,7 @@ export const USERS_DDL = `CREATE TABLE users (
   banned INTEGER NOT NULL DEFAULT 0,
   session_version INTEGER NOT NULL DEFAULT 0,
   email TEXT,
+  puzzlecat_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`
 

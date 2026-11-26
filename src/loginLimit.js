@@ -22,6 +22,8 @@ export const LOGIN_BLOCK_BASE_MS = 60 * 1000;
 export const LOGIN_BLOCK_MAX_MS = 15 * 60 * 1000;
 export const LOGIN_WINDOW_MS = 60 * 60 * 1000;
 export const LOGIN_KEEP_MS = 24 * 60 * 60 * 1000; // 计数行保留 24 小时，Cron 清理
+export const MESSAGE_USER_MAX = 5;
+export const MESSAGE_WINDOW_MS = 60 * 1000;
 
 // 结构变更只走 migrations/：这里**不再执行 ALTER**。
 //
@@ -109,6 +111,29 @@ export async function hitLimit(env, key, max, now = Date.now()) {
   const again = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
   const until = Number(again && again.until) || 0;
   return { blocked: true, fresh: false, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
+}
+
+/**
+ * 固定窗口原子限流。UPSERT 的单条写语句承担计数和限额裁决，
+ * 不使用 SELECT 预查，因而并发请求不能同时读取旧计数后全部放行。
+ * 第 max 次放行；超额请求只读返回 retry，不再改动计数。
+ */
+export async function hitWindowLimit(env, key, max, windowMs, now = Date.now()) {
+  const row = await env.DB.prepare(
+    `INSERT INTO login_fails (key, n, blocks, until, updated_at) VALUES (?, 1, 0, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       n = CASE WHEN ? >= login_fails.until THEN 1 ELSE login_fails.n + 1 END,
+       until = CASE WHEN ? >= login_fails.until THEN ? + ? ELSE login_fails.until END,
+       updated_at = ?
+     WHERE login_fails.n < ? OR ? >= login_fails.until
+     RETURNING n, until`
+  ).bind(key, now + windowMs, now, now, now, now, windowMs, now, max, now).first();
+  if (row) {
+    return { blocked: false, retry: 0, remaining: Math.max(0, max - Number(row.n)) };
+  }
+  const current = await env.DB.prepare('SELECT until FROM login_fails WHERE key = ?').bind(key).first();
+  const until = Number(current && current.until) || now + windowMs;
+  return { blocked: true, retry: Math.max(1, Math.ceil((until - now) / 1000)) };
 }
 
 export async function clearLimit(env, keys) {

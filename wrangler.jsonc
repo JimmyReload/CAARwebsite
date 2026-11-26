@@ -37,6 +37,8 @@
   // 两者缺任意一个时，登录页不显示 PuzzleCat 按钮，/api/oauth/puzzlecat/start 直接 503。
   "vars": {
     "LOG_LEVEL": "info",
-    "AUDIT_KEEP_DAYS": "90"
+    "AUDIT_KEEP_DAYS": "90",
+    "PUZZLECAT_CLIENT_ID": "app_y3TaAt66OVFIQolJyPby7g",
+    "PUZZLECAT_REDIRECT_URI": "https://caar.fun/api/oauth/puzzlecat/callback"
   }
 }

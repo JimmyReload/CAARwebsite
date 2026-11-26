@@ -214,6 +214,17 @@ test('没有 Content-Length 的 100049 字节流式正文也得到 413（F-06 �
   assert.equal(r.status, 413, '只能靠实际读取字节数拦住')
 })
 
+test('合法 JSON null、数组与标量根值统一返回 400 badParams', async () => {
+  const env = makeEnv({ fullSchema: true })
+  for (const body of ['null', '[]', 'true', '42', '"text"']) {
+    const r = await call(env, req('login', {
+      headers: { 'content-type': 'application/json' }, body
+    }))
+    assert.equal(r.status, 400, body + ' 必须按 badParams 拒绝')
+    assert.match(String(r.json && r.json.error), /参数不完整/)
+  }
+})
+
 test('畸形 JSON 返回 400，空正文按 {} 处理', async () => {
   const env = makeEnv({ fullSchema: true })
   const broken = await call(env, req('login', {
@@ -227,6 +238,49 @@ test('畸形 JSON 返回 400，空正文按 {} 处理', async () => {
     headers: { 'content-type': 'application/json' }
   }))
   assert.equal(empty.status, 401, '空正文按 {} 解析后继续业务校验')
+})
+
+test('GET /inbox 只读，显式同源 JSON POST /inbox/read 才推进成员已读位', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seedUser(env)
+  const cr = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (1)').run()
+  const convId = cr.meta.last_row_id
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 9, 'to_user', '客服回复 1')").bind(convId).run()
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 9, 'to_user', '客服回复 2')").bind(convId).run()
+  const before = await env.DB.prepare('SELECT user_last_read_id FROM conversations WHERE id = ?').bind(convId).first()
+  assert.equal(Number(before.user_last_read_id), 0)
+
+  for (const url of ['/api/inbox', '/api/inbox?after=0', '/api/inbox?after=1']) {
+    const get = await call(env, new Request(BASE + url, { headers: { cookie: 'caar_session=' + TOKEN } }))
+    assert.equal(get.status, 200)
+    const current = await env.DB.prepare('SELECT user_last_read_id FROM conversations WHERE id = ?').bind(convId).first()
+    assert.equal(Number(current.user_last_read_id), 0, 'GET 不得推进已读游标')
+  }
+
+  const marked = await call(env, req('inbox/read', {
+    headers: { cookie: 'caar_session=' + TOKEN, origin: BASE, 'content-type': 'application/json' },
+    body: { last_id: 1 }
+  }))
+  assert.equal(marked.status, 200)
+  const after = await env.DB.prepare('SELECT user_last_read_id FROM conversations WHERE id = ?').bind(convId).first()
+  assert.equal(Number(after.user_last_read_id), 1, '只能推进到确认看到的消息，不能跨过未查看的新回复')
+})
+
+test('inbox/read 要求同源 Origin + JSON，非法游标返回 400', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seedUser(env)
+  for (const headers of [
+    { cookie: 'caar_session=' + TOKEN, 'content-type': 'application/json' },
+    { cookie: 'caar_session=' + TOKEN, origin: 'https://attacker.test', 'content-type': 'application/json' }
+  ]) {
+    const r = await call(env, req('inbox/read', { headers, body: { last_id: 1 } }))
+    assert.equal(r.status, 403)
+  }
+  const bad = await call(env, req('inbox/read', {
+    headers: { cookie: 'caar_session=' + TOKEN, origin: BASE, 'content-type': 'application/json' },
+    body: { last_id: 'invalid' }
+  }))
+  assert.equal(bad.status, 400)
 })
 
 test('正文流读取失败按客户端错误 400 处理，不落成 500', async () => {
