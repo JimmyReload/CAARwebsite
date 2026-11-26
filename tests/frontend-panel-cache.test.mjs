@@ -14,6 +14,7 @@
 import test, { before, after } from 'node:test'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
@@ -80,7 +81,7 @@ before(async () => {
 
 after(async () => { await server.close() })
 
-test('HuntCard：有缩略图时不叠加赛事名称占位文字', () => {
+test('HuntCard：缩略图主体放大裁切，且仅无图时显示标题占位', () => {
   const hunt = {
     id: 'tph', title: "Let's Try Puzzle Hunt", url: 'https://puzzle.cat/hunt/tph',
     thumb: 'https://cdn.example.test/tph.png', status: 'running', interested: [],
@@ -92,6 +93,9 @@ test('HuntCard：有缩略图时不叠加赛事名称占位文字', () => {
   }))
   assert.match(markup, /<img[^>]+src="https:\/\/cdn\.example\.test\/tph\.png"/)
   assert.doesNotMatch(markup, /hunt-thumb-fallback|hunt-fallback-text/)
+
+  const css = readFileSync('src/index.css', 'utf8')
+  assert.match(css, /\.hunt-thumb img\s*\{[^}]*object-fit:\s*cover[^}]*transform:\s*scale\(1\.5\)[^}]*transform-origin:\s*center/s)
 
   const noThumbMarkup = renderToStaticMarkup(React.createElement(huntsView.HuntCard, {
     hunt: { ...hunt, thumb: '' }, pending: false, onToggle() {},
