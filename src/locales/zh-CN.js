@@ -378,6 +378,7 @@ export default {
     marked: '✓ 已标记',
     marking: '处理中…',
     nobodyYet: '还没有人标记',
+    interestedLabel: '想参加',
     completedLabel: '已完赛',
     completedBy: '已完赛成员：{names}',
     completionPending: '正在读取公开完赛标记…',

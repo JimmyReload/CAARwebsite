@@ -685,6 +685,7 @@ section[id] { scroll-margin-top: 96px; }
 .hunt-person--me { background: #000; color: var(--yellow); }
 .hunt-person--more { background: transparent; border-style: dashed; }
 .hunt-person--finished { background: #e8f3e8; border-style: dashed; }
+.hunt-people__label { font-family: var(--mono); font-size: 10px; font-weight: 900; color: #555; }
 .hunt-completed { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .hunt-completed__label { font-family: var(--mono); font-size: 10px; font-weight: 900; color: #285c36; }
 .hunt-completions-pending { font-family: var(--mono); font-size: 10px; color: #555; }

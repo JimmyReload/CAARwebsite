@@ -98,6 +98,7 @@ export function HuntCard({ hunt, pending, onToggle }) {
 
         <div className="hunt-people">
           {hunt.interested.length === 0 && <span className="hunt-nobody">{t('hunts.nobodyYet')}</span>}
+          {hunt.interested.length > 0 && <span className="hunt-people__label">{t('hunts.interestedLabel')}</span>}
           {shown.map((p, i) => (
             <span key={i} className={'hunt-person' + (p.me ? ' hunt-person--me' : '')}>
               {p.me ? t('hunts.me') : p.name}
