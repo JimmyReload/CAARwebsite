@@ -148,11 +148,28 @@ function Anchor({ to, id, className, children }) {
 }
 
 /* ============ 首页 ============ */
+/* 断点判断跟着 CSS 走：<1000px 首页不再是「固定视口 + 滚轮翻页」，改成普通长页面。
+   两处必须同时生效——只改 CSS 会出现「页面能滚，但滚轮仍被 JS 拦去翻页」。 */
+export function useMediaQuery(query) {
+  const [matches, setMatches] = useState(() => (
+    typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia(query).matches
+  ))
+  useEffect(() => {
+    const mq = window.matchMedia(query)
+    const onChange = () => setMatches(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [query])
+  return matches
+}
+
 function Home() {
   const loc = useLocation()
   const pagesRef = useRef(null)
   const animRef = useRef(0)
   const [pageIndex, setPageIndex] = useState(0)
+  const compact = useMediaQuery('(max-width: 999px)')
   const pageCount = 5
   // 固定 200ms 的自行缓动：CSS scroll-behavior: smooth 的时长由浏览器决定（整屏约 500ms），不可控。
   const goToPage = (index) => {
@@ -162,6 +179,12 @@ function Home() {
     const from = pages.scrollTop
     cancelAnimationFrame(animRef.current)
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    // 窄屏是文档流：没有可滚动的整屏容器，直接让目标区块滚进视口
+    if (compact) {
+      const section = pages.children[Math.max(0, Math.min(pageCount - 1, index))]
+      if (section) section.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' })
+      return
+    }
     if (reduced || Math.abs(target - from) < 2) {
       pages.style.scrollBehavior = ''
       pages.style.scrollSnapType = ''
@@ -187,12 +210,14 @@ function Home() {
   }
   useEffect(() => () => cancelAnimationFrame(animRef.current), [])
   const onPageKey = (e) => {
-    if (e.target !== e.currentTarget) return
+    if (compact || e.target !== e.currentTarget) return
     const next = { PageDown: pageIndex + 1, PageUp: pageIndex - 1, Home: 0, End: pageCount - 1 }[e.key]
     if (next !== undefined) { e.preventDefault(); goToPage(next) }
   }
   useEffect(() => {
     const pages = pagesRef.current
+    // 窄屏没有整屏容器可翻，滚轮交给浏览器原生滚动
+    if (compact) return
     let lastWheel = -Infinity
     let lockedUntil = 0
     let handled = false
@@ -232,7 +257,7 @@ function Home() {
     }
     pages.addEventListener('wheel', onWheel, { passive: false })
     return () => pages.removeEventListener('wheel', onWheel)
-  }, [])
+  }, [compact])
   useEffect(() => {
     const t2 = loc.state && loc.state.scrollTo
     if (t2) setTimeout(() => { const el = document.getElementById(t2); el && el.scrollIntoView({ behavior: 'smooth' }) }, 60)
@@ -253,7 +278,7 @@ function Home() {
 
   return (
     <>
-    <main ref={pagesRef} className="home-pages" tabIndex={0} aria-label={t('pageNavigation.label')} onKeyDown={onPageKey} onScroll={(e) => { if (e.target === e.currentTarget) setPageIndex(Math.round(e.currentTarget.scrollTop / e.currentTarget.clientHeight)) }}>
+    <main ref={pagesRef} className="home-pages" tabIndex={0} aria-label={t('pageNavigation.label')} onKeyDown={onPageKey} onScroll={(e) => { if (!compact && e.target === e.currentTarget) setPageIndex(Math.round(e.currentTarget.scrollTop / e.currentTarget.clientHeight)) }}>
       <div className="home-intro home-page">
       <section id="top" className="cover">
         <div className="cover-meta">{heroMeta.map((m, i) => <span key={i}>{m}</span>)}</div>
@@ -416,19 +441,21 @@ function Home() {
         </div>
       </footer>
     </main>
-    <nav className="page-dots" aria-label={t('pageNavigation.label')}>
-      <span className="page-dots-count" aria-live="polite">{pageIndex + 1}/{pageCount}</span>
-      {Array.from({ length: pageCount }, (_, i) => (
-        <button
-          key={i}
-          type="button"
-          className={'page-dot' + (i === pageIndex ? ' on' : '')}
-          onClick={() => goToPage(i)}
-          aria-label={t('pageNavigation.dot', { n: i + 1 })}
-          aria-current={i === pageIndex ? 'true' : undefined}
-        />
-      ))}
-    </nav>
+    {!compact && (
+      <nav className="page-dots" aria-label={t('pageNavigation.label')}>
+        <span className="page-dots-count" aria-live="polite">{pageIndex + 1}/{pageCount}</span>
+        {Array.from({ length: pageCount }, (_, i) => (
+          <button
+            key={i}
+            type="button"
+            className={'page-dot' + (i === pageIndex ? ' on' : '')}
+            onClick={() => goToPage(i)}
+            aria-label={t('pageNavigation.dot', { n: i + 1 })}
+            aria-current={i === pageIndex ? 'true' : undefined}
+          />
+        ))}
+      </nav>
+    )}
     </>
   )
 }
@@ -480,8 +507,13 @@ export function gate({ ready, verified, user, authError, refresh, children, rend
 }
 
 /* ============ 布局（刊头导航） ============ */
+/* 宽屏平铺；<1000px 收进汉堡抽屉。抽屉状态只活在 Shell 里：
+   路由一变就收起，Esc 收起，打开时锁住页面滚动（否则抽屉后面还会跟着滑）。 */
 function Shell({ user, setUser, ready, notifUnread }) {
   const [scrolled, setScrolled] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const wide = useMediaQuery('(min-width: 1000px)')
+  const loc = useLocation()
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 60)
     onScroll()
@@ -489,31 +521,60 @@ function Shell({ user, setUser, ready, notifUnread }) {
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
+  // 点链接后立刻收起：HashRouter 只改 hash 时 pathname 可能不变
+  useEffect(() => { setMenuOpen(false) }, [loc.pathname, loc.hash, loc.key])
+  // 窗口拖宽到平铺导航后抽屉状态作废，免得缩回来时自己又弹开
+  useEffect(() => { if (wide) setMenuOpen(false) }, [wide])
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const onKey = (e) => { if (e.key === 'Escape') setMenuOpen(false) }
+    document.addEventListener('keydown', onKey)
+    document.body.classList.add('nav-open')
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.classList.remove('nav-open')
+    }
+  }, [menuOpen])
+
   return (
-    <header className={"mast " + (scrolled ? 'on' : '')}>
-      <div className="mast-in">
-        <Link className="mast-name" to="/">{t('site.name')}</Link>
-        <nav className="mast-nav">
-          <Anchor to="/" id="about" className="mast-anchor">{t('nav.about')}</Anchor>
-          <Anchor to="/" id="projects" className="mast-anchor">{t('nav.projects')}</Anchor>
-          <Anchor to="/" id="members" className="mast-anchor">{t('nav.members')}</Anchor>
-          <Anchor to="/" id="faq" className="mast-anchor">{t('nav.faq')}</Anchor>
-          <Link to="/news" className="mast-anchor">{t('nav.news')}</Link>
-          {ready && !user && <Link className="mast-cta" to="/login">{t('nav.login')}</Link>}
-          {ready && user && (
-            <>
-              <Link to="/hunts" className="mast-hunts">
-                {t('nav.hunts')}
-                {notifUnread > 0 && <span className="mast-badge" aria-label={t('hunts.notif.badgeLabel')}>{notifUnread > 99 ? '99+' : notifUnread}</span>}
-              </Link>
-              <Link to="/member">{t('nav.memberPanel')}</Link>
-              {isStaff(user) && <Link to="/admin">{t('nav.adminPanel')}</Link>}
-              <Link to="/account">{t('nav.account')}</Link>
-            </>
-          )}
-        </nav>
-      </div>
-    </header>
+    <>
+      <header className={"mast " + (scrolled ? 'on' : '')}>
+        <div className="mast-in">
+          <Link className="mast-name" to="/">{t('site.name')}</Link>
+          <button
+            type="button"
+            className="mast-burger"
+            aria-expanded={menuOpen}
+            aria-controls="site-nav"
+            aria-label={menuOpen ? t('nav.closeMenu') : t('nav.openMenu')}
+            onClick={() => setMenuOpen((v) => !v)}
+          >
+            <span /><span /><span />
+          </button>
+          <nav id="site-nav" className={'mast-nav' + (menuOpen ? ' open' : '')} onClick={() => setMenuOpen(false)}>
+            <Anchor to="/" id="about" className="mast-anchor">{t('nav.about')}</Anchor>
+            <Anchor to="/" id="projects" className="mast-anchor">{t('nav.projects')}</Anchor>
+            <Anchor to="/" id="members" className="mast-anchor">{t('nav.members')}</Anchor>
+            <Anchor to="/" id="faq" className="mast-anchor">{t('nav.faq')}</Anchor>
+            <Link to="/news" className="mast-anchor">{t('nav.news')}</Link>
+            {ready && !user && <Link className="mast-cta" to="/login">{t('nav.login')}</Link>}
+            {ready && user && (
+              <>
+                <Link to="/hunts" className="mast-hunts">
+                  {t('nav.hunts')}
+                  {notifUnread > 0 && <span className="mast-badge" aria-label={t('hunts.notif.badgeLabel')}>{notifUnread > 99 ? '99+' : notifUnread}</span>}
+                </Link>
+                <Link to="/member">{t('nav.memberPanel')}</Link>
+                {isStaff(user) && <Link to="/admin">{t('nav.adminPanel')}</Link>}
+                <Link to="/account">{t('nav.account')}</Link>
+              </>
+            )}
+          </nav>
+        </div>
+      </header>
+      {menuOpen && <div className="mast-scrim" role="presentation" onClick={() => setMenuOpen(false)} />}
+    </>
   )
 }
 

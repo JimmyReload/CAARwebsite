@@ -62,6 +62,10 @@ section[id] { scroll-margin-top: 96px; }
 @media (prefers-reduced-motion: no-preference) { .rv { opacity: 1; } }
 
 /* ============ 导航 ============ */
+/* --mast-h 是可见条高度，--mast-offset 含 3px 下边框：正文留白和抽屉定位都用它，
+   改高度只改这两个值，不用再去各页面里找写死的 61/69/90/118。 */
+:root { --mast-h: 66px; --mast-offset: 69px; }
+
 .mast {
   position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
   background: var(--yellow);
@@ -70,9 +74,10 @@ section[id] { scroll-margin-top: 96px; }
 .mast-in {
   max-width: 1200px; margin: 0 auto;
   display: flex; align-items: center; justify-content: space-between;
-  height: 66px; padding: 0 clamp(16px, 2.6vw, 28px);
+  height: var(--mast-h); padding: 0 clamp(16px, 2.6vw, 28px);
 }
-.mast-name { font-family: var(--font); font-size: 19px; font-weight: 900; letter-spacing: -.02em; }
+/* 站名不换行也不被压缩：窗口窄的时候它是最后一个该变形的东西 */
+.mast-name { flex: 0 0 auto; font-family: var(--font); font-size: 19px; font-weight: 900; letter-spacing: -.02em; white-space: nowrap; }
 .mast-name::before { content: "■ "; }
 .mast-nav { display: flex; align-items: center; gap: 6px; }
 .mast-nav a {
@@ -81,8 +86,20 @@ section[id] { scroll-margin-top: 96px; }
 .mast-nav a:hover { background: #000; color: var(--yellow); border-color: #000; }
 .mast-cta { background: #000 !important; color: #fff !important; border: 2px solid #000 !important; }
 .mast-cta:hover { background: var(--red) !important; color: #000 !important; border-color: #000 !important; }
-.mast-burger { display: none; flex-direction: column; gap: 4px; background: none; border: none; padding: 8px; }
-.mast-burger span { width: 22px; height: 3px; background: #000; }
+/* 汉堡只在窄屏出现（见响应式段），三根线的高度/间距与开合时的位移绑定 */
+.mast-burger {
+  display: none; flex-direction: column; justify-content: center; gap: 5px;
+  margin-left: auto; padding: 10px 6px; background: none; border: 0; cursor: pointer;
+}
+.mast-burger span { display: block; width: 24px; height: 3px; background: #000; transition: none; }
+.mast-burger:focus-visible { outline: 3px solid #000; outline-offset: 2px; }
+.mast-burger[aria-expanded="true"] span:nth-child(1) { transform: translateY(8px) rotate(45deg); }
+.mast-burger[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+.mast-burger[aria-expanded="true"] span:nth-child(3) { transform: translateY(-8px) rotate(-45deg); }
+/* 抽屉打开时压暗正文，点空白处即收起 */
+.mast-scrim { position: fixed; top: var(--mast-offset); left: 0; right: 0; bottom: 0; z-index: 999; background: rgba(0, 0, 0, .38); }
+/* 宽屏上抽屉与遮罩都不该存在：拖宽窗口后残留的遮罩会挡住正文、锁住滚动 */
+@media (min-width: 1000px) { .mast-scrim { display: none; } }
 
 .wrap { max-width: 1200px; margin: 0 auto; padding: 0 clamp(16px, 2.6vw, 28px); }
 
@@ -373,6 +390,13 @@ section[id] { scroll-margin-top: 96px; }
 }
 
 /* ============ 登录 / 注册 ============ */
+/* 表单控件的默认宽度来自 size 属性（约 20 字符），网格列按 max-content 撑开，
+   窄屏上输入框会顶出卡片边框。统一让列可收缩、控件填满列宽。 */
+.auth-form, .msg-form, .chat-form, .news-review-label { grid-template-columns: minmax(0, 1fr); }
+.auth-form label, .msg-form label { min-width: 0; }
+.auth-form input, .auth-form select, .auth-form textarea,
+.msg-form input, .msg-form select, .msg-form textarea,
+.chat-form textarea, .news-review-label textarea { width: 100%; min-width: 0; }
 .auth-page { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 118px 18px 60px; }
 .auth-card {
   width: 100%; max-width: 460px; background: #fff;
@@ -429,8 +453,11 @@ section[id] { scroll-margin-top: 96px; }
 .panel-page { min-height: 100vh; min-height: 100dvh; padding: 112px clamp(16px, 4vw, 48px) 80px; max-width: 1040px; margin: 0 auto; }
 .panel-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 24px; border-bottom: 4px solid #000; padding-bottom: 16px; }
 .panel-title { font-family: var(--font); font-size: clamp(26px, 3.5vw, 44px); font-weight: 900; letter-spacing: -.02em; }
+/* 头部入口统一收进 .panel-actions：靠右排一行，窄屏整块换行，不会各自为战 */
+.panel-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .panel-back {
-  margin-left: auto; font-family: var(--mono); font-size: 12.5px; font-weight: 700; background: #fff; border: 3px solid #000; padding: 8px 14px; box-shadow: var(--hard-sm); transition: none;
+  margin-left: 0; font-family: var(--mono); font-size: 12.5px; font-weight: 700; background: #fff; border: 3px solid #000; padding: 8px 14px; box-shadow: var(--hard-sm); transition: none;
+  white-space: nowrap;
 }
 .panel-back:hover { background: var(--yellow); transform: translate(-2px, -2px); box-shadow: var(--hard); }
 .panel-sec { margin-bottom: 22px; background: #fff; border: var(--border); padding: clamp(20px, 3vw, 34px); box-shadow: var(--hard); }
@@ -667,6 +694,7 @@ section[id] { scroll-margin-top: 96px; }
 .hunt-title {
   font-family: var(--font); font-size: 15.5px; font-weight: 900; letter-spacing: -.015em; line-height: 1.32;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  overflow-wrap: anywhere;  /* 无空格的长串（英文赛名/拼音）在窄卡里不能溢出去 */
 }
 .hunt-title a:hover { background: #000; color: var(--yellow); }
 .hunt-date { font-family: var(--mono); font-size: 11px; font-weight: 700; }
@@ -733,13 +761,33 @@ section[id] { scroll-margin-top: 96px; }
   color: #000; font-family: var(--mono); font-size: 10px; font-weight: 900; line-height: 13px; text-align: center;
 }
 
-@media (max-width: 700px) {
-  .hunt-grid { grid-template-columns: 1fr; gap: 14px; }
+@media (max-width: 760px) {
+  /* 两列：单列时一张卡就占掉整屏，赛事总览要翻很久才看得完 */
+  .hunt-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .hunt-bar { gap: 8px; }
-  .hunt-search { flex: 1 1 100%; }
+  .hunt-search { flex: 1 1 100%; font-size: 16px; }
   .hunt-bar .mini-btn { margin-left: 0; flex: 1 1 100%; }
-  .hunt-body { padding: 12px; }
-  .hunt-title { font-size: 16px; }
+  .hunt-body { padding: 10px; gap: 5px; }
+  .hunt-title { font-size: 14px; }
+  .hunt-summary { font-size: 11.5px; }
+  .hunt-toggle { padding: 9px 8px; font-size: 12px; }
+}
+@media (max-width: 520px) {
+  /* 手机仍保持两列：这是「总览」页，单列时一张卡就吃掉整屏，45 场要翻很久。
+     靠缩略图与内边距压高度，文字保持两个标签 + 两行标题的可读下限。 */
+  .hunt-grid { gap: 8px; }
+  .hunt-thumb { max-height: 20vh; }
+  .hunt-body { padding: 8px 8px 9px; gap: 4px; }
+  .hunt-title { font-size: 13px; line-height: 1.28; }
+  .hunt-summary { font-size: 11px; line-height: 1.4; }
+  .hunt-meta { font-size: 9.5px; }
+  .hunt-date { font-size: 10px; }
+  .hunt-tags span, .hunt-person { font-size: 9px; padding: 0 4px; }
+  .hunt-toggle { font-size: 11.5px; padding: 8px 6px; box-shadow: 2px 2px 0 #000; }
+  .hunt-fallback-text.is-xl { font-size: 17px; }
+  .hunt-fallback-text.is-lg { font-size: 13px; }
+  .hunt-fallback-text.is-md { font-size: 11px; }
+  .hunt-fallback-text.is-sm { font-size: 10px; }
 }
 @media (hover: none) {
   .hunt:hover { transform: none; box-shadow: var(--hard-sm); }
@@ -749,18 +797,71 @@ section[id] { scroll-margin-top: 96px; }
 }
 
 /* ============ 响应式 ============ */
-/* 1000px 以下不再重排：列数与桌面保持一致，靠 700px 断点做尺寸压缩 */
-@media (max-width: 700px) {
-  /* 版式与桌面一致：同样的栅格列数、同样的元素相对位置，仅压缩尺寸 */
-  .mast-in { height: 58px; padding: 0 12px; gap: 8px; }
-  .mast-name { font-size: 16px; white-space: nowrap; flex: 0 0 auto; }
-  .mast-nav { min-width: 0; margin-left: auto; gap: 2px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none;
-    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent);
-    mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent); }
-  .mast-nav::-webkit-scrollbar { display: none; }
-  .mast-nav a { flex: 0 0 auto; font-size: 11.5px; padding: 6px 7px; }
+/* 断点约定
+   ≥1200      桌面：满排
+   1000–1199  窄桌面：结构不变，靠 clamp() 收间距与字号
+   761–999    平板：导航收进抽屉、首页转自然滚动、并排区块开始叠放
+   ≤760       手机：主体单列
+   ≤430       小屏手机：再压一档留白
+   能用 clamp()/min() 解决的尺寸不做断点——断点只放「结构必须变」的规则，
+   这样窗口在 768/820/912 这些位置来回拖也不会掉进没人管过的中间态。 */
 
-  .cover { padding: 90px 12px 24px; }
+@media (max-width: 1199px) {
+  /* 目录点会压在区块说明文字上，窄桌面直接收掉；翻页仍可用键盘与滚轮 */
+  nav.page-dots { display: none; }
+}
+
+@media (max-width: 999px) {
+  :root { --mast-h: 56px; --mast-offset: 59px; }
+
+  /* —— 导航：站名 + 汉堡，链接收进抽屉 —— */
+  .mast-in { padding: 0 12px; gap: 10px; }
+  .mast-name { font-size: 17.5px; }
+  .mast-burger { display: flex; }
+  .mast-nav {
+    position: fixed; top: var(--mast-offset); left: 0; right: 0;
+    display: none; flex-direction: column; align-items: stretch; gap: 0;
+    padding: 4px 12px calc(14px + env(safe-area-inset-bottom, 0px));
+    background: var(--yellow); border-bottom: 3px solid #000;
+    box-shadow: 0 6px 0 rgba(0, 0, 0, .14);
+    max-height: calc(100dvh - var(--mast-offset)); overflow-y: auto;
+  }
+  /* 收起时 display:none，顺带把链接从 Tab 序列里摘掉，不会出现「看不见但能聚焦」 */
+  .mast-nav.open { display: flex; }
+  body.nav-open { overflow: hidden; }
+  .mast-nav a {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 13px 2px; font-size: 15px; border: 0;
+    border-bottom: 2px solid rgba(0, 0, 0, .15);
+  }
+  .mast-nav a:last-child { border-bottom: 0; }
+  .mast-nav a:hover { background: transparent; color: inherit; }
+  .mast-cta { margin-top: 10px; justify-content: center; padding: 13px; border-width: 3px !important; }
+  .mast-cta:last-child { border-bottom: 3px solid #000; }
+
+  /* 区块头改上下排：并排时说明文字会被标题挤成细长一条 */
+  .sec-head { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .sec-lead { max-width: 62ch; text-align: left; }
+
+  /* 关于：立绘缩小一档，正文仍是两栏 */
+  .about-grid { grid-template-columns: 168px minmax(0, 1fr); gap: 12px 24px; }
+
+  /* 面板头：操作按钮另起一行靠左，不再被 margin-left:auto 顶到屏幕外 */
+  .panel-head { gap: 10px; }
+  /* 平板上一行放得下就并排，放不下由 flex-wrap 自然换行；手机再强制整行 */
+  .panel-actions { margin-left: 0; }
+
+  .panel-page { padding: calc(var(--mast-offset) + 26px) 18px 64px; }
+  .auth-page { padding: calc(var(--mast-offset) + 22px) 16px 52px; }
+  .news-page { padding: calc(var(--mast-offset) + 22px) 22px 48px; }
+}
+
+@media (max-width: 760px) {
+  /* 版式与桌面一致：同样的栅格列数、同样的元素相对位置，仅压缩尺寸 */
+  .mast-in { padding: 0 12px; gap: 8px; }
+  .mast-name { font-size: 16px; }
+
+  .cover { padding: 14px 14px 24px; }
   .cover-title { font-size: clamp(32px, 10.5vw, 52px); text-shadow: 3px 3px 0 var(--yellow); }
   .cover-meta span { font-size: 10px; padding: 3px 7px; }
   .cover-sub { font-size: 15.5px; }
@@ -820,17 +921,20 @@ section[id] { scroll-margin-top: 96px; }
   .join-cta { width: 100%; min-width: 0; padding: 14px 18px; box-shadow: 7px 7px 0 var(--yellow); }
   .join-foot { font-size: 11px; }
 
-  /* 手机上改为滑动翻页，浮层导航会压住正文，直接隐藏 */
+  /* 浮层目录点会压住正文，窄屏一律不显示（JS 侧也不再渲染） */
   nav.page-dots { display: none; }
 
   /* 面板 / 后台：栅格不变，仅内边距与字号 */
-  .panel-page { padding: 94px 12px 56px; }
-  .panel-head { gap: 10px; margin-bottom: 18px; }
+  .panel-page { padding: calc(var(--mast-offset) + 22px) 12px 56px; }
+  .panel-head { gap: 8px; margin-bottom: 18px; }
   .panel-title { font-size: 24px; }
-  .panel-back { font-size: 11px; padding: 6px 10px; }
+  .panel-back { font-size: 11px; padding: 7px 10px; box-shadow: 2px 2px 0 #000; }
+  .panel-actions { gap: 6px; width: 100%; }
+  /* 四个入口按 2×2 铺开，比一行四个更抗长文案 */
+  .panel-actions .panel-back { flex: 1 1 calc(50% - 3px); text-align: center; }
   .panel-sec { padding: 16px 14px; }
   .panel-sec-title { font-size: 17px; }
-  .auth-page { padding: 94px 14px 48px; }
+  .auth-page { padding: calc(var(--mast-offset) + 20px) 14px 48px; }
   .auth-title { font-size: 24px; }
   .ann { padding: 14px; }
   .dash-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
@@ -845,14 +949,17 @@ section[id] { scroll-margin-top: 96px; }
   .search-bar { gap: 8px; }
   .search-bar input { padding: 10px 12px; }
   .conv-row { padding: 12px; gap: 10px; }
-  .chat-box { height: 300px; }
+  /* 用视口高度而不是死值：手机上地址栏一收一放，固定 300px 会顶到键盘 */
+  .chat-box { height: clamp(240px, 44dvh, 340px); }
   .chat-bubble { font-size: 14px; }
-  section[id] { scroll-margin-top: 84px; }
+  section[id] { scroll-margin-top: calc(var(--mast-offset) + 12px); }
+  /* 卡片比视口还高时，flex 居中对齐会把顶部推到滚动区之外，改为顶部对齐 */
+  .auth-page { align-items: flex-start; }
 }
 
 /* 首页整屏翻页：导航留在页外，长内容在各页内自然滚动。 */
 .home-pages {
-  position: fixed; inset: 69px 0 0; overflow-y: auto;
+  position: fixed; inset: var(--mast-offset) 0 0; overflow-y: auto;
   scroll-snap-type: y mandatory; scroll-behavior: smooth;
   background: var(--bg); scrollbar-width: thin;
 }
@@ -924,14 +1031,31 @@ section[id] { scroll-margin-top: 96px; }
   .join-ticket { max-width: 330px; }
   .join-ticket-title { font-size: 32px; }
 }
+/* 注意：首页的基础规则定义在响应式段之后，这里重写同一选择器时优先级相同，
+   所以首页相关的覆盖规则必须放在这一段（基础规则之后），否则会被基础规则反压回去。 */
 @media (max-width: 999px) {
+  /* 固定视口 + 滚轮翻页在触摸设备上是嵌套滚动，改用普通长页面 */
+  .home-pages {
+    position: static; inset: auto; height: auto; overflow: visible;
+    scroll-snap-type: none; padding-top: var(--mast-offset);
+  }
+  .home-pages > .home-page {
+    height: auto; min-height: 0; overflow: visible; scroll-snap-align: none;
+    padding: 18px 20px 64px; scroll-margin-top: var(--mast-offset);
+  }
+  .home-pages > .home-intro { padding: 0 0 64px; }
+  .home-pages .home-intro > .sec { width: 100%; padding: 0 20px; }
+  /* 基础规则里的 margin:0 auto 会让 flex 子项失去拉伸、按 max-content 缩成 680px，
+     窄屏上表现为整块 hero 被推到右边；这里显式占满并去掉自动外边距 */
+  .home-pages .cover { width: 100%; max-width: none; margin: 0; padding: 14px 20px 12px; }
+  .home-pages .colophon { margin-bottom: 32px; }
   .home-pages .record-list { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: none; }
   .home-pages .staff-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; }
   .home-pages .letter-list { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; }
   .home-pages .home-intro > .sec { flex: 0 0 auto; }
 }
-@media (max-width: 700px) {
-  .home-pages { top: 61px; }
+@media (max-width: 760px) {
+  /* 首页在 ≤999 已转为文档流，这里只收内边距，不再动 top */
   .home-pages > .home-page { padding: 18px 14px 76px; }
   .home-pages > .home-intro { padding: 0 0 76px; }
   .home-pages .cover { padding: 16px 14px; }
@@ -1062,7 +1186,9 @@ section[id] { scroll-margin-top: 96px; }
 .news-cover-field { display: flex; flex-direction: column; gap: 8px; }
 .news-cover-label { font-weight: 700; }
 .news-cover-preview img { display: block; width: 100%; max-width: 420px; aspect-ratio: 16 / 9; object-fit: cover; border: 3px solid #000; background: var(--grey); }
-.news-cover-input { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* 视觉隐藏的文件输入：表单里「控件填满列宽」的规则会把它拉成整行宽，
+   选择器带上 input 提高一级优先级，别让它变成看不见的横向溢出 */
+input.news-cover-input { position: absolute; width: 1px; max-width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .news-article-body { font-size: 17px; line-height: 1.9; overflow-wrap: anywhere; }
 .news-article-body > * + * { margin-top: 1em; }
 .news-article-body h2, .news-article-body h3 { font-weight: 900; line-height: 1.3; }
@@ -1115,21 +1241,42 @@ section[id] { scroll-margin-top: 96px; }
 .news-review-label textarea { min-height: 90px; padding: 12px; border: 3px solid #000; font: 500 15px/1.6 var(--font); resize: vertical; }
 .news-approve { width: auto; padding: 11px 18px; background: #7cffa0; color: #000; }
 
-/* 日志筛选：窄屏时下拉与输入各占一整行 */
-@media (max-width: 700px) {
-  .news-page { padding: 76px 16px 40px; }
+/* 新闻：窄屏单列，正文卡去掉外边距改用整幅宽度 */
+@media (max-width: 760px) {
+  .news-page { padding: calc(var(--mast-offset) + 18px) 16px 40px; }
   .news-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }
-  .news-item { grid-template-columns: 30px minmax(0, 1fr); gap: 8px; }
+  .news-item { grid-template-columns: 26px minmax(0, 1fr); gap: 6px; }
+  .news-index { padding-top: 14px; font-size: 11px; }
   .news-card { min-height: 0; }
-  .news-card-body { padding: 18px; }
-  .news-article { margin: 4px 0 24px; padding: 20px; }
-  .news-pagination { align-items: flex-start; flex-direction: column; }
-  .news-review-detail { padding: 16px; }
+  .news-card-cover img { max-height: 30vh; }
+  .news-card-body { padding: 16px; gap: 6px; }
+  .news-card-title { font-size: 21px; line-height: 1.3; }
+  .news-card-summary { font-size: 14.5px; }
+  .news-article { margin: 4px 0 20px; padding: 18px 16px; box-shadow: 5px 5px 0 var(--yellow); }
+  /* 32px 起跳时「第二名」会把「二」单独甩到第三行，这里按视口缩放并允许更长一行 */
+  .news-article-title { margin: 12px 0; font-size: clamp(24px, 7.4vw, 32px); letter-spacing: -.035em; line-height: 1.16; }
+  .news-article-summary { font-size: 15px; padding: 12px 14px; margin-bottom: 20px; }
+  .news-article-body { font-size: 16px; line-height: 1.85; }
+  .news-pagination { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .news-review-detail { padding: 14px; gap: 12px; }
+  .news-review-content { max-height: 40vh; padding: 12px; }
+  .news-review-label textarea { font-size: 16px; }
   .member-news-row-head, .admin-news-row-head { align-items: flex-start; flex-direction: column; }
+  .rich-editor-toolbar { gap: 4px; padding: 6px; }
+  .rich-editor-tool { min-width: 32px; }
+  .rich-editor-input { min-height: 220px; padding: 12px; }
+  .news-cover-preview img { max-width: none; }
+}
+@media (max-width: 430px) {
+  .news-item { grid-template-columns: minmax(0, 1fr); }
+  .news-index { display: none; }  /* 手机上序号没有对齐价值，还占掉 26px 行宽 */
+  .news-card-title { font-size: 19px; }
 }
 @media (max-width: 640px) {
   .log-filter select,
   .log-filter input { flex: 1 1 100%; min-width: 0; }
+  /* iOS 对 <16px 的输入框会自动放大页面，筛选控件在手机上提到 16px */
+  .log-filter select, .log-filter input { font-size: 16px; }
   .log-row { padding: 10px 12px; gap: 8px; }
   .log-when { margin-left: 0; flex: 1 1 100%; }
   .log-event { font-size: 12.5px; }

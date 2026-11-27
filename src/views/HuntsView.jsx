@@ -354,7 +354,9 @@ export default function HuntsView({ user, onNotifRead }) {
       <div className="panel-head">
         <p className="auth-kicker">{t('hunts.kicker')}</p>
         <h1 className="panel-title">{t('hunts.title')}</h1>
-        <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        <div className="panel-actions">
+          <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        </div>
       </div>
 
       <section className="panel-sec hunt-board">

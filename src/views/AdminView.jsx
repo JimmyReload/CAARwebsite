@@ -354,8 +354,10 @@ export default function AdminView({ user }) {
       <div className="panel-head">
         <p className="auth-kicker">{t('admin.kicker')}</p>
         <h1 className="panel-title">{t('admin.title')}</h1>
-        <Link className="panel-back" to="/account">{t('account.title')}</Link>
-        <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        <div className="panel-actions">
+          <Link className="panel-back" to="/account">{t('account.title')}</Link>
+          <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        </div>
       </div>
 
       <div className="admin-tabs">

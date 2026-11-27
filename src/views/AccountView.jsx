@@ -140,7 +140,9 @@ export default function AccountView({ user, setUser }) {
       <div className="panel-head">
         <p className="auth-kicker">{t('account.kicker')}</p>
         <h1 className="panel-title">{t('account.title')}</h1>
-        <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        <div className="panel-actions">
+          <Link className="panel-back" to="/">{t('common.backHome')}</Link>
+        </div>
       </div>
 
       <section className="panel-sec">

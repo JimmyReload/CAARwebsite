@@ -80,6 +80,8 @@ export default {
     adminPanel: '管理后台',
     account: '个人主页',
     logout: '退出（{name}）',
+    openMenu: '展开导航菜单',
+    closeMenu: '收起导航菜单',
   },
 
   /* ---------- 首页 hero ---------- */

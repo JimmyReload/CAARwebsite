@@ -92,8 +92,10 @@ export default function MemberNewsView() {
       <div className="panel-head">
         <p className="auth-kicker">{t('news.memberKicker')}</p>
         <h1 className="panel-title">{t('news.memberTitle')}</h1>
-        <Link className="panel-back" to="/news">{t('news.backToNews')}</Link>
-        <Link className="panel-back" to="/member">{t('member.title')}</Link>
+        <div className="panel-actions">
+          <Link className="panel-back" to="/news">{t('news.backToNews')}</Link>
+          <Link className="panel-back" to="/member">{t('member.title')}</Link>
+        </div>
       </div>
 
       <section className="panel-sec news-compose">
