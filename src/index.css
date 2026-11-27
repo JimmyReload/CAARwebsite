@@ -483,7 +483,7 @@ section[id] { scroll-margin-top: 96px; }
 .msg-form input:focus, .msg-form select:focus, .msg-form textarea:focus { background: var(--yellow); }
 .msg-form textarea { resize: vertical; }
 .check { display: flex !important; flex-direction: row; align-items: center; gap: 8px; }
-.check input { width: auto; }
+.check input { width: auto; margin: 0; }
 .msg-row { display: grid; grid-template-columns: 130px 1fr auto auto; gap: 12px; align-items: baseline; padding: 13px 4px; border-bottom: 3px solid #000; font-size: 14.5px; font-weight: 500; }
 .msg-to { font-family: var(--mono); font-size: 12px; font-weight: 900; white-space: nowrap; }
 .msg-content { overflow-wrap: anywhere; }
@@ -1280,4 +1280,9 @@ input.news-cover-input { position: absolute; width: 1px; max-width: 1px; height:
   .log-row { padding: 10px 12px; gap: 8px; }
   .log-when { margin-left: 0; flex: 1 1 100%; }
   .log-event { font-size: 12.5px; }
+  /* 「显示客户端上报」被挤在按钮中间会折成三行，独占一行；两个按钮均分下一行 */
+  .log-client-toggle { flex: 1 1 100%; white-space: nowrap; justify-content: flex-start; }
+  /* 复选框本身被 .log-filter input 的 flex 规则拉宽，会把文字推到右边 */
+  .log-client-toggle input { flex: 0 0 auto; width: auto; }
+  .log-filter .mini-btn { flex: 1 1 auto; }
 }
