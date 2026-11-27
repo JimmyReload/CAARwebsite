@@ -167,6 +167,8 @@ CREATE TABLE IF NOT EXISTS news_articles (
   reviewed_by INTEGER,
   reviewed_at TEXT,
   published_at TEXT,
+  -- 封面图在 MEDIA KV 里的对象键（news/u3-<32hex>.webp）；空串=无封面
+  cover_key TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -195,4 +197,5 @@ INSERT OR REPLACE INTO schema_migrations (version) VALUES
   ('0011_news_articles'),
   ('0012_add_puzzlecat_id'),
   ('0013_hunt_completion_cache'),
-  ('0014_hunt_completion_retry_after');
+  ('0014_hunt_completion_retry_after'),
+  ('0015_news_cover');

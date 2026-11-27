@@ -4,6 +4,10 @@
 // 所有面向用户的提示文案统一取自 locales/zh-CN.js
 import { t } from './i18n.js'
 import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentExcerpt, newsDocumentText } from './newsContent.js'
+import {
+  COVER_MAX_BYTES, COVER_TYPES, detectCoverExt, coverContentType,
+  isCoverKey, isCoverKeyOwnedBy, makeCoverKey, coverUrlFromKey
+} from './newsCover.js'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts.js'
 import { getHuntCompletionData, removeHuntCompletionUser } from './huntCompletions.js'
 // 登录节流单独成模块：不依赖 Workers 运行时，可被 tests/ 直接驱动
@@ -153,6 +157,41 @@ async function readBody(req, maxBytes = MAX_BODY_BYTES) {
   return parseBodyObject(text);
 }
 
+// 读二进制正文（封面图上传）。与 readBody 同一套「按实际字节累计、超限立刻 cancel」
+// 的做法，只是上限不是 128 KiB 而是图片上限，且不做 JSON 解析。
+async function readBinaryBody(req, maxBytes) {
+  const limit = Math.max(1, Number(maxBytes) || COVER_MAX_BYTES);
+  const declared = req.headers.get('content-length');
+  if (declared !== null && Number(declared) > limit) throw tooLarge();
+  if (!req.body) throw badBody('empty_body');
+
+  const reader = req.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      let chunk;
+      try { chunk = await reader.read(); } catch { throw badBody('stream_read'); }
+      const { done, value } = chunk;
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch { /* 取消失败也不影响拒绝 */ }
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* 已 cancel 时 release 可能抛错，忽略 */ }
+  }
+
+  if (!total) throw badBody('empty_body');
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
+  return bytes;
+}
+
 // ---------- CSRF：带会话 Cookie 的状态变更 ----------
 // SameSite=Lax 只挡跨站，不挡**同站子域**（attacker.caar.fun 与 caar.fun 同站不同源）；
 // CORS 也不挡服务端副作用（浏览器只挡读取响应）。所以这里两道闸门都在 Worker 内做：
@@ -184,15 +223,23 @@ function hasBody(req) {
 }
 
 // 返回 Response 表示拒绝，null 表示放行
-function checkCookieMutation(req, url) {
+function checkCookieMutation(req, url, path = '') {
   if (SAFE_METHODS.has(String(req.method || '').toUpperCase())) return null;
   if (!hasSessionCookie(req)) return null;
   const origin = req.headers.get('origin');
   if (!origin || origin === 'null' || origin !== url.origin) {
     return json({ error: t('errors.forbidden') }, 403);
   }
-  if (hasBody(req) && mediaType(req) !== JSON_CONTENT_TYPE) {
-    return json({ error: t('errors.badParams') }, 415);
+  if (hasBody(req)) {
+    const type = mediaType(req);
+    if (type !== JSON_CONTENT_TYPE) {
+      // 封面图是二进制正文，没法塞进 JSON（base64 会把 2 MiB 的图放大成 2.7 MiB）。
+      // 只对这一个路由放开 image/*，且仍然要求上面的精确同源 Origin：
+      // 跨站 <form> 只能发 urlencoded/multipart/text-plain，发不出 image/png；
+      // 跨站 fetch 带 image/png 属于非简单请求，会先被 CORS 预检挡住。
+      const isCoverUpload = path === 'news/cover' && Object.prototype.hasOwnProperty.call(COVER_TYPES, type);
+      if (!isCoverUpload) return json({ error: t('errors.badParams') }, 415);
+    }
   }
   return null;
 }
@@ -243,6 +290,8 @@ const NEWS_TITLE_MAX = 100;
 const NEWS_SUMMARY_MAX = 280;
 const NEWS_CONTENT_MAX = NEWS_TEXT_MAX;
 const NEWS_PAGE_SIZE = 20;
+// 封面图的键随机且内容不变（换图=换键），可以放心长缓存
+const COVER_CACHE = 'public, max-age=31536000, immutable';
 
 // 返回 { value } 或 { error: 文案 key }；注册、后台改名、用户自助改名三条路径共用
 function normalizeNickname(raw) {
@@ -594,6 +643,69 @@ async function announcementVersion(env) {
   return row ? Number(row.v) || 0 : 0;
 }
 
+// ---------- 新闻封面（KV 对象） ----------
+// 键由 makeCoverKey 生成（news/u<id>-<32hex>.<ext>），所以一个键对应一份不变的内容：
+// 换图必然是换键，可以给 immutable 长缓存，读者不必每次回源。
+function mediaNotFound() {
+  return harden(new Response('', { status: 404, headers: { 'cache-control': 'no-store' } }));
+}
+
+async function serveNewsCover(env, pathname, request, log) {
+  let key = '';
+  try { key = decodeURIComponent(pathname.slice('/media/'.length)); } catch { return mediaNotFound(); }
+  if (!isCoverKey(key)) return mediaNotFound();
+  if (!env.MEDIA) {
+    log.error('media.unavailable', { key });
+    return harden(new Response('', { status: 503, headers: { 'cache-control': 'no-store' } }));
+  }
+  const etag = '"' + key + '"';
+  if (request.headers.get('if-none-match') === etag) {
+    return harden(new Response(null, { status: 304, headers: { etag, 'cache-control': COVER_CACHE } }));
+  }
+  const buf = await env.MEDIA.get(key, { type: 'arrayBuffer' });
+  if (!buf) return mediaNotFound();
+  const ext = key.slice(key.lastIndexOf('.') + 1);
+  const body = String(request.method || 'GET').toUpperCase() === 'HEAD' ? null : buf;
+  return harden(new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': coverContentType(ext),
+      'content-length': String(buf.byteLength),
+      'cache-control': COVER_CACHE,
+      etag
+    }
+  }));
+}
+
+
+// 0015 之前建的库没有 cover_key。为了让「代码先上线、迁移后补」这段时间读新闻不 500，
+// 第一次进新闻接口时补一次列；已存在则吞掉 duplicate column 错误（每个 isolate 只试一次）。
+let newsCoverReady = null;
+function ensureNewsCoverColumn(env) {
+  if (!newsCoverReady) {
+    newsCoverReady = (async () => {
+      try {
+        await env.DB.prepare("ALTER TABLE news_articles ADD COLUMN cover_key TEXT NOT NULL DEFAULT ''").run();
+      } catch (err) {
+        if (!/duplicate column name/i.test(String(err && err.message || err))) throw err;
+      }
+    })().catch((err) => { newsCoverReady = null; throw err; });
+  }
+  return newsCoverReady;
+}
+
+// 提交稿件时校验封面键：必须是自己上传的、且对象确实还在。
+// 空值合法（允许无封面），不合法一律回 400 而不是静默丢弃——静默丢弃会让作者
+// 以为图挂上了，发布后才发现没有。
+async function resolveCoverKey(env, raw, userId) {
+  const key = typeof raw === 'string' ? raw.trim() : '';
+  if (!key) return { key: '' };
+  if (!isCoverKeyOwnedBy(key, userId) || !env.MEDIA) return { error: 'errors.newsCoverInvalid' };
+  const exists = await env.MEDIA.get(key, { type: 'arrayBuffer' });
+  if (!exists) return { error: 'errors.newsCoverMissing' };
+  return { key };
+}
+
 function newsDocumentFromRow(row) {
   if (row.content_format === 'rich-v1') {
     try { return normalizeNewsDocument(JSON.parse(row.content)) || { type: 'doc', children: [] }; }
@@ -880,6 +992,10 @@ const app = {
     const url = new URL(request.url);
 
     if (!url.pathname.startsWith('/api/')) {
+      // 新闻封面：KV 里的图片对象，不经过静态资源层（那也是 run_worker_first 的原因之一）
+      if (url.pathname.startsWith('/media/')) {
+        return await serveNewsCover(env, url.pathname, request, log);
+      }
       // 静态资源 + SPA 兜底（HTML 不缓存，带 hash 的资源长缓存）
       const res = await env.ASSETS.fetch(request);
       if (res.status === 404) {
@@ -919,7 +1035,7 @@ const app = {
     const path = url.pathname.slice(5); // 去掉 /api/
     const method = request.method;
     // CSRF：带会话 Cookie 的写操作必须来自精确同源 + JSON 正文（见 checkCookieMutation）
-    const csrfBlocked = checkCookieMutation(request, url);
+    const csrfBlocked = checkCookieMutation(request, url, path);
     if (csrfBlocked) {
       // 事件名复用已有的 http.request（面板有中文名），具体原因放 meta.reject
       log.warn('http.request', {
@@ -934,7 +1050,9 @@ const app = {
     // 这里只是按声明长度的快速拒绝；真正的判定在 readBody() 里按实际读取字节做。
     if (method !== 'GET' && method !== 'HEAD') {
       const len = Number(request.headers.get('content-length') || 0);
-      const bodyMax = path === 'news' || /^news\/\d+\/resubmit$/.test(path) ? NEWS_BODY_MAX_BYTES : MAX_BODY_BYTES;
+      const bodyMax = path === 'news/cover'
+        ? COVER_MAX_BYTES
+        : path === 'news' || /^news\/\d+\/resubmit$/.test(path) ? NEWS_BODY_MAX_BYTES : MAX_BODY_BYTES;
       if (len > bodyMax) return json({ error: t('errors.bodyTooLarge') }, 413);
     }
     const user = await getSessionUser(env, getCookie(request));
@@ -1359,58 +1477,91 @@ const app = {
     // ---------- 以下需要登录 ----------
     // Public news endpoints must precede the authentication gate and reveal only published rows.
     if (path === 'news' && method === 'GET') {
+      await ensureNewsCoverColumn(env);
       const page = Math.max(1, Math.min(10000, Number(url.searchParams.get('page') || 1) || 1));
-      const rows = await env.DB.prepare("SELECT id,title,summary,excerpt,content,content_format,author_name,published_at FROM news_articles WHERE status='published' ORDER BY published_at DESC,id DESC LIMIT ? OFFSET ?").bind(NEWS_PAGE_SIZE, (page - 1) * NEWS_PAGE_SIZE).all();
+      const rows = await env.DB.prepare("SELECT id,title,summary,excerpt,content,content_format,author_name,published_at,cover_key FROM news_articles WHERE status='published' ORDER BY published_at DESC,id DESC LIMIT ? OFFSET ?").bind(NEWS_PAGE_SIZE, (page - 1) * NEWS_PAGE_SIZE).all();
       const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM news_articles WHERE status='published'").first();
-      const list = rows.results.map((row) => ({ id: row.id, title: row.title, summary: row.summary, author_name: row.author_name, published_at: row.published_at, excerpt: newsDocumentExcerpt(newsDocumentFromRow(row), 240) }));
+      const list = rows.results.map((row) => ({ id: row.id, title: row.title, summary: row.summary, author_name: row.author_name, published_at: row.published_at, coverUrl: coverUrlFromKey(row.cover_key), excerpt: newsDocumentExcerpt(newsDocumentFromRow(row), 240) }));
       return json({ list, page, pageSize: NEWS_PAGE_SIZE, total: Number(count && count.n) || 0 });
     }
     if (path.startsWith('news/') && path !== 'news/mine' && !path.startsWith('news/mine/') && method === 'GET') {
+      await ensureNewsCoverColumn(env);
       const parts = path.split('/'); const id = Number(parts[1]);
       if (parts.length !== 2 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
       const row = await env.DB.prepare("SELECT * FROM news_articles WHERE id=? AND status='published'").bind(id).first();
       if (!row) return json({ error: t('errors.newsNotFound') }, 404);
-      return json({ article: { id: row.id, title: row.title, summary: row.summary, excerpt: row.excerpt, author_name: row.author_name, published_at: row.published_at, content: newsDocumentFromRow(row) } });
+      return json({ article: { id: row.id, title: row.title, summary: row.summary, excerpt: row.excerpt, author_name: row.author_name, published_at: row.published_at, coverUrl: coverUrlFromKey(row.cover_key), content: newsDocumentFromRow(row) } });
     }
     if (!user) return json({ error: t('errors.unauthorized') }, 401);
 
     // Authenticated news submissions; members only access their own article records.
     if (path === 'news/mine' && method === 'GET') {
-      const rows = await env.DB.prepare('SELECT id,title,summary,excerpt,content_format,status,review_note,reviewed_at,published_at,created_at,updated_at FROM news_articles WHERE author_id = ? ORDER BY id DESC LIMIT 100').bind(user.id).all();
-      return json({ list: rows.results });
+      await ensureNewsCoverColumn(env);
+      const rows = await env.DB.prepare('SELECT id,title,summary,excerpt,content_format,status,review_note,reviewed_at,published_at,created_at,updated_at,cover_key FROM news_articles WHERE author_id = ? ORDER BY id DESC LIMIT 100').bind(user.id).all();
+      return json({ list: rows.results.map((row) => ({ ...row, coverUrl: coverUrlFromKey(row.cover_key) })) });
     }
     if (path.startsWith('news/mine/') && method === 'GET') {
+      await ensureNewsCoverColumn(env);
       const parts = path.split('/'); const id = Number(parts[2]);
       if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
       const row = await env.DB.prepare('SELECT * FROM news_articles WHERE id = ? AND author_id = ?').bind(id,user.id).first();
       if (!row) return json({ error: t('errors.newsNotFound') }, 404);
-      return json({ article: { ...row, content: newsDocumentFromRow(row) } });
+      return json({ article: { ...row, coverUrl: coverUrlFromKey(row.cover_key), content: newsDocumentFromRow(row) } });
+    }
+    // 封面图上传：正文是图片原始字节，Content-Type 声明格式，真实格式按文件头复核。
+    // 存 KV（MEDIA），键绑定上传者，返回可直接放进 <img src> 的站内路径。
+    if (path === 'news/cover' && method === 'POST') {
+      // 每人每小时 20 张：KV 免费额度有限，也避免有人拿上传接口当免费图床刷存储
+      try {
+        await ensureLoginSchema(env);
+        const hit = await hitLimit(env, 'cv:u:' + user.id, 20);
+        if (hit.blocked) return jsonRetry({ error: t('errors.tooManyAttempts', { n: hit.retry }) }, 429, hit.retry);
+      } catch { /* 限流表不可用不拦上传 */ }
+      const declared = mediaType(request);
+      const bytes = await readBinaryBody(request, COVER_MAX_BYTES);
+      const ext = detectCoverExt(bytes);
+      if (!ext || COVER_TYPES[declared] !== ext) {
+        return json({ error: t('errors.newsCoverType') }, 415);
+      }
+      if (!env.MEDIA) return json({ error: t('errors.serverError') }, 500);
+      const key = makeCoverKey(user.id, ext);
+      if (!key) return json({ error: t('errors.serverError') }, 500);
+      await env.MEDIA.put(key, bytes.buffer);
+      io.audit('news.cover', { status: 200, target_type: 'news', meta: { key, bytes: bytes.byteLength, type: ext } });
+      log.info('news.cover', { uid: user.id, bytes: bytes.byteLength, type: ext });
+      return json({ ok: true, key, url: coverUrlFromKey(key) });
     }
     if (path === 'news' && method === 'POST') {
+      await ensureNewsCoverColumn(env);
       const b = await readBody(request, NEWS_BODY_MAX_BYTES);
       if (b.__tooLarge) return json({ error: t('errors.bodyTooLarge') }, 413);
       const parsed = parseNewsSubmission(b);
       if (parsed.error) return json({ error: t(parsed.error) }, 400);
+      const cover = await resolveCoverKey(env, b.cover, user.id);
+      if (cover.error) return json({ error: t(cover.error) }, 400);
       const authorName = String(user.nickname || user.username).trim().slice(0, NICKNAME_MAX);
-      const ins = await env.DB.prepare(`INSERT INTO news_articles(title,summary,excerpt,content,content_format,author_id,author_name,status) SELECT ?,?,?,?,'rich-v1',?,?,'pending' WHERE (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5 RETURNING id,title,summary,excerpt,status,created_at`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,user.id,authorName,user.id).all();
+      const ins = await env.DB.prepare(`INSERT INTO news_articles(title,summary,excerpt,content,content_format,author_id,author_name,status,cover_key) SELECT ?,?,?,?,'rich-v1',?,?,'pending',? WHERE (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5 RETURNING id,title,summary,excerpt,status,created_at,cover_key`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,user.id,authorName,cover.key,user.id).all();
       const article = (ins.results || [])[0] || null;
       if (!article) return json({ error: t('errors.newsTooManyPending') }, 429);
-      io.audit('news.submit', { status: 200, target_type: 'news', target_id: article.id, meta: { title: parsed.title, len: parsed.length } });
-      return json({ ok: true, article });
+      io.audit('news.submit', { status: 200, target_type: 'news', target_id: article.id, meta: { title: parsed.title, len: parsed.length, cover: !!cover.key } });
+      return json({ ok: true, article: { ...article, coverUrl: coverUrlFromKey(article.cover_key) } });
     }
     if (path.startsWith('news/') && path.endsWith('/resubmit') && method === 'POST') {
+      await ensureNewsCoverColumn(env);
       const parts = path.split('/'); const id = Number(parts[1]);
       if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
       const b = await readBody(request, NEWS_BODY_MAX_BYTES);
       if (b.__tooLarge) return json({ error: t('errors.bodyTooLarge') }, 413);
       const parsed = parseNewsSubmission(b);
       if (parsed.error) return json({ error: t(parsed.error) }, 400);
-      const upd = await env.DB.prepare(`UPDATE news_articles SET title=?,summary=?,excerpt=?,content=?,content_format='rich-v1',status='pending',review_note='',reviewed_by=NULL,reviewed_at=NULL,published_at=NULL,updated_at=datetime('now') WHERE id=? AND author_id=? AND status='rejected' AND (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,id,user.id,user.id).run();
+      const cover = await resolveCoverKey(env, b.cover, user.id);
+      if (cover.error) return json({ error: t(cover.error) }, 400);
+      const upd = await env.DB.prepare(`UPDATE news_articles SET title=?,summary=?,excerpt=?,content=?,content_format='rich-v1',cover_key=?,status='pending',review_note='',reviewed_by=NULL,reviewed_at=NULL,published_at=NULL,updated_at=datetime('now') WHERE id=? AND author_id=? AND status='rejected' AND (SELECT COUNT(*) FROM news_articles WHERE author_id=? AND status='pending')<5`).bind(parsed.title,parsed.summary,parsed.excerpt,parsed.content,cover.key,id,user.id,user.id).run();
       if (!upd.meta.changes) {
         const ownedRejected = await env.DB.prepare("SELECT id FROM news_articles WHERE id=? AND author_id=? AND status='rejected'").bind(id,user.id).first();
         return json({ error: t(ownedRejected ? 'errors.newsTooManyPending' : 'errors.newsResubmitUnavailable') }, ownedRejected ? 429 : 409);
       }
-      io.audit('news.resubmit', { status: 200, target_type: 'news', target_id: id, meta: { title: parsed.title, len: parsed.length } });
+      io.audit('news.resubmit', { status: 200, target_type: 'news', target_id: id, meta: { title: parsed.title, len: parsed.length, cover: !!cover.key } });
       return json({ ok: true });
     }
     if (path === 'admin/news' && method === 'GET') {
@@ -1421,11 +1572,12 @@ const app = {
     }
     if (path.startsWith('admin/news/') && method === 'GET') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
+      await ensureNewsCoverColumn(env);
       const parts = path.split('/'); const id = Number(parts[2]);
       if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
       const row = await env.DB.prepare('SELECT n.*,u.username AS author_username FROM news_articles n LEFT JOIN users u ON u.id=n.author_id WHERE n.id=?').bind(id).first();
       if (!row) return json({ error: t('errors.newsNotFound') }, 404);
-      return json({ article: { ...row, content: newsDocumentFromRow(row) } });
+      return json({ article: { ...row, coverUrl: coverUrlFromKey(row.cover_key), content: newsDocumentFromRow(row) } });
     }
     if (path.startsWith('admin/news/') && method === 'PATCH') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);

@@ -135,6 +135,7 @@ export default function AdminNewsView() {
           <h3 className="news-review-title">{active.title}</h3>
           <p className="news-review-meta">{active.author_name || active.author_username} · @{active.author_username} · {fmtDateTime(active.created_at)}</p>
           {active.summary && <p className="news-article-summary">{active.summary}</p>}
+          {active.coverUrl && <img className="news-review-cover" src={active.coverUrl} alt={t('news.coverLabel')} decoding="async" />}
           <div className="news-review-content"><NewsContent value={active.content} /></div>
           {active.status === 'pending' && <label className="news-review-label">{t('news.reviewNote')} <textarea value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} rows="3" maxLength="500" placeholder={t('news.reviewNotePlaceholder')} /></label>}
           {active.status !== 'pending' && active.review_note && <p className="news-review-note"><strong>{t('news.reviewNote')}：</strong>{active.review_note}</p>}

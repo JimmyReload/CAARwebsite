@@ -5,14 +5,21 @@ import { t } from '../i18n'
 import { fmtDateTime } from '../time'
 import NewsContent from './NewsContent'
 
+/* 列表卡片：头图 + 标题 + 简介，作者与发布时间压成一行小字。
+   没有封面的稿件不占位（直接省略图区），避免出现一块空白框。 */
 function ArticleCard({ article }) {
   return (
-    <article className="news-card">
-      <div className="news-card-meta"><span>{article.author_name || t('news.author')}</span><time>{fmtDateTime(article.published_at)}</time></div>
-      <h2 className="news-card-title"><Link to={'/news/' + article.id}>{article.title}</Link></h2>
-      {article.summary && <p className="news-card-summary">{article.summary}</p>}
-      {article.excerpt && <div className="news-card-excerpt"><NewsContent value={article.excerpt} /></div>}
-      <Link className="news-read-more" to={'/news/' + article.id}>{t('news.readMore')} <span aria-hidden="true">→</span></Link>
+    <article className={article.coverUrl ? 'news-card news-card--cover' : 'news-card'}>
+      {article.coverUrl && (
+        <div className="news-card-cover">
+          <img src={article.coverUrl} alt="" loading="lazy" decoding="async" />
+        </div>
+      )}
+      <div className="news-card-body">
+        <h2 className="news-card-title"><Link to={'/news/' + article.id}>{article.title}</Link></h2>
+        {article.summary && <p className="news-card-summary">{article.summary}</p>}
+        <div className="news-card-meta"><span>{article.author_name || t('news.author')}</span><time>{fmtDateTime(article.published_at)}</time></div>
+      </div>
     </article>
   )
 }
@@ -53,11 +60,6 @@ export default function NewsView() {
         <p className="news-deck">{t('news.subtitle')}</p>
       </header>
 
-      {!id && <div className="news-actions">
-        <p>{t('news.reviewNotice')}</p>
-        <Link className="news-submit-link" to="/member/news">{t('news.memberSubmit')} <span aria-hidden="true">↗</span></Link>
-      </div>}
-
       {error && <p className="auth-msg news-message" role="alert">{error}</p>}
       {loading && <div className="news-grid" aria-label={t('news.loading')}>{[1, 2, 3].map((x) => <div className="news-skeleton" key={x} />)}</div>}
 
@@ -67,6 +69,7 @@ export default function NewsView() {
           <div className="news-card-meta"><span>{article.author_name || t('news.author')}</span><time>{fmtDateTime(article.published_at)}</time></div>
           <h2 className="news-article-title">{article.title}</h2>
           {article.summary && <p className="news-article-summary">{article.summary}</p>}
+          {article.coverUrl && <img className="news-article-cover" src={article.coverUrl} alt="" decoding="async" />}
           <NewsContent value={article.content} />
         </article>
       )}

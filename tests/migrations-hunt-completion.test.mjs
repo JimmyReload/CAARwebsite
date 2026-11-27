@@ -46,11 +46,14 @@ test('0013/0014 按序迁移完赛缓存且逐版登记', () => {
   }
 })
 
-test('fresh schema 提供相同完赛缓存最终结构并登记迁移 0002–0014', () => {
+test('fresh schema 提供相同完赛缓存最终结构并登记迁移 0002–0015', () => {
   const db = new DatabaseSync(':memory:')
   try {
     db.exec(readSql('../schema.sql'))
     assert.deepEqual(cacheColumns(db), EXPECTED_CACHE_COLUMNS)
+    // 0015 的封面列也要在全新库里直接到位，否则新环境读到新闻就报列不存在
+    const newsColumns = db.prepare('PRAGMA table_info(news_articles)').all().map((row) => row.name)
+    assert.ok(newsColumns.includes('cover_key'), newsColumns.join(','))
 
     const versions = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row) => row.version)
     assert.deepEqual(versions, [
@@ -66,7 +69,8 @@ test('fresh schema 提供相同完赛缓存最终结构并登记迁移 0002–00
       '0011_news_articles',
       '0012_add_puzzlecat_id',
       '0013_hunt_completion_cache',
-      '0014_hunt_completion_retry_after'
+      '0014_hunt_completion_retry_after',
+      '0015_news_cover'
     ])
   } finally {
     db.close()

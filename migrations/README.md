@@ -22,7 +22,7 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 `/api/admin/logs` 会返回 500 并提示执行迁移，写入只落控制台。确实需要先上线后补迁移时，
 可临时设 `AUDIT_BOOTSTRAP=1` 让代码兜底建表，建完立刻取消。
 
-## 执行记录（截至 2026-11-25；0013/0014 尚待应用）
+## 执行记录（截至 2026-11-27；0013/0014/0015 尚待应用）
 
 | 文件 | 内容 | 线上状态 |
 |---|---|---|
@@ -39,6 +39,7 @@ SQLite 的 `ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，重复执行会
 | `0012_add_puzzlecat_id.sql` | `users.puzzlecat_id`（PuzzleCat OAuth 用户 ID，与公开 `/users/{profileKey}` 一致） | 已应用（2026-11-25） |
 | `0013_hunt_completion_cache.sql` | 建立公开完赛 Hunt 缓存快照（id/slug、本站显示名、采集时间与刷新租约） | 待应用（当前仅本地开发） |
 | `0014_hunt_completion_retry_after.sql` | 增加 `hunt_completion_cache.retry_after` 上游失败重试退避列 | 待应用（当前仅本地开发） |
+| `0015_news_cover.sql` | `news_articles.cover_key`（新闻封面在 MEDIA KV 里的对象键，空串=无封面） | 待应用 |
 
 > `0010` 只依赖 `0008` 建好的 `schema_migrations`，与 `0009` 互不依赖，应用顺序不分先后。
 

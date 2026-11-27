@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import api from '../api'
+import api, { apiUpload } from '../api'
 import { EMPTY_NEWS_DOCUMENT } from '../newsContent'
+import { COVER_MAX_BYTES, COVER_TYPES } from '../newsCover'
 import { t } from '../i18n'
 import { fmtDateTime } from '../time'
 import RichTextEditor from './RichTextEditor'
@@ -25,6 +26,10 @@ export default function MemberNewsView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  // 封面：选完立刻上传，表单里只带 key；这样提交时不用等一张 2 MB 的图。
+  const [cover, setCover] = useState({ key: '', url: '' })
+  const [coverBusy, setCoverBusy] = useState(false)
+  const coverInput = useRef(null)
 
   const load = useCallback(async () => {
     try {
@@ -36,6 +41,22 @@ export default function MemberNewsView() {
   useEffect(() => { load() }, [load])
 
   const change = (key) => (event) => setForm((old) => ({ ...old, [key]: event.target.value }))
+
+  const pickCover = async (event) => {
+    const file = event.target.files && event.target.files[0]
+    // 清空 value：同一张图重新选也能触发 change
+    event.target.value = ''
+    if (!file) return
+    setError(''); setNotice('')
+    if (!COVER_TYPES[file.type]) { setError(t('news.coverBadType')); return }
+    if (file.size > COVER_MAX_BYTES) { setError(t('news.coverTooBig')); return }
+    setCoverBusy(true)
+    try {
+      const data = await apiUpload('/news/cover', file)
+      setCover({ key: data.key || '', url: data.url || '' })
+    } catch (err) { setError(err.message) } finally { setCoverBusy(false) }
+  }
+
   const edit = async (item) => {
     setError(''); setNotice('')
     try {
@@ -44,23 +65,24 @@ export default function MemberNewsView() {
       if (!article || article.status !== 'rejected') { await load(); return }
       setEditing(article.id)
       setForm({ title: article.title, summary: article.summary || '', content: toDocument(article) })
+      setCover({ key: article.cover_key || '', url: article.coverUrl || '' })
       setEditorReset((v) => v + 1)
       window.scrollTo({ top: 0, behavior: 'smooth' })
     } catch (err) { setError(err.message) }
   }
   const cancel = () => {
-    setEditing(null); setForm(blank); setEditorReset((v) => v + 1)
+    setEditing(null); setForm(blank); setCover({ key: '', url: '' }); setEditorReset((v) => v + 1)
   }
   const submit = async (event) => {
     event.preventDefault()
-    if (busy) return
+    if (busy || coverBusy) return
     setBusy(true); setError(''); setNotice('')
-    const payload = { title: form.title, summary: form.summary, content: form.content }
+    const payload = { title: form.title, summary: form.summary, content: form.content, cover: cover.key }
     try {
       if (editing) await api('/news/' + editing + '/resubmit', { method: 'POST', body: payload })
       else await api('/news', { method: 'POST', body: payload })
       setNotice(editing ? t('news.resubmitted') : t('news.submitted'))
-      setForm(blank); setEditing(null); setEditorReset((v) => v + 1)
+      setForm(blank); setEditing(null); setCover({ key: '', url: '' }); setEditorReset((v) => v + 1)
       await load()
     } catch (err) { setError(err.message) } finally { setBusy(false) }
   }
@@ -82,13 +104,27 @@ export default function MemberNewsView() {
         <form onSubmit={submit} className="msg-form">
           <label>{t('news.titleLabel')} <input value={form.title} onChange={change('title')} maxLength="100" required /></label>
           <label>{t('news.summaryLabel')} <textarea value={form.summary} onChange={change('summary')} rows="2" maxLength="280" /></label>
+          <div className="news-cover-field">
+            <span className="news-cover-label">{t('news.coverLabel')}</span>
+            {cover.url
+              ? <div className="news-cover-preview"><img src={cover.url} alt={t('news.coverLabel')} /></div>
+              : <p className="acct-note">{t('news.coverHint')}</p>}
+            {coverBusy && <p className="acct-note" aria-live="polite">{t('news.coverUploading')}</p>}
+            <div className="btn-row">
+              <button type="button" className="mini-btn" disabled={coverBusy || busy} onClick={() => coverInput.current && coverInput.current.click()}>
+                {cover.url ? t('news.coverReplace') : t('news.coverChoose')}
+              </button>
+              {cover.url && <button type="button" className="mini-btn" disabled={coverBusy || busy} onClick={() => setCover({ key: '', url: '' })}>{t('news.coverRemove')}</button>}
+              <input ref={coverInput} className="news-cover-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={pickCover} />
+            </div>
+          </div>
           <RichTextEditor
             key={editorReset} resetKey={editorReset} initialValue={form.content} disabled={busy}
             label={t('news.contentLabel')} placeholder={t('news.editorPlaceholder')}
             onChange={(content) => setForm((old) => ({ ...old, content }))}
           />
           <div className="btn-row">
-            <button className="auth-btn" disabled={busy}>{busy ? t('news.submitting') : editing ? t('news.resubmitButton') : t('news.submitButton')}</button>
+            <button className="auth-btn" disabled={busy || coverBusy}>{busy ? t('news.submitting') : coverBusy ? t('news.coverUploading') : editing ? t('news.resubmitButton') : t('news.submitButton')}</button>
             {editing && <button type="button" className="mini-btn" onClick={cancel}>{t('common.cancel')}</button>}
           </div>
         </form>

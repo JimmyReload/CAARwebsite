@@ -61,7 +61,7 @@ const LOGIN_FAILS_LEGACY = `CREATE TABLE IF NOT EXISTS login_fails (
 
 // 注意：ensureLoginSchema 的就绪状态按模块缓存，一个进程里只对第一个 env 执行建表。
 // 所以这里直接把目标结构建好，等价于"线上已经跑过迁移的库"，别依赖那个缓存。
-export function makeEnv({ fullSchema = false, loginFails = 'current', kv = null } = {}) {
+export function makeEnv({ fullSchema = false, loginFails = 'current', kv = null, media = null } = {}) {
   const DB = makeD1()
   if (fullSchema) {
     // 直接用仓库的 schema.sql 建库：既省得手写各表，也顺带验证这份脚本本身能跑
@@ -73,17 +73,26 @@ export function makeEnv({ fullSchema = false, loginFails = 'current', kv = null 
   return {
     DB,
     SESSIONS: kv || makeKv(),
+    // 新闻封面所在的命名空间；不传就各测各的，互不污染
+    MEDIA: media || makeKv(),
     ASSETS: { async fetch() { return new Response('', { status: 404 }) } }
   }
 }
 
-// 最小 KV 适配层：会话只用到 get/put/delete
+// 最小 KV 适配层：会话用字符串，封面图用 ArrayBuffer
 export function makeKv() {
   const store = new Map()
   return {
     _store: store,
-    async get(k) { return store.has(k) ? store.get(k) : null },
-    async put(k, v) { store.set(String(k), String(v)) },
+    async get(k, opts) {
+      if (!store.has(k)) return null
+      const v = store.get(k)
+      if (opts && opts.type === 'arrayBuffer' && typeof v === 'string') {
+        return new TextEncoder().encode(v).buffer
+      }
+      return v
+    },
+    async put(k, v) { store.set(String(k), v) },
     async delete(k) { store.delete(String(k)) }
   }
 }
