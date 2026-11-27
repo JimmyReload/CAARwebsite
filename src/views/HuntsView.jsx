@@ -4,15 +4,8 @@ import api from '../api'
 import { t } from '../i18n'
 import { readHuntsCache, writeHuntsCache, fetchHunts, currentHuntsEpoch } from '../huntsCache'
 import { startCompletionPolling as startCompletionPollingImpl } from '../completionPolling'
-
-/* 上游时间是不带时区的墙钟时间（timezone 默认 Asia/Shanghai），抓取时已补 +08:00 后缀；
-   这里按墙钟时间展示，不做时区换算 */
-function fmtDay(iso) {
-  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/)
-  if (!m) return ''
-  const day = m[2] + '/' + m[3]
-  return m[4] ? day + ' ' + m[4] + ':' + m[5] : day
-}
+// 赛事时间展示：上游是 UTC，统一按东八区墙钟显示（服务端已换算，这里再兜一层旧快照）
+import { fmtHuntDay as fmtDay } from '../huntTime'
 
 function rangeText(h) {
   const start = fmtDay(h.startAt)

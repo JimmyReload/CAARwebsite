@@ -33,11 +33,14 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// pzc 的 startAt/endAt 是**不带时区**的墙钟时间（按 h.timezone，默认 Asia/Shanghai），
-// 例如 "2026-11-27T10:00:00"。这种串一旦被 new Date() 解析，Worker（UTC 运行时）会
-// 当成 UTC+0，比实际早 8 小时。这里只补时区后缀、不改墙钟时间：
-//   "2026-11-27T10:00:00" → "2026-11-27T10:00:00+08:00"
-// 下游怎么解析都是同一绝对时刻，前端按字符串截取展示也仍是 10:00。
+// pzc 的 startAt/endAt 是**不带时区的 UTC 时间**，例如 "2026-11-27T10:00:00"。
+// 判据是上游自己的 status：该场在 UTC 08:45 时仍是 scheduled，说明 10:00 指的是 UTC 10:00
+// （若按北京时间理解，6 小时前就该 running 了）。h.timezone 只是赛事所在时区。
+//
+// 所以这里不能原样展示（那样等于 UTC+0，比北京时间早 8 小时），也不能只贴后缀，
+// 必须换算成目标时区的墙钟时间：
+//   "2026-11-27T10:00:00" → "2026-11-27T18:00:00+08:00"
+// 这样前端截字符串就得到北京时间，new Date() 解析也还是同一个绝对时刻。
 const TZ_OFFSET = {
   'Asia/Shanghai': '+08:00',
   'Asia/Chongqing': '+08:00',
@@ -48,13 +51,26 @@ const TZ_OFFSET = {
 };
 const DEFAULT_TZ = 'Asia/Shanghai';
 
+function offsetMinutes(offset) {
+  const m = /^([+-])(\d{2}):?(\d{2})$/.exec(String(offset || ''));
+  if (!m) return 0;
+  const n = Number(m[2]) * 60 + Number(m[3]);
+  return m[1] === '-' ? -n : n;
+}
+
 export function normalizeHuntTime(v, tz) {
   const s = v == null ? '' : String(v).trim();
   if (!s) return null;
-  // 已带 Z 或 ±HH:MM 的原样保留，避免重复追加
-  if (/([zZ]|[+-]\d{2}:?\d{2})$/.test(s)) return s;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return s.replace(' ', 'T');
+  // 不带时区 → 按 UTC 解释；带了 Z/±HH:MM → 按它自己的声明解释
+  const naive = !/([zZ]|[+-]\d{2}:?\d{2})$/.test(s);
+  const base = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}`;
+  const ms = Date.parse(naive ? base + 'Z' : base + s.slice(m[0].length).trim());
+  if (!Number.isFinite(ms)) return base + 'Z';
   const offset = TZ_OFFSET[tz] || TZ_OFFSET[DEFAULT_TZ];
-  return s.replace(' ', 'T') + offset;
+  const wall = new Date(ms + offsetMinutes(offset) * 60000).toISOString().slice(0, 19);
+  return wall + offset;
 }
 
 function normalize(h) {
