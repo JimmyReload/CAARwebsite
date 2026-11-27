@@ -21,6 +21,11 @@ import {
   exchangeCode, fetchUserinfo, revokeToken, makeOauthOnlyPassword, usernameSeed, usernameCandidate,
   isOauthOnly, safeNext
 } from './oauth.js'
+// 维护页：页面导航遇到 5xx/超时不再把裸错误码丢给浏览器
+import {
+  isPageNavigation, maintenanceResponse, subresourceFailureResponse,
+  withDeadline, NAVIGATION_DEADLINE_MS
+} from './maintenance.js'
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -801,8 +806,25 @@ const app = {
     };
 
     let res;
+    // 页面导航（地址栏能看到的 HTML）：所有 5xx 与超时都收口成维护页，
+    // 不让浏览器看到裸状态码或 Cloudflare 的错误页文案。
+    const nav = isPageNavigation(request, url);
+    const retryHref = url.pathname + url.search;
+    // 运维可调，但夹在 1–30s：填错也不至于让页面全挂
+    const rawDeadline = Number(env.NAVIGATION_DEADLINE_MS);
+    const deadlineMs = nav
+      ? (Number.isFinite(rawDeadline) && rawDeadline > 0
+        ? Math.min(30000, Math.max(1000, rawDeadline))
+        : NAVIGATION_DEADLINE_MS)
+      : 0;
+    // 只对页面导航加期限：API 有自己的上游预算（如赛事抓取 12s），不能被这里提前掐断
+    const failBody = (status) => (url.pathname.startsWith('/api/')
+      ? json({ error: t('errors.serverError') }, status)
+      : nav
+        ? harden(maintenanceResponse({ href: retryHref, rid }))
+        : harden(subresourceFailureResponse()));
     try {
-      res = await app.handle(request, env, ctx, io);
+      res = await withDeadline(app.handle(request, env, ctx, io), deadlineMs);
     } catch (err) {
       // 请求体自身的错误（超限/畸形 JSON/流读取失败）是客户端问题，按协议状态码回，
       // 不要混成 500 让人去翻服务端日志
@@ -810,12 +832,23 @@ const app = {
         // 事件名复用已有的 http.request（面板有中文名），具体原因放 meta.reject
         log.warn('http.request', { status: err.status, reject: 'body', reason: err.detail || err.localeKey });
         res = json({ error: t(err.localeKey) }, err.status);
+      } else if (err && err.name === 'RequestTimeout') {
+        // 上游/静态层卡住：先给维护页，别让浏览器挂到自己的「连接超时」
+        log.error('http.timeout', { ms: Date.now() - started, nav, path: url.pathname.slice(0, 120) });
+        res = failBody(503);
       } else {
         // 兜底：未捕获异常必须留痕，同时给用户一个体面的响应（不泄露堆栈）
         log.error('http.unhandled', { err: describeError(err), uid: io.actor ? io.actor.id : 0 });
         io.audit('request.error', { level: 'error', status: 500, meta: { err: describeError(err) } });
-        res = json({ error: t('errors.serverError') }, 500);
+        res = failBody(500);
       }
+    }
+
+    // 即便业务层正常返回了 5xx，也不该让浏览器停在裸错误码上
+    if (res.status >= 500 && !url.pathname.startsWith('/api/')) {
+      res = nav
+        ? harden(maintenanceResponse({ href: retryHref, rid }))
+        : harden(subresourceFailureResponse());
     }
 
     const ms = Date.now() - started;
@@ -855,6 +888,12 @@ const app = {
         if (!accept.includes('text/html')) return harden(res);
         // SPA 兜底：页面能打开，但状态码保持 404，避免未知路径伪装成正常页面
         const idx = await env.ASSETS.fetch(new Request(url.origin + '/index.html'));
+        // 连入口 HTML 都取不到，就不是"路径不存在"而是这次发布没传全：
+        // 给维护页，别让用户停在一个空白 404 上
+        if (idx.status !== 200) {
+          log.error('assets.index_missing', { status: idx.status });
+          return harden(maintenanceResponse({ href: url.pathname + url.search, rid: io.rid }));
+        }
         return harden(new Response(idx.body, {
           status: 404,
           headers: {

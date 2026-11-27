@@ -656,6 +656,8 @@ export default {
     'request.error': '请求异常',
     'http.request': 'HTTP 请求',
     'http.unhandled': '未捕获异常',
+    'http.timeout': '请求超出期限（已回维护页）',
+    'assets.index_missing': '入口 HTML 缺失（已回维护页）',
     // 审计自身
     'audit.dropped': '审计超出预算丢弃',
     'audit.prune': '清理过期日志',
