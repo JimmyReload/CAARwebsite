@@ -196,7 +196,7 @@ export default function AdminView({ user }) {
     } catch (err) { setMsg(String(err.message)) }
   }
 
-  /* 打开会话：消息与已读并行发出，不再串行等两次往返 */
+  /* 打开会话：先取实际显示的消息，再只标记其中最后一条来信 */
   const openConv = async (cv) => {
     const seq = ++convSeqRef.current
     const gen = genRef.current
@@ -204,15 +204,20 @@ export default function AdminView({ user }) {
     setMsgs([])
     setMsgsLoading(true)
     try {
-      const [m] = await Promise.all([
-        api('/conversation/' + cv.id + '/messages'),
-        api('/conversation/' + cv.id + '/read', { method: 'POST' })
-      ])
-      // 期间换了会话或换了账号：这份消息不能显示在当前会话里
+      const m = await api('/conversation/' + cv.id + '/messages')
+      // 期间换了会话或换了账号：这份消息不能显示，也不能推进它的已读位
       if (seq !== convSeqRef.current || gen !== genRef.current) return
-      setMsgs(m.list || [])
+      const list = m.list || []
+      setMsgs(list)
+      const lastIncomingId = list.reduce((last, item) => (
+        item.direction === 'to_staff' ? Math.max(last, Number(item.id) || 0) : last
+      ), 0)
+      const readState = await api('/conversation/' + cv.id + '/read', {
+        method: 'POST', body: { last_id: lastIncomingId }
+      })
+      if (seq !== convSeqRef.current || gen !== genRef.current) return
       setConvs((old) => {
-        const next = old.map((c) => (c.id === cv.id ? { ...c, unread: 0 } : c))
+        const next = old.map((c) => (c.id === cv.id ? { ...c, unread: Number(readState.unread) || 0 } : c))
         syncCache({ convs: next })
         return next
       })

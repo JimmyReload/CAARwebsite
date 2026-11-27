@@ -14,6 +14,85 @@ const MAX_BADGES_PER_HUNT = 8
 const MAX_LABEL_LENGTH = 40
 const CONCURRENCY = 8
 
+function activeUserIdsSql() {
+  return 'SELECT CAST(id AS TEXT) FROM users WHERE banned = 0 AND puzzlecat_id IS NOT NULL'
+}
+
+export function prepareHuntCompletionCacheCleanup(db, userId = null) {
+  // Deletion and zero-bound-user cleanup share one JSON1 read-modify-write. The
+  // single UPDATE reads the live row in SQLite, so no stale JS snapshot can
+  // overwrite another user's concurrently refreshed map entry.
+  const hasUserId = userId !== null && userId !== undefined
+  const params = [CACHE_ID]
+  let sourceCte = 'SELECT cache_source.payload FROM cache_source'
+  if (hasUserId) {
+    const id = Number(userId)
+    if (!Number.isSafeInteger(id) || id <= 0) throw new TypeError('userId must be a positive safe integer')
+    sourceCte = 'SELECT json_remove(cache_source.payload, ?, ?) AS payload FROM cache_source'
+    params.push('$.userHunts.' + JSON.stringify(String(id)), '$.userHuntFetchedAt.' + JSON.stringify(String(id)))
+  }
+  params.push(CACHE_ID)
+  const objectMap = (property) => {
+    const alias = 'entry'
+    const value = `CASE WHEN ${alias}.type IN ('object', 'array') THEN json(${alias}.value) ELSE ${alias}.value END`
+    return `json(COALESCE((SELECT json_group_object(${alias}.key, ${value})
+      FROM json_each(source.payload, '$.${property}') AS ${alias}
+      WHERE ${alias}.key IN (${activeUserIdsSql()})), '{}'))`
+  }
+  const idArray = (property) => `json(COALESCE((SELECT json_group_array(value)
+    FROM json_each(source.payload, '$.${property}')
+    WHERE CAST(value AS TEXT) IN (${activeUserIdsSql()})), '[]'))`
+  return db.prepare(`
+    WITH cache_source(payload) AS (
+      SELECT CASE WHEN json_valid(payload) THEN payload ELSE '{}' END
+        FROM hunt_completion_cache WHERE id = ?
+    ), source(payload) AS (${sourceCte}), cleaned(payload) AS (
+      SELECT json_set(source.payload,
+        '$.userHunts', ${objectMap('userHunts')},
+        '$.userHuntFetchedAt', ${objectMap('userHuntFetchedAt')},
+        '$.syncedUserIds', ${idArray('syncedUserIds')},
+        '$.failedUserIds', ${idArray('failedUserIds')},
+        '$.syncedAllUsers', json('false')
+      ) FROM source
+    )
+    UPDATE hunt_completion_cache
+       SET payload = json_remove((SELECT payload FROM cleaned), '$._refreshLease'),
+           refresh_until = 0, retry_after = 0
+     WHERE id = ?
+  `).bind(...params)
+}
+
+function prepareRefreshCommit(db, payload, now, retryAt, leaseUntil, leaseToken) {
+  // The JS merge is based on the lease owner's snapshot; commit filters current
+  // linked users and requires that exact lease, so delete/refresh interleavings
+  // cannot resurrect a deleted key or overwrite a newer cache generation.
+  const objectMap = (property) => {
+    const alias = 'entry'
+    const value = `CASE WHEN ${alias}.type IN ('object', 'array') THEN json(${alias}.value) ELSE ${alias}.value END`
+    return `json(COALESCE((SELECT json_group_object(${alias}.key, ${value})
+      FROM json_each(source.payload, '$.${property}') AS ${alias}
+      WHERE ${alias}.key IN (${activeUserIdsSql()})), '{}'))`
+  }
+  const idArray = (property) => `json(COALESCE((SELECT json_group_array(value)
+    FROM json_each(source.payload, '$.${property}')
+    WHERE CAST(value AS TEXT) IN (${activeUserIdsSql()})), '[]'))`
+  return db.prepare(`
+    WITH source(payload) AS (SELECT json(?))
+    UPDATE hunt_completion_cache
+       SET payload = json_remove(json_set(source.payload,
+             '$.userHunts', ${objectMap('userHunts')},
+             '$.userHuntFetchedAt', ${objectMap('userHuntFetchedAt')},
+             '$.syncedUserIds', ${idArray('syncedUserIds')},
+             '$.failedUserIds', ${idArray('failedUserIds')}
+           ), '$._refreshLease'),
+           fetched_at = ?, refresh_until = 0, retry_after = ?
+      FROM source
+     WHERE hunt_completion_cache.id = ?
+       AND hunt_completion_cache.refresh_until = ?
+       AND json_extract(hunt_completion_cache.payload, '$._refreshLease') = ?
+  `).bind(JSON.stringify(payload), now, retryAt, CACHE_ID, leaseUntil, leaseToken)
+}
+
 export const HUNT_COMPLETION_LIMITS = Object.freeze({
   maxLinkedUsers: MAX_LINKED_USERS,
   maxItemsPerProfile: MAX_ITEMS_PER_PROFILE,
@@ -121,7 +200,7 @@ export async function buildHuntCompletionPayload(users, fetcher = fetch, now = D
   return { fetchedAt, syncedUserIds: rows.map((row) => row.id), failedUserIds, userHunts, userHuntFetchedAt }
 }
 
-async function refreshSnapshot(env, now) {
+async function refreshSnapshot(env, now, leaseUntil, leaseToken) {
   try {
     const [{ count }, usersResult] = await Promise.all([
       env.DB.prepare('SELECT COUNT(*) AS count FROM users WHERE banned = 0 AND puzzlecat_id IS NOT NULL').first(),
@@ -146,12 +225,20 @@ async function refreshSnapshot(env, now) {
       for (const key of Object.keys(merged.userHunts)) {
         if (!Object.prototype.hasOwnProperty.call(userHuntFetchedAt, key)) userHuntFetchedAt[key] = legacyFetchedAt
       }
+      const currentUserIds = new Set(payload.syncedUserIds.map(Number))
+      // Drop unlinked/deleted ids immediately. For still-linked ids, retain failed
+      // users' last known rows only inside their per-user success TTL.
+      for (const key of Object.keys(merged.userHunts)) {
+        const userId = Number(key)
+        if (!currentUserIds.has(userId) || !isWithinStaleTtl(userHuntFetchedAt[key], now)) {
+          delete merged.userHunts[key]
+          delete userHuntFetchedAt[key]
+        }
+      }
       for (const userId of payload.syncedUserIds) {
         const key = String(userId)
         if (payload.failedUserIds.includes(userId)) {
-          // Keep the old result only while its independent last-success age is
-          // within the stale TTL. A failed refresh must not renew that age.
-          if (Object.prototype.hasOwnProperty.call(merged.userHunts, key) && isWithinStaleTtl(userHuntFetchedAt[key], now)) {
+          if (Object.prototype.hasOwnProperty.call(merged.userHunts, key)) {
             payload.userHunts[key] = merged.userHunts[key]
             payload.userHuntFetchedAt[key] = userHuntFetchedAt[key]
           }
@@ -161,15 +248,9 @@ async function refreshSnapshot(env, now) {
       }
       Object.assign(merged.userHunts, payload.userHunts)
       Object.assign(userHuntFetchedAt, payload.userHuntFetchedAt)
-      // Also clean old users outside this bounded refresh batch.
-      for (const key of Object.keys(merged.userHunts)) {
-        if (!isWithinStaleTtl(userHuntFetchedAt[key], now)) {
-          delete merged.userHunts[key]
-          delete userHuntFetchedAt[key]
-        }
-      }
+      // Keep timestamps only for currently linked users and non-expired results.
       for (const key of Object.keys(userHuntFetchedAt)) {
-        if (!isWithinStaleTtl(userHuntFetchedAt[key], now)) delete userHuntFetchedAt[key]
+        if (!currentUserIds.has(Number(key)) || !isWithinStaleTtl(userHuntFetchedAt[key], now)) delete userHuntFetchedAt[key]
       }
       merged.userHuntFetchedAt = userHuntFetchedAt
       merged.syncedUserIds = [...new Set([...merged.syncedUserIds, ...payload.syncedUserIds])].sort((a, b) => a - b)
@@ -187,14 +268,29 @@ async function refreshSnapshot(env, now) {
     } else {
       payload.fetchedAt = now
     }
-    await env.DB.prepare(
-      `INSERT INTO hunt_completion_cache (id, payload, fetched_at, refresh_until, retry_after)
-       VALUES (?, ?, ?, 0, ?)
-       ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at, refresh_until = 0, retry_after = excluded.retry_after`
-    ).bind(CACHE_ID, JSON.stringify(payload), now, retryAt).run()
+    // Commit only while this refresh still owns its lease. The SQL re-filters all
+    // cached ids against current linked users at commit time, closing delete-vs-fetch races.
+    await prepareRefreshCommit(env.DB, payload, now, retryAt, leaseUntil, leaseToken).run()
   } catch {
-    try { await env.DB.prepare('UPDATE hunt_completion_cache SET refresh_until = 0, retry_after = ? WHERE id = ?').bind(Date.now() + RETRY_BACKOFF_MS, CACHE_ID).run() }
-    catch { /* migration or DB unavailable: optional labels remain absent */ }
+    try {
+      await env.DB.prepare(`UPDATE hunt_completion_cache
+         SET refresh_until = 0, retry_after = ?,
+             payload = json_remove(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$._refreshLease')
+       WHERE id = ? AND refresh_until = ? AND json_extract(payload, '$._refreshLease') = ?`)
+        .bind(Date.now() + RETRY_BACKOFF_MS, CACHE_ID, leaseUntil, leaseToken).run()
+    } catch { /* migration or DB unavailable: optional labels remain absent */ }
+  }
+}
+
+/** Remove a deleted account's public completion keys using one atomic JSON1 update. */
+export async function removeHuntCompletionUser(env, userId = null) {
+  if (!env || !env.DB) return false
+  try {
+    await prepareHuntCompletionCacheCleanup(env.DB, userId).run()
+    return true
+  } catch {
+    // Cache cleanup is best-effort; account deletion itself remains authoritative.
+    return false
   }
 }
 
@@ -234,7 +330,12 @@ export async function getHuntCompletionData(env, ctx, now = Date.now()) {
          FROM users WHERE banned = 0 AND puzzlecat_id IS NOT NULL ORDER BY id LIMIT ?`
     ).bind(MAX_LINKED_USERS).all()).results || []
   } catch { return { byHunt: Object.create(null), pending: false, source: 'unavailable' } }
-  if (!users.length) return { byHunt: Object.create(null), pending: false, source: 'empty' }
+  if (!users.length) {
+    // No active profile means the cache is not displayable. Still prune orphaned
+    // JSON keys atomically without deleting/rewriting other users' valid data.
+    try { await removeHuntCompletionUser(env, null) } catch { /* optional cache cleanup */ }
+    return { byHunt: Object.create(null), pending: false, source: 'empty' }
+  }
 
   let row = null
   let payload = null
@@ -256,15 +357,18 @@ export async function getHuntCompletionData(env, ctx, now = Date.now()) {
   if (!fresh && !retryDeferred && !refreshInProgress) {
     try {
       const leaseUntil = now + REFRESH_LEASE_MS
+      const leaseToken = crypto.randomUUID()
       const lease = await env.DB.prepare(
         `INSERT INTO hunt_completion_cache (id, payload, fetched_at, refresh_until, retry_after)
-         VALUES (?, '{}', 0, ?, 0)
-         ON CONFLICT(id) DO UPDATE SET refresh_until = excluded.refresh_until
+         VALUES (?, json_object('_refreshLease', ?), 0, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           payload = json_set(CASE WHEN json_valid(hunt_completion_cache.payload) THEN hunt_completion_cache.payload ELSE '{}' END, '$._refreshLease', ?),
+           refresh_until = excluded.refresh_until
          WHERE hunt_completion_cache.refresh_until <= ? AND hunt_completion_cache.retry_after <= ?
          RETURNING id`
-      ).bind(CACHE_ID, leaseUntil, now, now).first()
+      ).bind(CACHE_ID, leaseToken, leaseUntil, leaseToken, now, now).first()
       if (lease) {
-        const job = refreshSnapshot(env, now)
+        const job = refreshSnapshot(env, now, leaseUntil, leaseToken)
         if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job)
         else job.catch(() => null)
       }

@@ -266,6 +266,66 @@ test('GET /inbox 只读，显式同源 JSON POST /inbox/read 才推进成员已�
   assert.equal(Number(after.user_last_read_id), 1, '只能推进到确认看到的消息，不能跨过未查看的新回复')
 })
 
+test('客服先读取实际显示的来信，再以所见 id 标记已读；并发新来信仍保持未读', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seedUser(env)
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, password, nickname, role, banned, session_version) VALUES (2, 'staff', 'deadbeef:deadbeef', '客服', 'admin', 0, 0)"
+  ).run()
+  const staffToken = 's'.repeat(32)
+  await env.SESSIONS.put('s:' + staffToken, '2:0')
+  const created = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (1)').run()
+  const convId = created.meta.last_row_id
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 1, 'to_staff', '已看到的来信')").bind(convId).run()
+
+  const messages = await call(env, new Request(BASE + `/api/conversation/${convId}/messages`, {
+    headers: { cookie: 'caar_session=' + staffToken }
+  }))
+  assert.equal(messages.status, 200)
+  const displayedIncoming = messages.json.list.filter((message) => message.direction === 'to_staff')
+  assert.equal(displayedIncoming.length, 1)
+  const shownLastId = displayedIncoming.at(-1).id
+
+  // barrier: GET 已经返回给页面后、read POST 到达前，又有一条新来信提交。
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 1, 'to_staff', '读取请求前的新来信')").bind(convId).run()
+  const marked = await call(env, req(`conversation/${convId}/read`, {
+    headers: { cookie: 'caar_session=' + staffToken, origin: BASE, 'content-type': 'application/json' },
+    body: { last_id: shownLastId }
+  }))
+  assert.equal(marked.status, 200)
+  assert.equal(marked.json.unread, 1, '返回 GET 之后到达的未读来信数，供前端保持正确徽标')
+  const state = await env.DB.prepare(
+    `SELECT c.staff_last_read_id,
+            (SELECT COUNT(*) FROM messages m WHERE m.conv_id = c.id AND m.direction = 'to_staff' AND m.id > c.staff_last_read_id) AS unread
+       FROM conversations c WHERE c.id = ?`
+  ).bind(convId).first()
+  assert.equal(Number(state.staff_last_read_id), Number(shownLastId), '只能推进到 GET 返回并显示的最后一条来信')
+  assert.equal(Number(state.unread), 1, 'GET 之后到达的消息仍保持未读')
+})
+
+test('conversation/read 拒绝无效游标和非对方消息 ID', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seedUser(env)
+  const staffToken = 's'.repeat(32)
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, password, nickname, role, banned, session_version) VALUES (2, 'staff', 'deadbeef:deadbeef', '客服', 'admin', 0, 0)"
+  ).run()
+  await env.SESSIONS.put('s:' + staffToken, '2:0')
+  const created = await env.DB.prepare('INSERT INTO conversations (user_id) VALUES (1)').run()
+  const convId = created.meta.last_row_id
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 1, 'to_staff', '来信')").bind(convId).run()
+  await env.DB.prepare("INSERT INTO messages (conv_id, sender_id, direction, content) VALUES (?, 2, 'to_user', '客服回复')").bind(convId).run()
+  for (const last_id of ['1', -1, 99, 2]) {
+    const r = await call(env, req(`conversation/${convId}/read`, {
+      headers: { cookie: 'caar_session=' + staffToken, origin: BASE, 'content-type': 'application/json' },
+      body: { last_id }
+    }))
+    assert.equal(r.status, 400, `last_id=${last_id} 必须无效`)
+  }
+  const row = await env.DB.prepare('SELECT staff_last_read_id FROM conversations WHERE id = ?').bind(convId).first()
+  assert.equal(Number(row.staff_last_read_id), 0)
+})
+
 test('inbox/read 要求同源 Origin + JSON，非法游标返回 400', async () => {
   const env = makeEnv({ fullSchema: true })
   await seedUser(env)

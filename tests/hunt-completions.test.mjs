@@ -1,6 +1,6 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildHuntCompletionPayload, getHuntCompletionData, HUNT_COMPLETION_LIMITS } from '../src/huntCompletions.js'
+import { buildHuntCompletionPayload, getHuntCompletionData, removeHuntCompletionUser, HUNT_COMPLETION_LIMITS } from '../src/huntCompletions.js'
 import { makeEnv } from './helpers/d1.mjs'
 
 function json(body, status = 200) {
@@ -69,6 +69,40 @@ test('caps upstream work at the configured number of linked users', async () => 
   assert.equal(payload.syncedUserIds.length, HUNT_COMPLETION_LIMITS.maxLinkedUsers)
 })
 
+test('user cache cleanup is atomic, removes both target maps and preserves other active users', async () => {
+  const freshEnv = makeEnv({ fullSchema: true })
+  await freshEnv.DB.prepare("INSERT INTO users (id, username, password, nickname, role, puzzlecat_id) VALUES (4, 'gone', 'p', 'Gone', 'user', 'p4'), (5, 'keep', 'p', 'Keep', 'user', 'p5')").run()
+  const at = Date.now()
+  await freshEnv.DB.prepare('INSERT INTO hunt_completion_cache (id, payload, fetched_at) VALUES (1, ?, ?)')
+    .bind(JSON.stringify({ syncedUserIds: [4, 5], syncedAllUsers: true, failedUserIds: [], userHunts: { '4': ['id:deleted'], '5': ['id:kept'] }, userHuntFetchedAt: { '4': at, '5': at } }), at).run()
+  await freshEnv.DB.prepare('DELETE FROM users WHERE id = 4').run()
+  assert.equal(await removeHuntCompletionUser(freshEnv, 4), true)
+  const row = await freshEnv.DB.prepare('SELECT payload, refresh_until FROM hunt_completion_cache WHERE id = 1').first()
+  const payload = JSON.parse(row.payload)
+  assert.equal(Object.hasOwn(payload.userHunts, '4'), false)
+  assert.equal(Object.hasOwn(payload.userHuntFetchedAt, '4'), false)
+  assert.deepEqual(payload.userHunts['5'], ['id:kept'])
+  assert.equal(payload.userHuntFetchedAt['5'], at)
+  assert.deepEqual(payload.syncedUserIds, [5])
+  assert.equal(Number(row.refresh_until), 0, 'delete invalidates any in-flight refresh lease')
+})
+
+test('zero-active-user read atomically removes orphan cache keys without rebuilding a historic roster', async () => {
+  const freshEnv = makeEnv({ fullSchema: true })
+  await freshEnv.DB.prepare("INSERT INTO users (id, username, password, nickname, role) VALUES (4, 'unlinked', 'p', 'Unlinked', 'user')").run()
+  await freshEnv.DB.prepare('INSERT INTO hunt_completion_cache (id, payload, fetched_at) VALUES (1, ?, ?)')
+    .bind(JSON.stringify({ fetchedAt: Date.now(), syncedUserIds: [99], syncedAllUsers: true, failedUserIds: [99], userHunts: { '99': ['id:orphan'] }, userHuntFetchedAt: { '99': Date.now() } }), Date.now()).run()
+  const empty = await getHuntCompletionData(freshEnv, { waitUntil() {} })
+  assert.equal(empty.source, 'empty')
+  assert.deepEqual(Object.keys(empty.byHunt), [])
+  const row = await freshEnv.DB.prepare('SELECT payload FROM hunt_completion_cache WHERE id = 1').first()
+  const payload = JSON.parse(row.payload)
+  assert.deepEqual(payload.userHunts, {})
+  assert.deepEqual(payload.userHuntFetchedAt, {})
+  assert.deepEqual(payload.syncedUserIds, [])
+  assert.deepEqual(payload.failedUserIds, [])
+})
+
 let vite
 let worker
 let env
@@ -123,6 +157,55 @@ test('stale completion cache without a refresh lease schedules background refres
   assert.equal(out.byHunt['id:cached-hunt'][0].name, '缓存用户', 'serve stale snapshot while refreshing')
   assert.equal(scheduled, 1, 'only one bounded refresh is scheduled for the cache lease')
   await new Promise((resolve) => setImmediate(resolve))
+})
+
+test('deleting a user revokes an in-flight refresh lease so stale refresh cannot restore deleted keys', async () => {
+  const freshEnv = makeEnv({ fullSchema: true })
+  await freshEnv.DB.prepare("INSERT INTO users (id, username, password, nickname, role, puzzlecat_id) VALUES (4, 'gone', 'p', 'Gone', 'user', 'profile-4'), (5, 'keep', 'p', 'Keep', 'user', 'profile-5')").run()
+  const now = Date.now()
+  await freshEnv.DB.prepare('INSERT INTO hunt_completion_cache (id, payload, fetched_at, refresh_until, retry_after) VALUES (1, ?, ?, 0, 0)')
+    .bind(JSON.stringify({ fetchedAt: now - HUNT_COMPLETION_LIMITS.cacheTtlMs - 1000, syncedUserIds: [4, 5], syncedAllUsers: false, failedUserIds: [], userHunts: { '4': ['id:old-4'], '5': ['id:old-5'] }, userHuntFetchedAt: { '4': now, '5': now } }), now - HUNT_COMPLETION_LIMITS.cacheTtlMs - 1000).run()
+
+  const originalFetch = globalThis.fetch
+  let resolveProfiles
+  let started
+  const startedPromise = new Promise((resolve) => { started = resolve })
+  const profilePromise = new Promise((resolve) => { resolveProfiles = resolve })
+  let calls = 0
+  globalThis.fetch = async (url) => {
+    const profileKey = decodeURIComponent(String(url).split('/').pop())
+    calls++
+    if (calls === 2) started()
+    return profilePromise.then(() => profile(profileKey, { finishedHunts: [finished('late-' + profileKey, 'late-' + profileKey)] }))
+  }
+
+  try {
+    let refresh
+    await getHuntCompletionData(freshEnv, { waitUntil(promise) { refresh = promise } }, now)
+    assert.ok(refresh, 'a stale snapshot should acquire a refresh lease')
+    await startedPromise
+    const lease = await freshEnv.DB.prepare('SELECT refresh_until, payload FROM hunt_completion_cache WHERE id = 1').first()
+    assert.ok(Number(lease.refresh_until) > now)
+    assert.ok(JSON.parse(lease.payload)._refreshLease, 'lease token is persisted atomically with the lease')
+
+    await freshEnv.DB.prepare('DELETE FROM users WHERE id = 4').run()
+    assert.equal(await removeHuntCompletionUser(freshEnv, 4), true)
+    const afterDelete = JSON.parse((await freshEnv.DB.prepare('SELECT payload FROM hunt_completion_cache WHERE id = 1').first()).payload)
+    assert.equal(Object.hasOwn(afterDelete.userHunts, '4'), false)
+    assert.equal(Object.hasOwn(afterDelete.userHuntFetchedAt, '4'), false)
+    assert.equal(afterDelete.userHunts['5'][0], 'id:old-5')
+
+    resolveProfiles()
+    await refresh
+    const final = JSON.parse((await freshEnv.DB.prepare('SELECT payload FROM hunt_completion_cache WHERE id = 1').first()).payload)
+    assert.equal(Object.hasOwn(final.userHunts, '4'), false, 'revoked stale refresh must not resurrect the deleted profile')
+    assert.equal(Object.hasOwn(final.userHuntFetchedAt, '4'), false)
+    assert.equal(final.userHunts['5'][0], 'id:old-5', 'other active profile snapshot is retained')
+    assert.equal(JSON.stringify(final).includes('late-profile-5'), false, 'stale lease commit is rejected in full after revocation')
+  } finally {
+    resolveProfiles()
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('repeated profile failures do not renew legacy per-user success age and expire old hunts', async () => {

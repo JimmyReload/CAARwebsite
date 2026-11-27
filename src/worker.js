@@ -5,7 +5,7 @@
 import { t } from './i18n.js'
 import { NEWS_CONTENT_MAX as NEWS_TEXT_MAX, normalizeNewsDocument, newsDocumentExcerpt, newsDocumentText } from './newsContent.js'
 import { getHuntFeed, refreshFeed, isValidHuntId } from './hunts.js'
-import { getHuntCompletionData } from './huntCompletions.js'
+import { getHuntCompletionData, removeHuntCompletionUser } from './huntCompletions.js'
 // 登录节流单独成模块：不依赖 Workers 运行时，可被 tests/ 直接驱动
 import {
   LOGIN_COMBO_MAX, LOGIN_IP_MAX, LOGIN_USER_MAX, LOGIN_STAFF_MAX,
@@ -763,7 +763,12 @@ const app = {
     // 规范主机名：所有 www.caar.fun 请求 308 到裸域，保留 method、path、query。
     // Location 固定使用本站 canonical origin，不信任 Host/X-Forwarded-Host，防止重定向注入。
     if (url.hostname.toLowerCase() === 'www.caar.fun') {
-      const canonical = new URL(url.pathname + url.search, 'https://caar.fun');
+      // Set components on a URL whose origin is already fixed. Never parse the
+      // request path as a relative URL: `//host`, normalized backslashes, and
+      // userinfo-looking segments must remain path data, not a new authority.
+      const canonical = new URL('https://caar.fun/');
+      canonical.pathname = url.pathname;
+      canonical.search = url.search;
       return harden(new Response(null, {
         status: 308,
         headers: { location: canonical.href, 'cache-control': 'no-store' }
@@ -1819,17 +1824,33 @@ const app = {
       return json({ conv: { id: conv.id, user_id: conv.user_id }, list: msgs });
     }
 
-    // 标记已读
+    // 标记已读：客户端只提交它刚拉取并显示的最后一条对方消息。
+    // 在同一条 UPDATE 中校验会话、方向和消息 ID，且用 MAX 保证并发请求不回退。
     if (path.indexOf('conversation/') === 0 && path.endsWith('/read') && method === 'POST') {
       const convId = Number(path.split('/')[1]);
       const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
       if (!conv) return json({ error: t('errors.convNotFound') }, 404);
       const isOwner = conv.user_id === user.id;
       if (!isOwner && !isStaff(user)) return json({ error: t('errors.forbidden') }, 403);
-      const last = await env.DB.prepare('SELECT MAX(id) AS n FROM messages WHERE conv_id = ?').bind(convId).first();
-      if (isOwner) await env.DB.prepare('UPDATE conversations SET user_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
-      else await env.DB.prepare('UPDATE conversations SET staff_last_read_id = ? WHERE id = ?').bind(last.n || 0, convId).run();
-      return json({ ok: true });
+      const b = await readBody(request);
+      const lastId = b.last_id;
+      if (!Number.isSafeInteger(lastId) || lastId < 0) return json({ error: t('errors.badParams') }, 400);
+      const col = isOwner ? 'user_last_read_id' : 'staff_last_read_id';
+      const direction = isOwner ? 'to_user' : 'to_staff';
+      if (lastId > 0) {
+        const updated = await env.DB.prepare(
+          `UPDATE conversations
+              SET ${col} = MAX(${col}, ?)
+            WHERE id = ? AND user_id = ?
+              AND EXISTS (SELECT 1 FROM messages WHERE id = ? AND conv_id = ? AND direction = ? AND id <= ?)`
+        ).bind(lastId, convId, conv.user_id, lastId, convId, direction, lastId).run();
+        if (!Number(updated && updated.meta && updated.meta.changes)) return json({ error: t('errors.badParams') }, 400);
+      }
+      const unread = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND direction = ?
+           AND id > (SELECT ${col} FROM conversations WHERE id = ?)`
+      ).bind(convId, direction, convId).first();
+      return json({ ok: true, unread: Number(unread && unread.n) || 0 });
     }
     // 管理概览
     if (path === 'admin/stats' && method === 'GET') {
@@ -1988,70 +2009,92 @@ const app = {
     if (path.startsWith('admin/users/') && method === 'PATCH') {
       if (!isStaff(user)) return json({ error: t('errors.adminOnly') }, 403);
       const id = Number(path.split('/')[2]);
-      if (!id) return json({ error: t('errors.badParams') }, 400);
+      if (!Number.isSafeInteger(id) || id <= 0) return json({ error: t('errors.badParams') }, 400);
+      const b = await readBody(request);
+      const allowedFields = new Set(['role', 'nickname', 'banned', 'new_password']);
+      if (!Object.keys(b).length || Object.keys(b).some((key) => !allowedFields.has(key))) {
+        return json({ error: t('errors.badParams') }, 400);
+      }
       const target = await env.DB.prepare('SELECT id, username, role FROM users WHERE id = ?').bind(id).first();
       if (!target) return json({ error: t('errors.userNotFound') }, 404);
       const targetIsSuper = target.role === 'superadmin';
       // 同族收口：对"另一个管理员"的任何改动都要求超管。
-      // 否则平权的 admin 之间可以互相压制——改密（接管）、封禁（拒服）、改昵称（篡改他人展示）。
-      // 三处分支共用这一个判定，避免只堵了一条路径又从前门进来。
       const peerAdmin = target.role === 'admin' && !isSuper(user) && id !== user.id;
-      const b = await readBody(request);
-      // 管理员改自己的口令必须走 /change-password 验证旧口令，禁止 PATCH 旁路。
-      if (b.new_password !== undefined && id === user.id) return json({ error: t('errors.forbidden') }, 403);
+      const guarded = targetIsSuper && id !== user.id;
 
-      // 授权（设为/撤销管理员）只给超管
+      // 先校验本次请求的全部字段，不允许 String()/truthiness 隐式接受对象、字符串布尔等。
+      let nickname = null;
+      let banned = null;
+      let newPassword = null;
+      let passwordHash = null;
+      if (b.role !== undefined && (typeof b.role !== 'string' || !['user', 'admin'].includes(b.role))) {
+        return json({ error: t('errors.invalidRole') }, 400);
+      }
+      if (b.nickname !== undefined) {
+        if (typeof b.nickname !== 'string') return json({ error: t('errors.badParams') }, 400);
+        const parsed = normalizeNickname(b.nickname);
+        if (parsed.error) return json({ error: t(parsed.error) }, 400);
+        nickname = parsed.value;
+      }
+      if (b.banned !== undefined) {
+        if (!(typeof b.banned === 'boolean' || (typeof b.banned === 'number' && (b.banned === 0 || b.banned === 1)))) {
+          return json({ error: t('errors.badParams') }, 400);
+        }
+        banned = b.banned ? 1 : 0;
+      }
+      if (b.new_password !== undefined) {
+        if (typeof b.new_password !== 'string') return json({ error: t('errors.badParams') }, 400);
+        const pwErr = passwordProblem(b.new_password, target.username);
+        if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
+        newPassword = b.new_password;
+      }
+
+      // 所有授权都在写库前完成：混合字段请求不能先成功写一个字段、再被后续字段拒绝。
       if (b.role !== undefined) {
         if (!isSuper(user)) return json({ error: t('errors.superOnly') }, 403);
-        if (!['user', 'admin'].includes(b.role)) return json({ error: t('errors.invalidRole') }, 400);
         if (targetIsSuper || id === user.id) return json({ error: t('errors.cannotEditSuper') }, 400);
-        await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(b.role, id).run();
-        io.audit('admin.user.role', {
-          level: 'warn', status: 200, target_type: 'user', target_id: id,
-          meta: { username: target.username, from: target.role, to: b.role }
-        });
       }
-      // 其余改动不允许落到超管账号上（自己改自己除外）
-      const guarded = targetIsSuper && id !== user.id;
-      if (b.nickname !== undefined) {
+      if (b.nickname !== undefined || b.new_password !== undefined) {
         if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
         if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
-        // 与 /api/profile 同一口径：非空、≤20 码点、无控制字符。
-        // 昵称会进入所有人的赛事列表与工单，这里漏了上限就能被拿来放大响应体。
-        const nick = normalizeNickname(b.nickname);
-        if (nick.error) return json({ error: t(nick.error) }, 400);
-        await env.DB.prepare('UPDATE users SET nickname = ? WHERE id = ?').bind(nick.value, id).run();
-        io.audit('admin.user.nickname', {
-          status: 200, target_type: 'user', target_id: id,
-          meta: { username: target.username, nickname: nick.value }
-        });
       }
+      if (b.new_password !== undefined && id === user.id) return json({ error: t('errors.forbidden') }, 403);
       if (b.banned !== undefined) {
         if (id === user.id) return json({ error: t('errors.cannotBanSelf') }, 400);
         if (targetIsSuper) return json({ error: t('errors.cannotEditSuper') }, 400);
-        // 封禁同级 admin = 拒绝服务攻击（对方被踢下线、需他人解封），只能由超管做
         if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
-        await env.DB.prepare('UPDATE users SET banned = ? WHERE id = ?').bind(b.banned ? 1 : 0, id).run();
-        io.audit(b.banned ? 'admin.user.ban' : 'admin.user.unban', {
-          level: 'warn', status: 200, target_type: 'user', target_id: id,
-          meta: { username: target.username }
-        });
       }
-      if (b.new_password !== undefined) {
-        if (guarded) return json({ error: t('errors.cannotEditSuper') }, 400);
-        // 管理员之间平权：admin 不得重置同级的口令，否则可横向接管对方账号
-        if (peerAdmin) return json({ error: t('errors.superOnly') }, 403);
-        const np = String(b.new_password);
-        const pwErr = passwordProblem(np, target.username);
-        if (pwErr) return json({ error: t(pwErr === 'errors.passwordLength' ? 'errors.newPasswordLength' : pwErr) }, 400);
-        const { salt: s2, hash: h2 } = await hashPassword(np);
-        await env.DB.prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?').bind(s2 + ':' + h2, id).run();
-        // 代改他人口令等于临时接管账号：必须留档
-        io.audit('admin.user.password_reset', {
-          level: 'warn', status: 200, target_type: 'user', target_id: id,
-          meta: { username: target.username }
-        });
+
+      // 单条参数化 UPDATE 是 D1 原子边界；口令哈希计算也在任何数据库写之前完成。
+      if (newPassword !== null) {
+        const { salt, hash } = await hashPassword(newPassword);
+        passwordHash = salt + ':' + hash;
       }
+      const sets = [];
+      const values = [];
+      if (b.role !== undefined) { sets.push('role = ?'); values.push(b.role); }
+      if (nickname !== null) { sets.push('nickname = ?'); values.push(nickname); }
+      if (banned !== null) { sets.push('banned = ?'); values.push(banned); }
+      if (passwordHash !== null) { sets.push('password = ?', 'session_version = session_version + 1'); values.push(passwordHash); }
+      await env.DB.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?').bind(...values, id).run();
+
+      // 只有整批 UPDATE 成功后才排入成功审计事件。
+      if (b.role !== undefined) io.audit('admin.user.role', {
+        level: 'warn', status: 200, target_type: 'user', target_id: id,
+        meta: { username: target.username, from: target.role, to: b.role }
+      });
+      if (nickname !== null) io.audit('admin.user.nickname', {
+        status: 200, target_type: 'user', target_id: id,
+        meta: { username: target.username, nickname }
+      });
+      if (banned !== null) io.audit(banned ? 'admin.user.ban' : 'admin.user.unban', {
+        level: 'warn', status: 200, target_type: 'user', target_id: id,
+        meta: { username: target.username }
+      });
+      if (passwordHash !== null) io.audit('admin.user.password_reset', {
+        level: 'warn', status: 200, target_type: 'user', target_id: id,
+        meta: { username: target.username }
+      });
       return json({ ok: true });
     }
 
@@ -2076,6 +2119,9 @@ const app = {
       ]);
       if (target.email) {
         try { await env.DB.prepare('DELETE FROM email_codes WHERE email = ?').bind(target.email).run(); } catch { /* 表未建 */ }
+      }
+      if (!await removeHuntCompletionUser(env, id)) {
+        log.warn('hunt.completion_cache.user_prune.fail', { uid: id })
       }
       // 删号不可恢复：审计里保留被删账号的标识，便于日后追查
       io.audit('admin.user.delete', {

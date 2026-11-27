@@ -13,9 +13,41 @@ test('www homepage redirects permanently to apex', async () => {
 })
 
 test('www path and query are preserved on canonical redirect', async () => {
-  const res = await worker.fetch(new Request('https://www.caar.fun/news/article?id=17&from=www'), env, ctx)
-  assert.equal(res.status, 308)
-  assert.equal(res.headers.get('location'), 'https://caar.fun/news/article?id=17&from=www')
+  const cases = [
+    ['/news/article?id=17&from=www', 'https://caar.fun/news/article?id=17&from=www'],
+    ['/normal/path?x=1&next=%2Faccount', 'https://caar.fun/normal/path?x=1&next=%2Faccount']
+  ]
+
+  for (const [path, expected] of cases) {
+    const res = await worker.fetch(new Request('https://www.caar.fun' + path), env, ctx)
+    assert.equal(res.status, 308, path)
+    const location = res.headers.get('location')
+    assert.equal(location, expected)
+    assert.equal(new URL(location).origin, 'https://caar.fun', path)
+  }
+})
+
+test('authority-like path variants stay on the canonical origin', async () => {
+  const inputs = [
+    'https://www.caar.fun//attacker.example/path?x=1',
+    'https://www.caar.fun///attacker.example/path?x=1',
+    String.raw`https://www.caar.fun/\\attacker.example/path?x=1`,
+    String.raw`https://www.caar.fun/\\\\attacker.example/path?x=1`,
+    'https://www.caar.fun/@attacker.example/path?x=1',
+    'https://www.caar.fun/user@attacker.example/path?x=1',
+    'https://www.caar.fun//user:pass@attacker.example/path?x=1',
+    'https://www.caar.fun/normal/path?x=1'
+  ]
+
+  for (const input of inputs) {
+    const res = await worker.fetch(new Request(input), env, ctx)
+    assert.equal(res.status, 308, input)
+    const location = res.headers.get('location')
+    assert.ok(location, `missing Location for ${input}`)
+    const redirected = new URL(location)
+    assert.equal(redirected.origin, 'https://caar.fun', input)
+    assert.equal(redirected.search, '?x=1', input)
+  }
 })
 
 test('www OAuth start redirects to apex before setting state cookie', async () => {

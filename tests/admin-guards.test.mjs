@@ -5,6 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { makeEnv, api } from './helpers/d1.mjs'
+import { getHuntCompletionData } from '../src/huntCompletions.js'
 
 const worker = (await import('../src/worker.js')).default
 
@@ -90,6 +91,40 @@ test('管理员与超管都不能用 PATCH 重置自己的密码（必须走旧�
   }
 })
 
+test('多字段用户 PATCH 整体校验失败时昵称、口令、版本与审计均不变', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+  const initial = await env.DB.prepare('SELECT id, role, password, session_version FROM users WHERE id IN (2, 4) ORDER BY id').all()
+  const initialRows = initial.results.map((row) => ({
+    id: Number(row.id), role: row.role, password: row.password, session_version: Number(row.session_version)
+  }))
+
+  const self = await api(worker, env, 'admin/users/2', {
+    method: 'PATCH', token: ADMIN, body: { nickname: '不应生效', banned: false }
+  })
+  assert.equal(self.status, 400, '管理员不能提交会被拒绝的自封禁字段')
+
+  const invalidPassword = await api(worker, env, 'admin/users/4', {
+    method: 'PATCH', token: ADMIN, body: { nickname: '不应生效', new_password: 'x' }
+  })
+  assert.equal(invalidPassword.status, 400, '后续弱口令字段必须先校验，整条请求拒绝')
+
+  const invalidNickname = await api(worker, env, 'admin/users/4', {
+    method: 'PATCH', token: SUPER, body: { role: 'admin', nickname: '' }
+  })
+  assert.equal(invalidNickname.status, 400, '有效角色字段之前的后续昵称校验失败时，整条请求不得应用')
+
+  const rows = await env.DB.prepare('SELECT id, nickname, role, password, session_version FROM users WHERE id IN (2, 4) ORDER BY id').all()
+  assert.deepEqual(rows.results.map((row) => ({
+    id: Number(row.id), role: row.role, nickname: row.nickname,
+    password: row.password, session_version: Number(row.session_version)
+  })), [
+    { ...initialRows[0], nickname: 'admin1' }, { ...initialRows[1], nickname: 'member1' }
+  ])
+  const audit = await env.DB.prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE event IN ('admin.user.role','admin.user.nickname','admin.user.ban','admin.user.unban','admin.user.password_reset') AND target_id IN ('2','4')").first()
+  assert.equal(Number(audit.n), 0, '拒绝前不得写成功审计事件')
+})
+
 test('M-1：管理员仍可重置普通成员口令，且会话被踢', async () => {
   const env = makeEnv({ fullSchema: true })
   await seed(env)
@@ -99,6 +134,39 @@ test('M-1：管理员仍可重置普通成员口令，且会话被踢', async ()
   })
   assert.equal(r.status, 200, '重置普通成员口令属于正常管理操作')
   assert.equal(await version(env, 4), 1, '改密必须递增 session_version，踢掉旧会话')
+})
+
+test('删号原子清除目标完赛键，保留其他已绑定用户并不在响应暴露被删者', async () => {
+  const env = makeEnv({ fullSchema: true })
+  await seed(env)
+  await env.DB.prepare("INSERT INTO users (id, username, password, nickname, role, puzzlecat_id) VALUES (5, 'member5', 'deadbeef:deadbeef', '保留用户名字', 'user', 'profile-member-5')").run()
+  const member5Token = 'e'.repeat(32)
+  await env.SESSIONS.put('s:' + member5Token, '5:0')
+  await env.DB.prepare('UPDATE users SET puzzlecat_id = ? WHERE id = 4').bind('profile-member-4').run()
+  const now = Date.now()
+  await env.DB.prepare('INSERT INTO hunt_completion_cache (id, payload, fetched_at, refresh_until, retry_after) VALUES (1, ?, ?, 0, 0)')
+    .bind(JSON.stringify({ syncedUserIds: [4, 5], syncedAllUsers: true, failedUserIds: [], userHunts: { '4': ['id:deleted-hunt'], '5': ['id:kept-hunt'] }, userHuntFetchedAt: { '4': now, '5': now } }), now).run()
+
+  const deleted = await api(worker, env, 'admin/users/4', { method: 'DELETE', token: SUPER })
+  assert.equal(deleted.status, 200)
+  assert.equal(await env.DB.prepare('SELECT id FROM users WHERE id = 4').first(), null)
+  const cache = await env.DB.prepare('SELECT payload FROM hunt_completion_cache WHERE id = 1').first()
+  const payload = JSON.parse(cache.payload)
+  assert.equal(Object.hasOwn(payload.userHunts, '4'), false)
+  assert.equal(Object.hasOwn(payload.userHuntFetchedAt, '4'), false)
+  assert.deepEqual(payload.userHunts['5'], ['id:kept-hunt'])
+  assert.equal(payload.userHuntFetchedAt['5'], now)
+  assert.deepEqual(payload.syncedUserIds, [5])
+
+  const completionResponse = await worker.fetch(new Request('https://caar.test/api/hunts/completions', {
+    headers: { cookie: 'caar_session=' + member5Token }
+  }), env, { waitUntil() {} })
+  assert.equal(completionResponse.status, 200)
+  const completionBody = await completionResponse.json()
+  const serialized = JSON.stringify(completionBody)
+  assert.equal(serialized.includes('member1'), false, 'completions response must not name deleted member')
+  assert.equal(serialized.includes('profile-member-4'), false, 'completions response must not expose deleted profile key')
+  assert.equal(completionBody.byHunt['id:kept-hunt'][0].name, '保留用户名字')
 })
 
 test('删号时同时清理该会员的新闻投稿（含已发布稿件），保留其他作者', async () => {
