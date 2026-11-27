@@ -33,12 +33,37 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// pzc 的 startAt/endAt 是**不带时区**的墙钟时间（按 h.timezone，默认 Asia/Shanghai），
+// 例如 "2026-11-27T10:00:00"。这种串一旦被 new Date() 解析，Worker（UTC 运行时）会
+// 当成 UTC+0，比实际早 8 小时。这里只补时区后缀、不改墙钟时间：
+//   "2026-11-27T10:00:00" → "2026-11-27T10:00:00+08:00"
+// 下游怎么解析都是同一绝对时刻，前端按字符串截取展示也仍是 10:00。
+const TZ_OFFSET = {
+  'Asia/Shanghai': '+08:00',
+  'Asia/Chongqing': '+08:00',
+  'Asia/Harbin': '+08:00',
+  'Asia/Taipei': '+08:00',
+  'Asia/Hong_Kong': '+08:00',
+  'Asia/Macau': '+08:00'
+};
+const DEFAULT_TZ = 'Asia/Shanghai';
+
+export function normalizeHuntTime(v, tz) {
+  const s = v == null ? '' : String(v).trim();
+  if (!s) return null;
+  // 已带 Z 或 ±HH:MM 的原样保留，避免重复追加
+  if (/([zZ]|[+-]\d{2}:?\d{2})$/.test(s)) return s;
+  const offset = TZ_OFFSET[tz] || TZ_OFFSET[DEFAULT_TZ];
+  return s.replace(' ', 'T') + offset;
+}
+
 function normalize(h) {
   const id = text(h && h.id, 32);
   if (!id) return null;
   const slug = text(h.slug, 80);
   // 有 slug 时用规范路径，否则回落到 id 路径；外部赛（originalUrl）直接跳原站
   const original = text(h.originalUrl, 500);
+  const tz = text(h.timezone, 40) || DEFAULT_TZ;
   const url = /^https?:\/\//i.test(original)
     ? original
     : slug
@@ -50,8 +75,8 @@ function normalize(h) {
     title: text(h.title, 160),
     summary: text(h.summary, 400),
     url,
-    startAt: h.startAt || null,
-    endAt: h.endAt || null,
+    startAt: normalizeHuntTime(h.startAt, tz),
+    endAt: normalizeHuntTime(h.endAt, tz),
     status: text(h.status, 20),
     type: text(h.huntType, 20),
     tags: Array.isArray(h.tags) ? h.tags.slice(0, 8).map((x) => text(x, 40)).filter(Boolean) : [],

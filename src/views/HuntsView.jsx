@@ -5,7 +5,8 @@ import { t } from '../i18n'
 import { readHuntsCache, writeHuntsCache, fetchHunts, currentHuntsEpoch } from '../huntsCache'
 import { startCompletionPolling as startCompletionPollingImpl } from '../completionPolling'
 
-/* 上游时间是带时区的本地时间（默认 Asia/Shanghai），按墙上时间展示，不做时区换算 */
+/* 上游时间是不带时区的墙钟时间（timezone 默认 Asia/Shanghai），抓取时已补 +08:00 后缀；
+   这里按墙钟时间展示，不做时区换算 */
 function fmtDay(iso) {
   const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/)
   if (!m) return ''
