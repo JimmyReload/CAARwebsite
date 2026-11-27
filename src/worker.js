@@ -1585,14 +1585,21 @@ const app = {
       if (parts.length !== 3 || !Number.isSafeInteger(id) || id < 1) return json({ error: t('errors.newsNotFound') }, 404);
       const b = await readBody(request);
       if (!['published','rejected'].includes(b.status)) return json({ error: t('errors.badParams') }, 400);
+      // from = 期望的当前状态，兼作乐观并发：默认 pending（原有的「审核待审稿」调用不变），
+      // 传 published 表示「把已发布稿件退回下线」。声明与实际状态不符就 409，
+      // 这样两个管理员同时点「通过」和「退回」不会双双生效，后到的那个拿到明确失败。
+      const from = b.from === 'published' ? 'published' : 'pending';
+      // 已发布的稿子只能退回，不能借着 published 这个来源再「发布」一次
+      if (from === 'published' && b.status !== 'rejected') return json({ error: t('errors.badParams') }, 400);
       const note = String(b.review_note || '').trim();
       if (b.status === 'rejected' && !note) return json({ error: t('errors.newsReviewNoteRequired') }, 400);
       if ([...note].length > 500) return json({ error: t('errors.newsReviewNoteTooLong') }, 400);
       const now = "datetime('now')";
-      const upd = await env.DB.prepare(`UPDATE news_articles SET status=?,review_note=?,reviewed_by=?,reviewed_at=${now},published_at=CASE WHEN ?='published' THEN COALESCE(published_at,${now}) ELSE NULL END,updated_at=${now} WHERE id=? AND status='pending'`).bind(b.status,note,user.id,b.status,id).run();
+      const upd = await env.DB.prepare(`UPDATE news_articles SET status=?,review_note=?,reviewed_by=?,reviewed_at=${now},published_at=CASE WHEN ?='published' THEN COALESCE(published_at,${now}) ELSE NULL END,updated_at=${now} WHERE id=? AND status=?`).bind(b.status,note,user.id,b.status,id,from).run();
       if (!upd.meta.changes) return json({ error: t('errors.newsReviewUnavailable') }, 409);
-      io.audit(b.status === 'published' ? 'news.publish' : 'news.reject', { level: b.status === 'published' ? 'info' : 'warn', status: 200, target_type: 'news', target_id: id, meta: { review_note: note.slice(0,200) } });
-      return json({ ok: true, status: b.status });
+      const event = b.status === 'published' ? 'news.publish' : from === 'published' ? 'news.unpublish' : 'news.reject';
+      io.audit(event, { level: b.status === 'published' ? 'info' : 'warn', status: 200, target_type: 'news', target_id: id, meta: { review_note: note.slice(0,200), from } });
+      return json({ ok: true, status: b.status, from });
     }
 
     // 给「只走过 PuzzleCat 登录」的账号补设口令。

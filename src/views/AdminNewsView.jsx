@@ -92,15 +92,19 @@ export default function AdminNewsView() {
     const articleId = active && active.id
     if (!articleId || reviewInFlightRef.current || selectedIdRef.current !== articleId) return
     if (nextStatus === 'rejected' && !reviewNote.trim()) { setError(t('news.reviewNoteRequired')); return }
+    // 已发布稿件的「退回」等于下线，动的是线上内容，先让管理员确认一次
+    const unpublish = active.status === 'published'
+    if (unpublish && !window.confirm(t('news.unpublishConfirm', { title: active.title }))) return
     const requestId = detailRequestRef.current
     const reviewId = ++reviewRequestRef.current
     reviewInFlightRef.current = true
     setSaving(true); setReviewingId(articleId); setError(''); setNotice('')
     try {
-      await api('/admin/news/' + articleId, { method: 'PATCH', body: { status: nextStatus, review_note: reviewNote } })
+      // from 说明这次动作假定的当前状态：待审稿走审核，已发布稿只允许退回下线
+      await api('/admin/news/' + articleId, { method: 'PATCH', body: { status: nextStatus, review_note: reviewNote, from: unpublish ? 'published' : 'pending' } })
       if (!mountedRef.current || reviewId !== reviewRequestRef.current) return
       const stillViewingArticle = requestId === detailRequestRef.current && selectedIdRef.current === articleId
-      setNotice(nextStatus === 'published' ? t('news.published') : t('news.rejected') )
+      setNotice(unpublish ? t('news.unpublished') : nextStatus === 'published' ? t('news.published') : t('news.rejected'))
       if (stillViewingArticle) {
         selectedIdRef.current = null
         setActive(null); setReviewNote('')
@@ -137,13 +141,14 @@ export default function AdminNewsView() {
           {active.summary && <p className="news-article-summary">{active.summary}</p>}
           {active.coverUrl && <img className="news-review-cover" src={active.coverUrl} alt={t('news.coverLabel')} decoding="async" />}
           <div className="news-review-content"><NewsContent value={active.content} /></div>
-          {active.status === 'pending' && <label className="news-review-label">{t('news.reviewNote')} <textarea value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} rows="3" maxLength="500" placeholder={t('news.reviewNotePlaceholder')} /></label>}
-          {active.status !== 'pending' && active.review_note && <p className="news-review-note"><strong>{t('news.reviewNote')}：</strong>{active.review_note}</p>}
+          {active.status !== 'rejected' && <label className="news-review-label">{t('news.reviewNote')} <textarea value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} rows="3" maxLength="500" placeholder={t('news.reviewNotePlaceholder')} /></label>}
+          {active.status === 'rejected' && active.review_note && <p className="news-review-note"><strong>{t('news.reviewNote')}：</strong>{active.review_note}</p>}
           <div className="btn-row">
             {active.status === 'pending' && <>
               <button className="auth-btn news-approve" disabled={saving || reviewingId === active.id} onClick={() => review('published')}>{saving && reviewingId === active.id ? t('news.reviewing') : t('news.approvePublish')}</button>
               <button className="mini-btn mini-btn--danger" disabled={saving || reviewingId === active.id} onClick={() => review('rejected')}>{t('news.returnToAuthor')}</button>
             </>}
+            {active.status === 'published' && <button className="mini-btn mini-btn--danger" disabled={saving || reviewingId === active.id} onClick={() => review('rejected')}>{saving && reviewingId === active.id ? t('news.reviewing') : t('news.unpublish')}</button>}
             {active.status !== 'pending' && <span className="acct-note">{active.published_at ? t('news.publishedAt', { date: fmtDateTime(active.published_at) }) : active.reviewed_at ? t('news.reviewedAt', { date: fmtDateTime(active.reviewed_at) }) : ''}</span>}
           </div>
         </article>

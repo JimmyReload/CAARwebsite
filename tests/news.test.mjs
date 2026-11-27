@@ -275,3 +275,44 @@ test('拒绝非 allow-list 富文本结构、不安全链接及超长内容', as
   const bad = await api(worker, env, 'news', { method: 'POST', token: MEMBER, body: { title: '坏数据', content: { type: 'doc', children: [{ type: 'script', children: [] }] } } })
   assert.equal(bad.status, 400)
 })
+
+test('已发布稿件可退回下线，作者修改后可重投；状态不符时 409 不误伤', async () => {
+  const env = await setup()
+  const created = await submit(env)
+  const id = created.body.article.id
+  const patch = (body, token = ADMIN) => api(worker, env, `admin/news/${id}`, { method: 'PATCH', token, body })
+
+  assert.equal((await patch({ status: 'published' })).status, 200)
+  assert.equal((await api(worker, env, 'news')).body.total, 1)
+
+  // 没声明 from 的退回只作用于待审稿：已发布的稿子不该被顺手退掉
+  assert.equal((await patch({ status: 'rejected', review_note: '内容过期' })).status, 409)
+  // 退回必须写意见
+  assert.equal((await patch({ status: 'rejected', from: 'published' })).status, 400)
+  // 已发布稿件不能借 from:'published' 再发一次
+  assert.equal((await patch({ status: 'published', from: 'published', review_note: 'x' })).status, 400)
+  assert.equal((await api(worker, env, 'news')).body.total, 1, '失败的请求不应改动线上内容')
+
+  const off = await patch({ status: 'rejected', from: 'published', review_note: '内容过期，请更新后重投' })
+  assert.equal(off.status, 200)
+  assert.equal(off.body.from, 'published')
+  assert.equal((await api(worker, env, 'news')).body.total, 0, '下线后不应留在公开列表')
+  assert.equal((await api(worker, env, `news/${id}`)).status, 404, '下线后详情页对匿名者 404')
+
+  const adminRejected = await api(worker, env, 'admin/news?status=rejected', { token: ADMIN })
+  assert.ok(adminRejected.body.list.some((item) => item.id === id), '退回的稿子应出现在「退回修改」分类里')
+
+  // 重复退回：它已经不在 published，按状态不符拒绝
+  assert.equal((await patch({ status: 'rejected', from: 'published', review_note: '再退一次' })).status, 409)
+
+  // 作者侧能看到退回意见，并重新提交
+  const mine = await api(worker, env, 'news/mine', { token: MEMBER })
+  assert.equal(mine.body.list[0].status, 'rejected')
+  assert.equal(mine.body.list[0].review_note, '内容过期，请更新后重投')
+  const again = await api(worker, env, `news/${id}/resubmit`, { method: 'POST', token: MEMBER, body: { title: '赛事现场（修订）', summary: '一段摘要', content: richDoc('修订后') } })
+  assert.equal(again.status, 200)
+
+  // 重新审核通过后能再次上线
+  assert.equal((await patch({ status: 'published' })).status, 200)
+  assert.equal((await api(worker, env, 'news')).body.total, 1)
+})
