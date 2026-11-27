@@ -1028,7 +1028,12 @@ section[id] { scroll-margin-top: 96px; }
 .news-item { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 10px; align-items: start; }
 .news-index { padding-top: 18px; font-family: var(--mono); font-size: 12px; font-weight: 900; color: #555; }
 .news-item:nth-child(4n + 2) .news-card, .news-item:nth-child(4n + 3) .news-card { background: var(--grey); }
-.news-card { display: flex; flex-direction: column; min-height: 230px; padding: 0; border: 3px solid #000; background: #fff; box-shadow: var(--hard); overflow: hidden; }
+.news-card { position: relative; display: flex; flex-direction: column; min-height: 230px; padding: 0; border: 3px solid #000; background: #fff; box-shadow: var(--hard); overflow: hidden; }
+/* 整卡可点：标题链接的伪元素铺满卡片，视觉上整块都是热区；
+   语义上仍是标题链接（读屏念的是标题，不是一串空链接），也不用嵌套可交互元素。 */
+.news-card-title a::after { content: ''; position: absolute; inset: 0; z-index: 1; }
+.news-card:hover { transform: translate(-3px, -3px); box-shadow: 8px 8px 0 var(--yellow); }
+.news-card:hover .news-card-title a { text-decoration: underline; text-decoration-thickness: 3px; text-underline-offset: 5px; }
 /* 头图：定死 16:9 并裁切，避免不同比例的图把卡片撑成参差不齐的高度。
    再按视口高度封顶：矮屏上第一行卡片不吃掉整屏，页面底部（总数 + 翻页）才留得住。 */
 .news-card-cover { border-bottom: 3px solid #000; background: var(--grey); }
